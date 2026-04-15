@@ -282,13 +282,15 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(row, ('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain'))
 
     def test_missing_timestamp_falls_back(self):
+        from datetime import datetime
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke({'url': 'https://example.com', 'title': 'No Timestamp'}, tmp)
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             ts = conn.execute('SELECT timestamp FROM visits').fetchone()[0]
             conn.close()
-        self.assertIsNotNone(ts)
-        self.assertGreater(len(ts), 0)
+        # Verify the fallback is a parseable ISO 8601 datetime, not just any string
+        parsed = datetime.fromisoformat(ts)  # raises ValueError if not a valid datetime
+        self.assertGreater(parsed.year, 2000)
 
     def test_sequential_invocations_accumulate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,17 +314,33 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': ''}, tmp)
         self.assertEqual(resp['status'], 'ok')
 
-    def test_both_outputs_written_independently(self):
-        """Log and DB are written in independent try/except — both should succeed."""
+    def test_log_written_even_when_db_path_is_unwritable(self):
+        """Log file write proceeds even if the DB path is a directory (can't be opened)."""
         with tempfile.TemporaryDirectory() as tmp:
-            self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
-                tmp,
+            # Make the DB path a directory so sqlite3.connect() will fail
+            db_collision = os.path.join(tmp, 'visits.db')
+            os.makedirs(db_collision)
+
+            env = os.environ.copy()
+            env['BVL_LOG_FILE'] = os.path.join(tmp, 'visits.log')
+            env['BVL_DB_FILE']  = db_collision
+            env['BVL_HOST_LOG'] = os.path.join(tmp, 'host.log')
+
+            result = subprocess.run(
+                [sys.executable, HOST_PY],
+                input=_frame({'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}),
+                capture_output=True,
+                timeout=10,
+                env=env,
             )
-            log_exists = Path(tmp, 'visits.log').exists()
-            db_exists  = Path(tmp, 'visits.db').exists()
-        self.assertTrue(log_exists)
-        self.assertTrue(db_exists)
+            resp = _unframe(result.stdout)
+            log_content = Path(tmp, 'visits.log').read_text()
+
+        # DB write failed, so the response should report an error
+        self.assertEqual(resp['status'], 'error')
+        self.assertTrue(any('db' in e for e in resp.get('errors', [])))
+        # But the log write must have succeeded independently
+        self.assertIn('https://example.com', log_content)
 
 
 if __name__ == '__main__':

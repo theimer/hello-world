@@ -159,12 +159,14 @@ describe('webNavigation.onCompleted — immediate flush', () => {
     expect(msg.title).toBe('Example Domain');
   });
 
-  test('timestamp is an ISO string', () => {
+  test('timestamp is a valid ISO string that round-trips through Date', () => {
     tabReturns('Example Domain');
     navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
     const { timestamp } = mockSendNativeMessage.mock.calls[0][1];
-    expect(() => new Date(timestamp)).not.toThrow();
-    expect(new Date(timestamp).getFullYear()).toBeGreaterThan(2000);
+    // new Date(x).toISOString() throws on Invalid Date, so this fails for garbage input
+    const reparsed = new Date(timestamp);
+    expect(isNaN(reparsed.getTime())).toBe(false);
+    expect(reparsed.getFullYear()).toBeGreaterThan(2000);
   });
 
   test('sends to the correct native host name', () => {
@@ -267,7 +269,7 @@ describe('tabs.onUpdated', () => {
     expect(mockSendNativeMessage).not.toHaveBeenCalled();
   });
 
-  test('flushed message contains original URL and navigation timestamp', () => {
+  test('flushed message contains original URL and a valid navigation timestamp', () => {
     tabReturns('');
     navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
 
@@ -276,6 +278,9 @@ describe('tabs.onUpdated', () => {
     const msg = mockSendNativeMessage.mock.calls[0][1];
     expect(msg.url).toBe('https://example.com/');
     expect(msg.title).toBe('Late Title');
-    expect(msg.timestamp).toBeDefined();
+    // Timestamp must be a valid date, not just any truthy value
+    const parsed = new Date(msg.timestamp);
+    expect(isNaN(parsed.getTime())).toBe(false);
+    expect(parsed.getFullYear()).toBeGreaterThan(2000);
   });
 });
