@@ -16,7 +16,6 @@ import os
 import sqlite3
 import struct
 import sys
-from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 # ---------------------------------------------------------------------------
@@ -115,12 +114,15 @@ def main() -> None:
         write_message({'status': 'error', 'message': str(exc)})
         return
 
-    timestamp = message.get('timestamp') or datetime.now(timezone.utc).isoformat()
     url       = message.get('url', '').strip()
+    timestamp = message.get('timestamp', '').strip()
     title     = message.get('title', '')
 
     if not url:
         write_message({'status': 'error', 'message': 'url is required'})
+        return
+    if not timestamp:
+        write_message({'status': 'error', 'message': 'timestamp is required'})
         return
 
     errors = []

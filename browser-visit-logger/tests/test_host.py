@@ -281,16 +281,20 @@ class TestIntegration(unittest.TestCase):
             conn.close()
         self.assertEqual(row, ('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain'))
 
-    def test_missing_timestamp_falls_back(self):
-        from datetime import datetime
+    def test_missing_timestamp_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._invoke({'url': 'https://example.com', 'title': 'No Timestamp'}, tmp)
-            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            ts = conn.execute('SELECT timestamp FROM visits').fetchone()[0]
-            conn.close()
-        # Verify the fallback is a parseable ISO 8601 datetime, not just any string
-        parsed = datetime.fromisoformat(ts)  # raises ValueError if not a valid datetime
-        self.assertGreater(parsed.year, 2000)
+            resp = self._invoke({'url': 'https://example.com', 'title': 'No Timestamp'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('timestamp', resp.get('message', ''))
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(tmp, 'visits.db').exists())
+
+    def test_empty_timestamp_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': '', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('timestamp', resp.get('message', ''))
+            self.assertFalse(Path(tmp, 'visits.log').exists())
 
     def test_sequential_invocations_accumulate(self):
         with tempfile.TemporaryDirectory() as tmp:
