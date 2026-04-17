@@ -9,8 +9,7 @@
 #      to letters a-p, first 32 chars).
 #   4. Makes native-host/host.py executable.
 #   5. Installs the native messaging host manifest (with real path + extension ID)
-#      to ~/.config/google-chrome/NativeMessagingHosts/ and/or
-#      ~/.config/chromium/NativeMessagingHosts/ depending on what's installed.
+#      to the correct NativeMessagingHosts directory for the OS and browser.
 #   6. Prints instructions for loading the unpacked extension in Chrome.
 #
 # Usage:
@@ -127,31 +126,57 @@ PYEOF
 )"
 
 INSTALLED=0
+OS="$(uname -s)"
 
-# Chrome (stable)
-CHROME_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
-if [[ -d "$HOME/.config/google-chrome" ]] || command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then
-  mkdir -p "$CHROME_DIR"
-  echo "$FILLED_MANIFEST" > "$CHROME_DIR/$HOST_NAME.json"
-  info "Installed native host manifest for Chrome at $CHROME_DIR/$HOST_NAME.json"
-  INSTALLED=1
-fi
+if [[ "$OS" == "Darwin" ]]; then
+  # macOS — Chrome reads from ~/Library/Application Support/...
+  install_manifest() {
+    local dir="$1"
+    local label="$2"
+    mkdir -p "$dir"
+    echo "$FILLED_MANIFEST" > "$dir/$HOST_NAME.json"
+    info "Installed native host manifest for $label at $dir/$HOST_NAME.json"
+    INSTALLED=1
+  }
 
-# Chromium
-CHROMIUM_DIR="$HOME/.config/chromium/NativeMessagingHosts"
-if [[ -d "$HOME/.config/chromium" ]] || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1; then
-  mkdir -p "$CHROMIUM_DIR"
-  echo "$FILLED_MANIFEST" > "$CHROMIUM_DIR/$HOST_NAME.json"
-  info "Installed native host manifest for Chromium at $CHROMIUM_DIR/$HOST_NAME.json"
-  INSTALLED=1
-fi
+  CHROME_APP="$HOME/Library/Application Support/Google/Chrome"
+  CANARY_APP="$HOME/Library/Application Support/Google/Chrome Canary"
+  CHROMIUM_APP="$HOME/Library/Application Support/Chromium"
 
-# Fallback: install for both if neither config dir was detected
-if [[ $INSTALLED -eq 0 ]]; then
-  mkdir -p "$CHROME_DIR" "$CHROMIUM_DIR"
-  echo "$FILLED_MANIFEST" > "$CHROME_DIR/$HOST_NAME.json"
-  echo "$FILLED_MANIFEST" > "$CHROMIUM_DIR/$HOST_NAME.json"
-  info "No browser config dir detected; installed manifest to both Chrome and Chromium locations."
+  [[ -d "$CHROME_APP" ]]   && install_manifest "$CHROME_APP/NativeMessagingHosts"   "Chrome"
+  [[ -d "$CANARY_APP" ]]   && install_manifest "$CANARY_APP/NativeMessagingHosts"   "Chrome Canary"
+  [[ -d "$CHROMIUM_APP" ]] && install_manifest "$CHROMIUM_APP/NativeMessagingHosts" "Chromium"
+
+  # Fallback: Chrome wasn't open yet so its profile dir doesn't exist
+  if [[ $INSTALLED -eq 0 ]]; then
+    install_manifest "$CHROME_APP/NativeMessagingHosts" "Chrome (pre-created)"
+  fi
+
+else
+  # Linux
+  CHROME_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
+  CHROMIUM_DIR="$HOME/.config/chromium/NativeMessagingHosts"
+
+  if [[ -d "$HOME/.config/google-chrome" ]] || command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then
+    mkdir -p "$CHROME_DIR"
+    echo "$FILLED_MANIFEST" > "$CHROME_DIR/$HOST_NAME.json"
+    info "Installed native host manifest for Chrome at $CHROME_DIR/$HOST_NAME.json"
+    INSTALLED=1
+  fi
+
+  if [[ -d "$HOME/.config/chromium" ]] || command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null 2>&1; then
+    mkdir -p "$CHROMIUM_DIR"
+    echo "$FILLED_MANIFEST" > "$CHROMIUM_DIR/$HOST_NAME.json"
+    info "Installed native host manifest for Chromium at $CHROMIUM_DIR/$HOST_NAME.json"
+    INSTALLED=1
+  fi
+
+  if [[ $INSTALLED -eq 0 ]]; then
+    mkdir -p "$CHROME_DIR" "$CHROMIUM_DIR"
+    echo "$FILLED_MANIFEST" > "$CHROME_DIR/$HOST_NAME.json"
+    echo "$FILLED_MANIFEST" > "$CHROMIUM_DIR/$HOST_NAME.json"
+    info "No browser config dir detected; installed manifest to both Chrome and Chromium locations."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
