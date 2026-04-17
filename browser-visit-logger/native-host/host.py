@@ -116,8 +116,12 @@ def main() -> None:
         return
 
     timestamp = message.get('timestamp') or datetime.now(timezone.utc).isoformat()
-    url       = message.get('url', '')
+    url       = message.get('url', '').strip()
     title     = message.get('title', '')
+
+    if not url:
+        write_message({'status': 'error', 'message': 'url is required'})
+        return
 
     errors = []
 

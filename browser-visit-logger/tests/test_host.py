@@ -309,17 +309,36 @@ class TestIntegration(unittest.TestCase):
             conn.close()
         self.assertEqual(count, 3)
 
-    def test_empty_url_and_title(self):
+    def test_empty_url_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
-            resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': ''}, tmp)
+            resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': 'Whatever'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('url', resp.get('message', ''))
+            # Nothing should have been written
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(tmp, 'visits.db').exists())
+
+    def test_whitespace_only_url_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': 'ts', 'url': '   ', 'title': 'Whatever'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    def test_missing_url_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': 'ts', 'title': 'No URL at all'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    def test_empty_title_with_valid_url_accepted(self):
+        # Title is optional — a page may simply have no <title>
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': 'ts', 'url': 'https://example.com', 'title': ''}, tmp)
             self.assertEqual(resp['status'], 'ok')
-            # Verify the empty strings were actually persisted, not silently dropped
-            log_line = Path(tmp, 'visits.log').read_text()
-            self.assertEqual(log_line, 'ts\t\t\n')
-            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT url, title FROM visits').fetchone()
-            conn.close()
-        self.assertEqual(row, ('', ''))
+            row = sqlite3.connect(os.path.join(tmp, 'visits.db')).execute(
+                'SELECT url, title FROM visits'
+            ).fetchone()
+        self.assertEqual(row, ('https://example.com', ''))
 
     def test_log_written_even_when_db_path_is_unwritable(self):
         """Log file write proceeds even if the DB path is a directory (can't be opened)."""
