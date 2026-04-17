@@ -23,7 +23,7 @@ function flushVisit(tabId) {
   const payload = {
     timestamp: entry.timestamp,
     url:       entry.url,
-    title:     entry.title || entry.url,
+    title:     isTitleMeaningful(entry.title, entry.url) ? entry.title : entry.url,
   };
 
   chrome.runtime.sendNativeMessage(NATIVE_HOST, payload, (response) => {
@@ -68,6 +68,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.title) return;
   if (!pendingVisits.has(tabId)) return;
 
-  pendingVisits.get(tabId).title = changeInfo.title;
+  const entry = pendingVisits.get(tabId);
+  if (!isTitleMeaningful(changeInfo.title, entry.url)) return;
+
+  entry.title = changeInfo.title;
   flushVisit(tabId);
 });

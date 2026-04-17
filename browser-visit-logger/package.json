@@ -1,0 +1,16 @@
+{
+  "name": "browser-visit-logger",
+  "private": true,
+  "scripts": {
+    "test": "jest --testPathPattern=tests/"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ]
+  }
+}

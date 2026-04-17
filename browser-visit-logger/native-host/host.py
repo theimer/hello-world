@@ -16,16 +16,16 @@ import os
 import sqlite3
 import struct
 import sys
-from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 # ---------------------------------------------------------------------------
-# Paths (all in the user's home directory)
+# Paths — default to the user's home directory; overrideable via env vars
+# (env var overrides are used by the test suite to isolate test output)
 # ---------------------------------------------------------------------------
 HOME     = os.path.expanduser('~')
-LOG_FILE = os.path.join(HOME, 'browser-visits.log')
-DB_FILE  = os.path.join(HOME, 'browser-visits.db')
-HOST_LOG = os.path.join(HOME, 'browser-visits-host.log')
+LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
+DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
+HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 
 # ---------------------------------------------------------------------------
 # Host process logging (errors/debug — never written to stderr)
@@ -114,9 +114,16 @@ def main() -> None:
         write_message({'status': 'error', 'message': str(exc)})
         return
 
-    timestamp = message.get('timestamp') or datetime.now(timezone.utc).isoformat()
-    url       = message.get('url', '')
-    title     = message.get('title', '')
+    url       = (message.get('url') or '').strip()
+    timestamp = (message.get('timestamp') or '').strip()
+    title     = message.get('title') or ''
+
+    if not url:
+        write_message({'status': 'error', 'message': 'url is required'})
+        return
+    if not timestamp:
+        write_message({'status': 'error', 'message': 'timestamp is required'})
+        return
 
     errors = []
 
