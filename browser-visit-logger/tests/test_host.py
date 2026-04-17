@@ -121,10 +121,6 @@ class TestAppendLog(unittest.TestCase):
         content = self._run('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain')
         self.assertEqual(content, '2026-01-01T00:00:00Z\thttps://example.com\tExample Domain\n')
 
-    def test_exactly_three_fields(self):
-        content = self._run('ts', 'https://a.com', 'Title').rstrip('\n')
-        self.assertEqual(len(content.split('\t')), 3)
-
     def test_tab_in_title_replaced(self):
         content = self._run('ts', 'https://a.com', 'Part1\tPart2').rstrip('\n')
         parts = content.split('\t')
@@ -312,6 +308,29 @@ class TestIntegration(unittest.TestCase):
             count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
             conn.close()
         self.assertEqual(count, 3)
+
+    def test_null_url_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': 'ts', 'url': None, 'title': 'Title'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('url', resp.get('message', ''))
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    def test_null_timestamp_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': None, 'url': 'https://example.com', 'title': 'Title'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('timestamp', resp.get('message', ''))
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    def test_null_title_treated_as_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'timestamp': 'ts', 'url': 'https://example.com', 'title': None}, tmp)
+            self.assertEqual(resp['status'], 'ok')
+            row = sqlite3.connect(os.path.join(tmp, 'visits.db')).execute(
+                'SELECT title FROM visits'
+            ).fetchone()
+        self.assertEqual(row[0], '')
 
     def test_empty_url_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

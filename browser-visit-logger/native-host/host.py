@@ -114,9 +114,9 @@ def main() -> None:
         write_message({'status': 'error', 'message': str(exc)})
         return
 
-    url       = message.get('url', '').strip()
-    timestamp = message.get('timestamp', '').strip()
-    title     = message.get('title', '')
+    url       = (message.get('url') or '').strip()
+    timestamp = (message.get('timestamp') or '').strip()
+    title     = message.get('title') or ''
 
     if not url:
         write_message({'status': 'error', 'message': 'url is required'})

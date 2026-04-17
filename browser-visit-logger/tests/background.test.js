@@ -269,6 +269,20 @@ describe('tabs.onUpdated', () => {
     expect(mockSendNativeMessage).not.toHaveBeenCalled();
   });
 
+  test('ignores onUpdated with whitespace-only title; timeout falls back to URL', () => {
+    tabReturns('');
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+
+    // Whitespace is truthy in JS but not a meaningful title — must not flush early
+    tabUpdateHandler(1, { title: '   ' }, {});
+    expect(mockSendNativeMessage).not.toHaveBeenCalled();
+
+    // Timeout fires — URL used as fallback since no meaningful title ever arrived
+    jest.advanceTimersByTime(5000);
+    expect(mockSendNativeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendNativeMessage.mock.calls[0][1].title).toBe('https://example.com/');
+  });
+
   test('flushed message contains original URL and a valid navigation timestamp', () => {
     tabReturns('');
     navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
