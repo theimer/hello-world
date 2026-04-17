@@ -312,7 +312,14 @@ class TestIntegration(unittest.TestCase):
     def test_empty_url_and_title(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': ''}, tmp)
-        self.assertEqual(resp['status'], 'ok')
+            self.assertEqual(resp['status'], 'ok')
+            # Verify the empty strings were actually persisted, not silently dropped
+            log_line = Path(tmp, 'visits.log').read_text()
+            self.assertEqual(log_line, 'ts\t\t\n')
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute('SELECT url, title FROM visits').fetchone()
+            conn.close()
+        self.assertEqual(row, ('', ''))
 
     def test_log_written_even_when_db_path_is_unwritable(self):
         """Log file write proceeds even if the DB path is a directory (can't be opened)."""
