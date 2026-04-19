@@ -25,6 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_DIR="$SCRIPT_DIR/extension"
 NATIVE_DIR="$SCRIPT_DIR/native-host"
+MANIFEST_TEMPLATE="$EXTENSION_DIR/manifest.json.template"
 MANIFEST_JSON="$EXTENSION_DIR/manifest.json"
 HOST_MANIFEST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.json"
 HOST_PY="$NATIVE_DIR/host.py"
@@ -69,15 +70,15 @@ openssl rsa -in "$KEY_PEM" -pubout -outform DER -out "$DER_TMP" 2>/dev/null
 # Base64-encode the DER (no line breaks — Chrome wants a single long string)
 PUBLIC_KEY_B64="$(base64 < "$DER_TMP" | tr -d '\n')"
 
-# Patch the "key" field in manifest.json
-info "Embedding public key into $MANIFEST_JSON ..."
-python3 - "$MANIFEST_JSON" "$PUBLIC_KEY_B64" <<'PYEOF'
+# Generate manifest.json from the template, embedding the public key
+info "Generating $MANIFEST_JSON from template ..."
+python3 - "$MANIFEST_TEMPLATE" "$MANIFEST_JSON" "$PUBLIC_KEY_B64" <<'PYEOF'
 import json, sys
-path, key_b64 = sys.argv[1], sys.argv[2]
-with open(path) as f:
+template_path, out_path, key_b64 = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(template_path) as f:
     data = json.load(f)
 data['key'] = key_b64
-with open(path, 'w') as f:
+with open(out_path, 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 PYEOF
