@@ -2,3 +2,5 @@ node_modules/
 __pycache__/
 *.pyc
 .pytest_cache/
+native-host/generated_key.pem
+extension/manifest.json
