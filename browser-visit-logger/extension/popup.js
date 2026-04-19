@@ -28,7 +28,7 @@ document.addEventListener('DOMContentLoaded', () => {
             showStatus('Error: ' + chrome.runtime.lastError.message);
             document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
           } else if (response && response.status === 'ok') {
-            showStatus('Marked as \u201c' + btn.dataset.tag + '\u201d.');
+            window.close();
           } else {
             showStatus('Write failed — check host log.');
             document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
