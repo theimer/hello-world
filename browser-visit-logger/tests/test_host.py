@@ -128,7 +128,6 @@ class TestAppendLog(unittest.TestCase):
 
     def test_newline_in_title_replaced(self):
         content = self._run('ts', 'https://a.com', 'Line1\nLine2')
-        # Must be exactly one line
         self.assertEqual(len(content.splitlines()), 1)
         self.assertIn('Line1 Line2', content)
 
@@ -181,6 +180,9 @@ class TestDatabase(unittest.TestCase):
         host.ensure_db(conn)
         return conn
 
+    def _cols(self, conn):
+        return {r[1] for r in conn.execute('PRAGMA table_info(visits)')}
+
     def test_ensure_db_creates_visits_table(self):
         conn = self._conn()
         tables = {r[0] for r in conn.execute(
@@ -197,13 +199,21 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('idx_visits_timestamp', indexes)
         conn.close()
 
-    def test_ensure_db_creates_url_index(self):
+    def test_ensure_db_creates_memorable_column(self):
         conn = self._conn()
-        indexes = {r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index'"
-        )}
-        self.assertIn('idx_visits_url', indexes)
+        self.assertIn('memorable', self._cols(conn))
         conn.close()
+
+    def test_ensure_db_creates_read_column(self):
+        conn = self._conn()
+        self.assertIn('read', self._cols(conn))
+        conn.close()
+
+    def test_ensure_db_url_is_primary_key(self):
+        conn = self._conn()
+        pk_cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)') if r[5] == 1}
+        conn.close()
+        self.assertEqual(pk_cols, {'url'})
 
     def test_ensure_db_is_idempotent(self):
         conn = sqlite3.connect(':memory:')
@@ -211,12 +221,49 @@ class TestDatabase(unittest.TestCase):
         host.ensure_db(conn)  # second call must not raise
         conn.close()
 
+    def test_ensure_db_migrates_old_id_based_schema(self):
+        # Simulate a database created before the url-PK redesign
+        conn = sqlite3.connect(':memory:')
+        conn.execute("""
+            CREATE TABLE visits (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                url       TEXT NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                tag       TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute(
+            "INSERT INTO visits (timestamp, url, title) VALUES (?, ?, ?)",
+            ('ts1', 'https://example.com', 'Example'),
+        )
+        conn.commit()
+        host.ensure_db(conn)
+        # Old columns gone, new schema in place
+        cols = self._cols(conn)
+        self.assertNotIn('id', cols)
+        self.assertNotIn('tag', cols)
+        self.assertIn('memorable', cols)
+        self.assertIn('read', cols)
+        # Existing data preserved
+        row = conn.execute('SELECT url, timestamp, title FROM visits').fetchone()
+        conn.close()
+        self.assertEqual(row, ('https://example.com', 'ts1', 'Example'))
+
     def test_insert_visit_stores_all_fields(self):
         conn = self._conn()
         host.insert_visit(conn, '2026-01-01T00:00:00Z', 'https://example.com', 'Example')
-        row = conn.execute('SELECT timestamp, url, title FROM visits').fetchone()
+        row = conn.execute('SELECT url, timestamp, title FROM visits').fetchone()
         conn.close()
-        self.assertEqual(row, ('2026-01-01T00:00:00Z', 'https://example.com', 'Example'))
+        self.assertEqual(row, ('https://example.com', '2026-01-01T00:00:00Z', 'Example'))
+
+    def test_insert_visit_memorable_and_read_default_to_null(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Title')
+        row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+        conn.close()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
 
     def test_insert_visit_empty_title(self):
         conn = self._conn()
@@ -225,11 +272,27 @@ class TestDatabase(unittest.TestCase):
         conn.close()
         self.assertEqual(row[0], '')
 
-    def test_insert_visit_multiple_rows_ordered_by_id(self):
+    def test_insert_visit_duplicate_url_ignored(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts1', 'https://example.com', 'First')
+        host.insert_visit(conn, 'ts2', 'https://example.com', 'Second')
+        count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    def test_insert_visit_duplicate_preserves_original_timestamp(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts1', 'https://example.com', 'First')
+        host.insert_visit(conn, 'ts2', 'https://example.com', 'Second')
+        row = conn.execute('SELECT timestamp, title FROM visits').fetchone()
+        conn.close()
+        self.assertEqual(row, ('ts1', 'First'))
+
+    def test_insert_visit_different_urls_create_separate_records(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts1', 'https://a.com', 'A')
         host.insert_visit(conn, 'ts2', 'https://b.com', 'B')
-        rows = conn.execute('SELECT url FROM visits ORDER BY id').fetchall()
+        rows = conn.execute('SELECT url FROM visits ORDER BY url').fetchall()
         conn.close()
         self.assertEqual(rows, [('https://a.com',), ('https://b.com',)])
 
@@ -239,36 +302,6 @@ class TestDatabase(unittest.TestCase):
         row = conn.execute('SELECT title FROM visits').fetchone()
         conn.close()
         self.assertEqual(row[0], '日本語タイトル')
-
-    def test_ensure_db_creates_tag_column(self):
-        conn = self._conn()
-        cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)')}
-        conn.close()
-        self.assertIn('tag', cols)
-
-    def test_ensure_db_migrates_existing_table(self):
-        # Simulate a pre-tag database (no tag column)
-        conn = sqlite3.connect(':memory:')
-        conn.execute("""
-            CREATE TABLE visits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                url TEXT NOT NULL,
-                title TEXT NOT NULL DEFAULT ''
-            )
-        """)
-        conn.commit()
-        host.ensure_db(conn)  # must add tag column without error
-        cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)')}
-        conn.close()
-        self.assertIn('tag', cols)
-
-    def test_insert_visit_tag_defaults_to_empty(self):
-        conn = self._conn()
-        host.insert_visit(conn, 'ts', 'https://example.com', 'Title')
-        row = conn.execute('SELECT tag FROM visits').fetchone()
-        conn.close()
-        self.assertEqual(row[0], '')
 
 
 # ---------------------------------------------------------------------------
@@ -282,27 +315,33 @@ class TestTagVisit(unittest.TestCase):
         host.ensure_db(conn)
         return conn
 
-    def test_tag_visit_updates_tag_field(self):
+    def test_tag_visit_sets_memorable(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
-        host.tag_visit(conn, 'https://example.com', 'memorable')
-        row = conn.execute('SELECT tag FROM visits').fetchone()
+        host.tag_visit(conn, 'https://example.com', 'memorable', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT memorable FROM visits').fetchone()
         conn.close()
-        self.assertEqual(row[0], 'memorable')
+        self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
-    def test_tag_visit_updates_most_recent_only(self):
+    def test_tag_visit_sets_read(self):
         conn = self._conn()
-        host.insert_visit(conn, 'ts1', 'https://example.com', 'Example')
-        host.insert_visit(conn, 'ts2', 'https://example.com', 'Example')
-        host.tag_visit(conn, 'https://example.com', 'read')
-        rows = conn.execute('SELECT tag FROM visits ORDER BY id').fetchall()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'read', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT read FROM visits').fetchone()
         conn.close()
-        self.assertEqual(rows[0][0], '')       # first visit unchanged
-        self.assertEqual(rows[1][0], 'read')   # only the most recent updated
+        self.assertEqual(row[0], '2026-01-01T12:00:00Z')
+
+    def test_tag_visit_memorable_does_not_set_read(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'memorable', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT read FROM visits').fetchone()
+        conn.close()
+        self.assertIsNone(row[0])
 
     def test_tag_visit_no_existing_visit_is_noop(self):
         conn = self._conn()
-        host.tag_visit(conn, 'https://example.com', 'memorable')  # must not raise
+        host.tag_visit(conn, 'https://example.com', 'memorable', 'ts')  # must not raise
         count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
         conn.close()
         self.assertEqual(count, 0)
@@ -311,11 +350,11 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts1', 'https://a.com', 'A')
         host.insert_visit(conn, 'ts2', 'https://b.com', 'B')
-        host.tag_visit(conn, 'https://a.com', 'memorable')
-        rows = conn.execute('SELECT url, tag FROM visits ORDER BY id').fetchall()
+        host.tag_visit(conn, 'https://a.com', 'memorable', '2026-01-01T12:00:00Z')
+        rows = conn.execute('SELECT url, memorable FROM visits ORDER BY url').fetchall()
         conn.close()
-        self.assertEqual(rows[0], ('https://a.com', 'memorable'))
-        self.assertEqual(rows[1], ('https://b.com', ''))
+        self.assertEqual(rows[0], ('https://a.com', '2026-01-01T12:00:00Z'))
+        self.assertIsNone(rows[1][1])  # https://b.com unchanged
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +405,13 @@ class TestIntegration(unittest.TestCase):
                 tmp,
             )
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT timestamp, url, title FROM visits').fetchone()
+            row = conn.execute(
+                'SELECT url, timestamp, title, memorable, read FROM visits'
+            ).fetchone()
             conn.close()
-        self.assertEqual(row, ('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain'))
+        self.assertEqual(row[:3], ('https://example.com', '2026-01-01T00:00:00Z', 'Example Domain'))
+        self.assertIsNone(row[3])  # memorable
+        self.assertIsNone(row[4])  # read
 
     def test_missing_timestamp_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,6 +445,43 @@ class TestIntegration(unittest.TestCase):
             conn.close()
         self.assertEqual(count, 3)
 
+    def test_duplicate_url_creates_single_db_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(3):
+                self._invoke(
+                    {'timestamp': '2026-01-01T00:00:00Z', 'url': 'https://example.com', 'title': 'Example'},
+                    tmp,
+                )
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_duplicate_url_writes_multiple_log_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for _ in range(3):
+                self._invoke(
+                    {'timestamp': '2026-01-01T00:00:00Z', 'url': 'https://example.com', 'title': 'Example'},
+                    tmp,
+                )
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+        self.assertEqual(len(lines), 3)
+
+    def test_duplicate_url_preserves_original_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-first', 'url': 'https://example.com', 'title': 'First'},
+                tmp,
+            )
+            self._invoke(
+                {'timestamp': 'ts-second', 'url': 'https://example.com', 'title': 'Second'},
+                tmp,
+            )
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute('SELECT timestamp FROM visits').fetchone()
+            conn.close()
+        self.assertEqual(row[0], 'ts-first')
+
     def test_null_url_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': 'ts', 'url': None, 'title': 'Title'}, tmp)
@@ -430,7 +510,6 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': 'Whatever'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('url', resp.get('message', ''))
-            # Nothing should have been written
             self.assertFalse(Path(tmp, 'visits.log').exists())
             self.assertFalse(Path(tmp, 'visits.db').exists())
 
@@ -447,7 +526,6 @@ class TestIntegration(unittest.TestCase):
             self.assertFalse(Path(tmp, 'visits.log').exists())
 
     def test_empty_title_with_valid_url_accepted(self):
-        # Title is optional — a page may simply have no <title>
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': 'ts', 'url': 'https://example.com', 'title': ''}, tmp)
             self.assertEqual(resp['status'], 'ok')
@@ -456,10 +534,18 @@ class TestIntegration(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row, ('https://example.com', ''))
 
+    def test_invalid_tag_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title', 'tag': 'favourite'},
+                tmp,
+            )
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('tag', resp.get('message', ''))
+
     def test_log_written_even_when_db_path_is_unwritable(self):
         """Log file write proceeds even if the DB path is a directory (can't be opened)."""
         with tempfile.TemporaryDirectory() as tmp:
-            # Make the DB path a directory so sqlite3.connect() will fail
             db_collision = os.path.join(tmp, 'visits.db')
             os.makedirs(db_collision)
 
@@ -478,29 +564,43 @@ class TestIntegration(unittest.TestCase):
             resp = _unframe(result.stdout)
             log_content = Path(tmp, 'visits.log').read_text()
 
-        # DB write failed, so the response should report an error
         self.assertEqual(resp['status'], 'error')
         self.assertTrue(any('db' in e for e in resp.get('errors', [])))
-        # But the log write must have succeeded independently
         self.assertIn('https://example.com', log_content)
 
-    def test_tag_message_updates_db_record(self):
+    def test_tag_message_sets_memorable_column(self):
         with tempfile.TemporaryDirectory() as tmp:
-            # Auto-log the visit first
             self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example'},
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
                 tmp,
             )
-            # Tag the visit
             resp = self._invoke(
-                {'timestamp': 'ts2', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
                 tmp,
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT tag FROM visits ORDER BY id DESC LIMIT 1').fetchone()
+            row = conn.execute('SELECT memorable, read FROM visits').fetchone()
             conn.close()
-        self.assertEqual(row[0], 'memorable')
+        self.assertEqual(row[0], 'ts-tag')
+        self.assertIsNone(row[1])
+
+    def test_tag_message_sets_read_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            resp = self._invoke(
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'read'},
+                tmp,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+            conn.close()
+        self.assertIsNone(row[0])
+        self.assertEqual(row[1], 'ts-tag')
 
     def test_tag_message_appends_four_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,31 +624,17 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(lines[0].split('\t')), 3)
 
     def test_tag_without_prior_visit_succeeds(self):
-        # tag_visit is a no-op UPDATE when the URL has no prior visit
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke(
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
                 tmp,
             )
             self.assertEqual(resp['status'], 'ok')
-            # Log line still written
             self.assertIn('memorable', Path(tmp, 'visits.log').read_text())
-            # DB exists but has no rows (UPDATE on empty table is a no-op)
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
             conn.close()
         self.assertEqual(count, 0)
-
-    def test_auto_log_tag_column_defaults_to_empty(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example'},
-                tmp,
-            )
-            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT tag FROM visits').fetchone()
-            conn.close()
-        self.assertEqual(row[0], '')
 
 
 if __name__ == '__main__':
