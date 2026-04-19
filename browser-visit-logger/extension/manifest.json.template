@@ -11,5 +11,9 @@
   "background": {
     "service_worker": "background.js"
   },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Browser Visit Logger"
+  },
   "key": "__GENERATED_PUBLIC_KEY__"
 }

@@ -8,6 +8,16 @@ log file and a SQLite database, then sends a JSON response to stdout.
 
 Chrome launches this script once per sendNativeMessage() call (MV3 one-shot
 semantics): read one message → write outputs → respond → exit.
+
+Message types
+-------------
+Auto-log (from background.js):
+    { "timestamp": "...", "url": "...", "title": "..." }
+    → INSERT new row; append 3-field TSV line.
+
+Tag action (from popup.js):
+    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read" }
+    → UPDATE tag on most recent row for that URL; append 4-field TSV line.
 """
 
 import json
@@ -69,9 +79,15 @@ def ensure_db(conn: sqlite3.Connection) -> None:
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT    NOT NULL,
             url       TEXT    NOT NULL,
-            title     TEXT    NOT NULL DEFAULT ''
+            title     TEXT    NOT NULL DEFAULT '',
+            tag       TEXT    NOT NULL DEFAULT ''
         )
     """)
+    # Migrate databases created before the tag column was added
+    try:
+        conn.execute("ALTER TABLE visits ADD COLUMN tag TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)"
     )
@@ -88,16 +104,29 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
     )
     conn.commit()
 
+
+def tag_visit(conn: sqlite3.Connection, url: str, tag: str) -> None:
+    """Set tag on the most recent visit for the given URL."""
+    conn.execute(
+        "UPDATE visits SET tag = ? "
+        "WHERE id = (SELECT id FROM visits WHERE url = ? ORDER BY id DESC LIMIT 1)",
+        (tag, url),
+    )
+    conn.commit()
+
 # ---------------------------------------------------------------------------
 # Log file helper
 # ---------------------------------------------------------------------------
 
-def append_log(timestamp: str, url: str, title: str) -> None:
-    """Append one TSV line. Tabs and newlines in field values are replaced."""
+def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
+    """Append one TSV line (3 fields for auto-log, 4 fields when tag is set)."""
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
-    line = f"{sanitise(timestamp)}\t{sanitise(url)}\t{sanitise(title)}\n"
+    fields = [sanitise(timestamp), sanitise(url), sanitise(title)]
+    if tag:
+        fields.append(sanitise(tag))
+    line = '\t'.join(fields) + '\n'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line)
 
@@ -117,6 +146,7 @@ def main() -> None:
     url       = (message.get('url') or '').strip()
     timestamp = (message.get('timestamp') or '').strip()
     title     = message.get('title') or ''
+    tag       = (message.get('tag') or '').strip()
 
     if not url:
         write_message({'status': 'error', 'message': 'url is required'})
@@ -129,7 +159,7 @@ def main() -> None:
 
     # Write to TSV log (independent of DB write)
     try:
-        append_log(timestamp, url, title)
+        append_log(timestamp, url, title, tag)
     except Exception as exc:
         logger.error('Log file write failed: %s', exc)
         errors.append(f'log: {exc}')
@@ -138,7 +168,10 @@ def main() -> None:
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
-        insert_visit(conn, timestamp, url, title)
+        if tag:
+            tag_visit(conn, url, tag)
+        else:
+            insert_visit(conn, timestamp, url, title)
         conn.close()
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)
