@@ -13,11 +13,22 @@ Message types
 -------------
 Auto-log (from background.js):
     { "timestamp": "...", "url": "...", "title": "..." }
-    → INSERT new row; append 3-field TSV line.
+    → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
 
 Tag action (from popup.js):
     { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read" }
-    → UPDATE tag on most recent row for that URL; append 4-field TSV line.
+    → UPDATE memorable or read column on the row for that URL using the
+      message timestamp; append 4-field TSV line.
+
+Schema
+------
+    visits (
+        url       TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,        -- set on first visit, never updated
+        title     TEXT NOT NULL DEFAULT '',
+        memorable TEXT,                 -- ISO timestamp, NULL until tagged
+        read      TEXT                  -- ISO timestamp, NULL until tagged
+    )
 """
 
 import json
@@ -74,44 +85,64 @@ def write_message(payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def ensure_db(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS visits (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT    NOT NULL,
-            url       TEXT    NOT NULL,
-            title     TEXT    NOT NULL DEFAULT '',
-            tag       TEXT    NOT NULL DEFAULT ''
-        )
-    """)
-    # Migrate databases created before the tag column was added
-    try:
-        conn.execute("ALTER TABLE visits ADD COLUMN tag TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)').fetchall()}
+
+    if not cols:
+        # Fresh database
+        conn.execute("""
+            CREATE TABLE visits (
+                url       TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                memorable TEXT,
+                read      TEXT
+            )
+        """)
+    elif 'id' in cols:
+        # Old id-based schema — migrate to url-primary-key schema
+        conn.execute("""
+            CREATE TABLE visits_new (
+                url       TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                memorable TEXT,
+                read      TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO visits_new (url, timestamp, title)
+            SELECT url, timestamp, title FROM visits
+        """)
+        conn.execute("DROP TABLE visits")
+        conn.execute("ALTER TABLE visits_new RENAME TO visits")
+
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_visits_url ON visits(url)"
     )
     conn.commit()
 
 
 def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str) -> None:
+    """Insert a new visit row; silently ignored if the URL already exists."""
     conn.execute(
-        "INSERT INTO visits (timestamp, url, title) VALUES (?, ?, ?)",
-        (timestamp, url, title),
+        "INSERT OR IGNORE INTO visits (url, timestamp, title) VALUES (?, ?, ?)",
+        (url, timestamp, title),
     )
     conn.commit()
 
 
-def tag_visit(conn: sqlite3.Connection, url: str, tag: str) -> None:
-    """Set tag on the most recent visit for the given URL."""
-    conn.execute(
-        "UPDATE visits SET tag = ? "
-        "WHERE id = (SELECT id FROM visits WHERE url = ? ORDER BY id DESC LIMIT 1)",
-        (tag, url),
-    )
+def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> None:
+    """Set the memorable or read timestamp on the visit record for url."""
+    if tag == 'memorable':
+        conn.execute(
+            "UPDATE visits SET memorable = ? WHERE url = ?",
+            (tag_timestamp, url),
+        )
+    elif tag == 'read':
+        conn.execute(
+            "UPDATE visits SET read = ? WHERE url = ?",
+            (tag_timestamp, url),
+        )
     conn.commit()
 
 # ---------------------------------------------------------------------------
@@ -134,6 +165,9 @@ def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+VALID_TAGS = {'memorable', 'read'}
+
+
 def main() -> None:
     try:
         message = read_message()
@@ -154,6 +188,9 @@ def main() -> None:
     if not timestamp:
         write_message({'status': 'error', 'message': 'timestamp is required'})
         return
+    if tag and tag not in VALID_TAGS:
+        write_message({'status': 'error', 'message': f'invalid tag: {tag}'})
+        return
 
     errors = []
 
@@ -169,7 +206,7 @@ def main() -> None:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
         if tag:
-            tag_visit(conn, url, tag)
+            tag_visit(conn, url, tag, timestamp)
         else:
             insert_visit(conn, timestamp, url, title)
         conn.close()
