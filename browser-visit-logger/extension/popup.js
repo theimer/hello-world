@@ -30,7 +30,7 @@ document.addEventListener('DOMContentLoaded', () => {
           } else if (response && response.status === 'ok') {
             window.close();
           } else {
-            showStatus('Write failed — check host log.');
+            showStatus(response && response.message ? response.message : 'Write failed — check host log.');
             document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
           }
         });
