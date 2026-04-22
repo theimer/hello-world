@@ -209,6 +209,27 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('read', self._cols(conn))
         conn.close()
 
+    def test_ensure_db_creates_skimmed_column(self):
+        conn = self._conn()
+        self.assertIn('skimmed', self._cols(conn))
+        conn.close()
+
+    def test_ensure_db_adds_skimmed_column_to_existing_schema(self):
+        conn = sqlite3.connect(':memory:')
+        conn.execute("""
+            CREATE TABLE visits (
+                url       TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                memorable TEXT,
+                read      TEXT
+            )
+        """)
+        conn.commit()
+        host.ensure_db(conn)
+        self.assertIn('skimmed', self._cols(conn))
+        conn.close()
+
     def test_ensure_db_url_is_primary_key(self):
         conn = self._conn()
         pk_cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)') if r[5] == 1}
@@ -260,10 +281,11 @@ class TestDatabase(unittest.TestCase):
     def test_insert_visit_memorable_and_read_default_to_null(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Title')
-        row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+        row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
         conn.close()
         self.assertIsNone(row[0])
         self.assertIsNone(row[1])
+        self.assertIsNone(row[2])
 
     def test_insert_visit_empty_title(self):
         conn = self._conn()
@@ -338,6 +360,23 @@ class TestTagVisit(unittest.TestCase):
         row = conn.execute('SELECT read FROM visits').fetchone()
         conn.close()
         self.assertIsNone(row[0])
+
+    def test_tag_visit_sets_skimmed(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT skimmed FROM visits').fetchone()
+        conn.close()
+        self.assertEqual(row[0], '2026-01-01T12:00:00Z')
+
+    def test_tag_visit_skimmed_does_not_set_memorable_or_read(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+        conn.close()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
 
     def test_tag_visit_no_existing_visit_is_noop(self):
         conn = self._conn()
@@ -580,10 +619,11 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
             conn.close()
         self.assertEqual(row[0], 'ts-tag')
         self.assertIsNone(row[1])
+        self.assertIsNone(row[2])
 
     def test_tag_message_sets_read_column(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -597,10 +637,29 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
             conn.close()
         self.assertIsNone(row[0])
         self.assertEqual(row[1], 'ts-tag')
+        self.assertIsNone(row[2])
+
+    def test_tag_message_sets_skimmed_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            resp = self._invoke(
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'skimmed'},
+                tmp,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+            conn.close()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+        self.assertEqual(row[2], 'ts-tag')
 
     def test_tag_message_appends_four_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
