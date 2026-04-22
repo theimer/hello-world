@@ -168,19 +168,26 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
 # Log file helper
 # ---------------------------------------------------------------------------
 
-def append_log(timestamp: str, url: str, title: str, tag: str = '', result: str = '') -> None:
-    """Append one TSV line (3 fields for auto-log, 4 with tag, 5 with tag + result)."""
+def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
+    """Append one TSV line (3 fields for auto-log, 4 fields when tag is set)."""
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
     fields = [sanitise(timestamp), sanitise(url), sanitise(title)]
     if tag:
         fields.append(sanitise(tag))
-    if result:
-        fields.append(sanitise(result))
     line = '\t'.join(fields) + '\n'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line)
+
+
+def append_result_log(result: str) -> None:
+    """Append a single-field result line: 'success' or 'error: <message>'."""
+    def sanitise(s: str) -> str:
+        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
+
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(sanitise(result) + '\n')
 
 # ---------------------------------------------------------------------------
 # Main
@@ -247,7 +254,7 @@ def main() -> None:
     else:
         log_result = 'success'
     try:
-        append_log(timestamp, url, title, tag, log_result)
+        append_result_log(log_result)
     except Exception as exc:
         logger.error('Log file result write failed: %s', exc)
 
