@@ -180,6 +180,15 @@ def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line)
 
+
+def append_result_log(result: str) -> None:
+    """Append a single-field result line: 'success' or 'error: <message>'."""
+    def sanitise(s: str) -> str:
+        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
+
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(sanitise(result) + '\n')
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -212,32 +221,46 @@ def main() -> None:
         return
 
     errors = []
+    no_record = False
+    no_record_msg = 'No record found for this URL — visit the page before tagging'
 
-    # Write to TSV log (independent of DB write)
+    # First write: record the intended action
     try:
         append_log(timestamp, url, title, tag)
     except Exception as exc:
         logger.error('Log file write failed: %s', exc)
         errors.append(f'log: {exc}')
 
-    # Write to SQLite (independent of log write)
+    # Write to SQLite
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
         if tag:
             found = tag_visit(conn, url, tag, timestamp)
+            if not found:
+                no_record = True
         else:
             insert_visit(conn, timestamp, url, title)
-            found = True
         conn.close()
-        if tag and not found:
-            write_message({'status': 'error', 'message': 'No record found for this URL — visit the page before tagging'})
-            return
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
 
-    if errors:
+    # Second write: record the result
+    if no_record:
+        log_result = f'error: {no_record_msg}'
+    elif errors:
+        log_result = f'error: {"; ".join(errors)}'
+    else:
+        log_result = 'success'
+    try:
+        append_result_log(log_result)
+    except Exception as exc:
+        logger.error('Log file result write failed: %s', exc)
+
+    if no_record:
+        write_message({'status': 'error', 'message': no_record_msg})
+    elif errors:
         write_message({'status': 'error', 'errors': errors})
     else:
         write_message({'status': 'ok'})

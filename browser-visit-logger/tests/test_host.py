@@ -158,6 +158,22 @@ class TestAppendLog(unittest.TestCase):
         self.assertEqual(len(parts), 4)
         self.assertEqual(parts[3], 'memorable')
 
+    def test_append_result_log_writes_single_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'visits.log')
+            with patch.object(host, 'LOG_FILE', path):
+                host.append_result_log('success')
+            content = Path(path).read_text(encoding='utf-8')
+        self.assertEqual(content, 'success\n')
+
+    def test_append_result_log_sanitises_tabs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'visits.log')
+            with patch.object(host, 'LOG_FILE', path):
+                host.append_result_log('error: foo\tbar')
+            content = Path(path).read_text(encoding='utf-8').rstrip('\n')
+        self.assertEqual(content, 'error: foo bar')
+
     def test_no_tag_produces_three_fields(self):
         content = self._run('ts', 'https://example.com', 'Example')
         parts = content.rstrip('\n').split('\t')
@@ -442,8 +458,9 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': '2026-01-01T00:00:00Z', 'url': 'https://example.com', 'title': 'Example Domain'},
                 tmp,
             )
-            content = Path(tmp, 'visits.log').read_text()
-        self.assertEqual(content, '2026-01-01T00:00:00Z\thttps://example.com\tExample Domain\n')
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+        self.assertEqual(lines[0], '2026-01-01T00:00:00Z\thttps://example.com\tExample Domain')
+        self.assertEqual(lines[1], 'success')
 
     def test_sqlite_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -485,7 +502,7 @@ class TestIntegration(unittest.TestCase):
                     tmp,
                 )
             log_lines = Path(tmp, 'visits.log').read_text().splitlines()
-            self.assertEqual(len(log_lines), 3)
+            self.assertEqual(len(log_lines), 6)  # 2 lines per invocation
 
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
@@ -512,7 +529,7 @@ class TestIntegration(unittest.TestCase):
                     tmp,
                 )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-        self.assertEqual(len(lines), 3)
+        self.assertEqual(len(lines), 6)  # 2 lines per invocation
 
     def test_duplicate_url_preserves_original_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,14 +689,20 @@ class TestIntegration(unittest.TestCase):
     def test_tag_message_appends_four_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'read'},
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            self._invoke(
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'read'},
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        parts = lines[0].split('\t')
-        self.assertEqual(len(parts), 4)
-        self.assertEqual(parts[3], 'read')
+        # lines[0]=visit action, lines[1]=visit result, lines[2]=tag action, lines[3]=tag result
+        self.assertEqual(len(lines), 4)
+        tag_action = lines[2].split('\t')
+        self.assertEqual(len(tag_action), 4)
+        self.assertEqual(tag_action[3], 'read')
+        self.assertEqual(lines[3], 'success')
 
     def test_auto_log_appends_three_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,7 +711,9 @@ class TestIntegration(unittest.TestCase):
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-        self.assertEqual(len(lines[0].split('\t')), 3)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines[0].split('\t')), 3)  # action: 3 fields
+        self.assertEqual(lines[1], 'success')
 
     def test_tag_without_prior_visit_returns_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -698,6 +723,12 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'error')
             self.assertIn('No record found', resp.get('message', ''))
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            action = lines[0].split('\t')
+            self.assertEqual(len(action), 4)
+            self.assertEqual(action[3], 'memorable')
+            self.assertIn('No record found', lines[1])
 
 
 if __name__ == '__main__':
