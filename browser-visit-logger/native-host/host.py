@@ -168,14 +168,16 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
 # Log file helper
 # ---------------------------------------------------------------------------
 
-def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
-    """Append one TSV line (3 fields for auto-log, 4 fields when tag is set)."""
+def append_log(timestamp: str, url: str, title: str, tag: str = '', error: str = '') -> None:
+    """Append one TSV line (3 fields for auto-log, 4 with tag, 5 with tag + error)."""
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
     fields = [sanitise(timestamp), sanitise(url), sanitise(title)]
     if tag:
         fields.append(sanitise(tag))
+    if error:
+        fields.append(sanitise(error))
     line = '\t'.join(fields) + '\n'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line)
@@ -212,32 +214,35 @@ def main() -> None:
         return
 
     errors = []
+    no_record = False
 
-    # Write to TSV log (independent of DB write)
-    try:
-        append_log(timestamp, url, title, tag)
-    except Exception as exc:
-        logger.error('Log file write failed: %s', exc)
-        errors.append(f'log: {exc}')
-
-    # Write to SQLite (independent of log write)
+    # Write to SQLite first so we know whether to append an error to the log line
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
         if tag:
             found = tag_visit(conn, url, tag, timestamp)
+            if not found:
+                no_record = True
         else:
             insert_visit(conn, timestamp, url, title)
-            found = True
         conn.close()
-        if tag and not found:
-            write_message({'status': 'error', 'message': 'No record found for this URL — visit the page before tagging'})
-            return
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
 
-    if errors:
+    # Write to TSV log, appending the error message when no record was found
+    no_record_msg = 'No record found for this URL — visit the page before tagging'
+    log_error = no_record_msg if no_record else ''
+    try:
+        append_log(timestamp, url, title, tag, log_error)
+    except Exception as exc:
+        logger.error('Log file write failed: %s', exc)
+        errors.append(f'log: {exc}')
+
+    if no_record:
+        write_message({'status': 'error', 'message': no_record_msg})
+    elif errors:
         write_message({'status': 'error', 'errors': errors})
     else:
         write_message({'status': 'ok'})

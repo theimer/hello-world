@@ -158,6 +158,17 @@ class TestAppendLog(unittest.TestCase):
         self.assertEqual(len(parts), 4)
         self.assertEqual(parts[3], 'memorable')
 
+    def test_tag_with_error_produces_five_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'visits.log')
+            with patch.object(host, 'LOG_FILE', path):
+                host.append_log('ts', 'https://example.com', 'Example', tag='memorable', error='No record found')
+            content = Path(path).read_text(encoding='utf-8')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(len(parts), 5)
+        self.assertEqual(parts[3], 'memorable')
+        self.assertEqual(parts[4], 'No record found')
+
     def test_no_tag_produces_three_fields(self):
         content = self._run('ts', 'https://example.com', 'Example')
         parts = content.rstrip('\n').split('\t')
@@ -672,12 +683,16 @@ class TestIntegration(unittest.TestCase):
     def test_tag_message_appends_four_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'read'},
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            self._invoke(
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'read'},
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        parts = lines[0].split('\t')
+        tag_line = lines[1]
+        parts = tag_line.split('\t')
         self.assertEqual(len(parts), 4)
         self.assertEqual(parts[3], 'read')
 
@@ -698,6 +713,12 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'error')
             self.assertIn('No record found', resp.get('message', ''))
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            self.assertEqual(len(lines), 1)
+            parts = lines[0].split('\t')
+            self.assertEqual(len(parts), 5)
+            self.assertEqual(parts[3], 'memorable')
+            self.assertIn('No record found', parts[4])
 
 
 if __name__ == '__main__':
