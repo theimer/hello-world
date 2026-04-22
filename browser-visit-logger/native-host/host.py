@@ -16,9 +16,9 @@ Auto-log (from background.js):
     → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
 
 Tag action (from popup.js):
-    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read" }
-    → UPDATE memorable or read column on the row for that URL using the
-      message timestamp; append 4-field TSV line.
+    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read"|"skimmed" }
+    → UPDATE memorable, read, or skimmed column on the row for that URL using
+      the message timestamp; append 4-field TSV line.
 
 Schema
 ------
@@ -27,7 +27,8 @@ Schema
         timestamp TEXT NOT NULL,        -- set on first visit, never updated
         title     TEXT NOT NULL DEFAULT '',
         memorable TEXT,                 -- ISO timestamp, NULL until tagged
-        read      TEXT                  -- ISO timestamp, NULL until tagged
+        read      TEXT,                 -- ISO timestamp, NULL until tagged
+        skimmed   TEXT                  -- ISO timestamp, NULL until tagged
     )
 """
 
@@ -95,7 +96,8 @@ def ensure_db(conn: sqlite3.Connection) -> None:
                 timestamp TEXT NOT NULL,
                 title     TEXT NOT NULL DEFAULT '',
                 memorable TEXT,
-                read      TEXT
+                read      TEXT,
+                skimmed   TEXT
             )
         """)
     elif 'id' in cols:
@@ -106,7 +108,8 @@ def ensure_db(conn: sqlite3.Connection) -> None:
                 timestamp TEXT NOT NULL,
                 title     TEXT NOT NULL DEFAULT '',
                 memorable TEXT,
-                read      TEXT
+                read      TEXT,
+                skimmed   TEXT
             )
         """)
         conn.execute("""
@@ -115,6 +118,11 @@ def ensure_db(conn: sqlite3.Connection) -> None:
         """)
         conn.execute("DROP TABLE visits")
         conn.execute("ALTER TABLE visits_new RENAME TO visits")
+
+    else:
+        # Add skimmed column to existing url-PK schema if missing
+        if 'skimmed' not in cols:
+            conn.execute("ALTER TABLE visits ADD COLUMN skimmed TEXT")
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)"
@@ -132,7 +140,7 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
 
 
 def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> None:
-    """Set the memorable or read timestamp on the visit record for url."""
+    """Set the memorable, read, or skimmed timestamp on the visit record for url."""
     if tag == 'memorable':
         conn.execute(
             "UPDATE visits SET memorable = ? WHERE url = ?",
@@ -141,6 +149,11 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
     elif tag == 'read':
         conn.execute(
             "UPDATE visits SET read = ? WHERE url = ?",
+            (tag_timestamp, url),
+        )
+    elif tag == 'skimmed':
+        conn.execute(
+            "UPDATE visits SET skimmed = ? WHERE url = ?",
             (tag_timestamp, url),
         )
     conn.commit()
@@ -165,7 +178,7 @@ def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-VALID_TAGS = {'memorable', 'read'}
+VALID_TAGS = {'memorable', 'read', 'skimmed'}
 
 
 def main() -> None:
