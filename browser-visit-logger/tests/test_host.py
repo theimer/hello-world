@@ -378,12 +378,20 @@ class TestTagVisit(unittest.TestCase):
         self.assertIsNone(row[0])
         self.assertIsNone(row[1])
 
-    def test_tag_visit_no_existing_visit_is_noop(self):
+    def test_tag_visit_no_existing_visit_returns_false(self):
         conn = self._conn()
-        host.tag_visit(conn, 'https://example.com', 'memorable', 'ts')  # must not raise
+        found = host.tag_visit(conn, 'https://example.com', 'memorable', 'ts')
         count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
         conn.close()
+        self.assertFalse(found)
         self.assertEqual(count, 0)
+
+    def test_tag_visit_existing_visit_returns_true(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        found = host.tag_visit(conn, 'https://example.com', 'memorable', 'ts-tag')
+        conn.close()
+        self.assertTrue(found)
 
     def test_tag_visit_does_not_affect_other_urls(self):
         conn = self._conn()
@@ -682,18 +690,14 @@ class TestIntegration(unittest.TestCase):
             lines = Path(tmp, 'visits.log').read_text().splitlines()
         self.assertEqual(len(lines[0].split('\t')), 3)
 
-    def test_tag_without_prior_visit_succeeds(self):
+    def test_tag_without_prior_visit_returns_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke(
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
                 tmp,
             )
-            self.assertEqual(resp['status'], 'ok')
-            self.assertIn('memorable', Path(tmp, 'visits.log').read_text())
-            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
-            conn.close()
-        self.assertEqual(count, 0)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('No record found', resp.get('message', ''))
 
 
 if __name__ == '__main__':

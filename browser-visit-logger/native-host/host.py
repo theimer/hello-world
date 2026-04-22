@@ -139,24 +139,30 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
     conn.commit()
 
 
-def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> None:
-    """Set the memorable, read, or skimmed timestamp on the visit record for url."""
+def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> bool:
+    """Set the memorable, read, or skimmed timestamp on the visit record for url.
+
+    Returns True if a row was found and updated, False if no record exists for url.
+    """
     if tag == 'memorable':
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE visits SET memorable = ? WHERE url = ?",
             (tag_timestamp, url),
         )
     elif tag == 'read':
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE visits SET read = ? WHERE url = ?",
             (tag_timestamp, url),
         )
     elif tag == 'skimmed':
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE visits SET skimmed = ? WHERE url = ?",
             (tag_timestamp, url),
         )
+    else:
+        return False
     conn.commit()
+    return cursor.rowcount > 0
 
 # ---------------------------------------------------------------------------
 # Log file helper
@@ -219,10 +225,14 @@ def main() -> None:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
         if tag:
-            tag_visit(conn, url, tag, timestamp)
+            found = tag_visit(conn, url, tag, timestamp)
         else:
             insert_visit(conn, timestamp, url, title)
+            found = True
         conn.close()
+        if tag and not found:
+            write_message({'status': 'error', 'message': 'No record found for this URL — visit the page before tagging'})
+            return
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
