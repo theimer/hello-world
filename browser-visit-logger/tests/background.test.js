@@ -17,12 +17,61 @@ const mockSendNativeMessage = jest.fn();
 const mockTabsGet           = jest.fn();
 const addNavListener        = jest.fn();
 const addTabUpdateListener  = jest.fn();
+const addMessageListener    = jest.fn();
+
+// Snapshot-related mocks
+const mockSaveAsMHTML       = jest.fn();
+const mockDownloadsDownload = jest.fn();
+
+// FileReader mock — readAsDataURL fires 'loadend' synchronously by default.
+// Tests that need to simulate a read error can set mockFileReaderInstance.error.
+let mockFileReaderInstance;
+function buildFileReaderMock() {
+  mockFileReaderInstance = {
+    addEventListener: jest.fn(),
+    readAsDataURL:    jest.fn(),
+    result: 'data:message/rfc822;base64,MOCKED_DATA',
+    error:  null,
+  };
+  mockFileReaderInstance.readAsDataURL.mockImplementation(() => {
+    for (const [event, cb] of mockFileReaderInstance.addEventListener.mock.calls) {
+      if (event === 'loadend') cb();
+    }
+  });
+  global.FileReader = jest.fn(() => mockFileReaderInstance);
+}
+
+// downloads.onChanged needs add/removeListener so tests can fire deltas
+const onChangedListeners = [];
+const mockDownloadsOnChanged = {
+  addListener:    jest.fn((cb) => onChangedListeners.push(cb)),
+  removeListener: jest.fn((cb) => {
+    const i = onChangedListeners.indexOf(cb);
+    if (i !== -1) onChangedListeners.splice(i, 1);
+  }),
+};
+
+function fireDownloadChanged(delta) {
+  [...onChangedListeners].forEach((cb) => cb(delta));
+}
+
+// Fixed 32-byte SHA-256 hash buffer returned by the crypto.subtle mock.
+// Hex: 'abababab...' (64 chars)
+const MOCK_HASH_BUFFER = new Uint8Array(32).fill(0xab).buffer;
+const MOCK_HEX_HASH   = 'ab'.repeat(32);
 
 function buildChromeMock() {
+  global.crypto = {
+    subtle: {
+      digest: jest.fn(() => Promise.resolve(MOCK_HASH_BUFFER)),
+    },
+  };
+
   global.chrome = {
     runtime: {
       sendNativeMessage: mockSendNativeMessage,
       lastError: null,
+      onMessage: { addListener: addMessageListener },
     },
     webNavigation: {
       onCompleted: { addListener: addNavListener },
@@ -31,6 +80,13 @@ function buildChromeMock() {
       get:       mockTabsGet,
       onUpdated: { addListener: addTabUpdateListener },
     },
+    pageCapture: {
+      saveAsMHTML: mockSaveAsMHTML,
+    },
+    downloads: {
+      download:  mockDownloadsDownload,
+      onChanged: mockDownloadsOnChanged,
+    },
   };
 }
 
@@ -38,7 +94,7 @@ function buildChromeMock() {
 // Load a fresh copy of background.js before every test
 // (jest.resetModules() clears the module cache so pendingVisits starts empty)
 // ---------------------------------------------------------------------------
-let navHandler, tabUpdateHandler;
+let navHandler, tabUpdateHandler, messageHandler;
 
 beforeEach(() => {
   jest.useFakeTimers();
@@ -48,9 +104,16 @@ beforeEach(() => {
   mockTabsGet.mockClear();
   addNavListener.mockClear();
   addTabUpdateListener.mockClear();
+  addMessageListener.mockClear();
+  mockSaveAsMHTML.mockClear();
+  mockDownloadsDownload.mockClear();
+  mockDownloadsOnChanged.addListener.mockClear();
+  mockDownloadsOnChanged.removeListener.mockClear();
+  onChangedListeners.length = 0;
 
-  // Fresh chrome mock
+  // Fresh chrome mock and FileReader mock
   buildChromeMock();
+  buildFileReaderMock();
 
   // Fresh module (new pendingVisits Map, fresh listener registrations)
   jest.resetModules();
@@ -58,6 +121,7 @@ beforeEach(() => {
 
   navHandler       = addNavListener.mock.calls[0][0];
   tabUpdateHandler = addTabUpdateListener.mock.calls[0][0];
+  messageHandler   = addMessageListener.mock.calls[0][0];
 });
 
 afterEach(() => {
@@ -91,6 +155,11 @@ describe('listener registration', () => {
   test('registers a tabs.onUpdated listener', () => {
     expect(addTabUpdateListener).toHaveBeenCalledTimes(1);
     expect(typeof tabUpdateHandler).toBe('function');
+  });
+
+  test('registers a runtime.onMessage listener', () => {
+    expect(addMessageListener).toHaveBeenCalledTimes(1);
+    expect(typeof messageHandler).toBe('function');
   });
 });
 
@@ -296,5 +365,180 @@ describe('tabs.onUpdated', () => {
     const parsed = new Date(msg.timestamp);
     expect(isNaN(parsed.getTime())).toBe(false);
     expect(parsed.getFullYear()).toBeGreaterThan(2000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// read-and-snapshot message handler
+// ---------------------------------------------------------------------------
+describe('read-and-snapshot message handler', () => {
+  const baseMsg = {
+    type:      'read-and-snapshot',
+    tabId:     1,
+    timestamp: '2026-01-01T00:00:00Z',
+    url:       'https://example.com/',
+    title:     'Example',
+  };
+
+  // Helper to flush Promise microtasks so crypto.subtle.digest and Promise.all resolve.
+  async function flushPromises() {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  // Helper: set up mocks for a fully successful snapshot flow
+  function setupSuccessFlow({ downloadId = 42 } = {}) {
+    const fakeBlob = { type: 'message/rfc822' }; // stand-in for a Blob
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => cb(downloadId));
+    mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
+  }
+
+  test('ignores messages of unknown type', () => {
+    const result = messageHandler({ type: 'something-else' }, {}, jest.fn());
+    expect(result).toBe(false);
+    expect(mockSaveAsMHTML).not.toHaveBeenCalled();
+  });
+
+  test('calls pageCapture.saveAsMHTML with the tabId', () => {
+    setupSuccessFlow();
+    messageHandler(baseMsg, {}, jest.fn());
+    expect(mockSaveAsMHTML).toHaveBeenCalledWith({ tabId: 1 }, expect.any(Function));
+  });
+
+  test('on pageCapture error, calls sendResponse with error', () => {
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => {
+      global.chrome.runtime.lastError = { message: 'Tab not found' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    expect(mockDownloadsDownload).not.toHaveBeenCalled();
+  });
+
+  test('on successful capture, downloads to browser-visit-snapshots/<sha256>.mhtml', async () => {
+    setupSuccessFlow();
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+    expect(mockDownloadsDownload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+        saveAs: false,
+      }),
+      expect.any(Function),
+    );
+  });
+
+  test('reads blob as data URL and passes it to downloads.download', async () => {
+    setupSuccessFlow();
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+    expect(mockFileReaderInstance.readAsDataURL).toHaveBeenCalledTimes(1);
+    expect(mockDownloadsDownload).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'data:message/rfc822;base64,MOCKED_DATA' }),
+      expect.any(Function),
+    );
+  });
+
+  test('on download error, calls sendResponse with error', async () => {
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => {
+      global.chrome.runtime.lastError = { message: 'Download failed' };
+      cb(undefined);
+      global.chrome.runtime.lastError = null;
+    });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    expect(mockDownloadsOnChanged.addListener).not.toHaveBeenCalled();
+  });
+
+  test('listens for download completion after successful download start', async () => {
+    setupSuccessFlow();
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+    expect(mockDownloadsOnChanged.addListener).toHaveBeenCalledTimes(1);
+  });
+
+  test('on download complete, sends native message with read tag (no snapshot path)', async () => {
+    setupSuccessFlow({ downloadId: 42 });
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+
+    expect(mockSendNativeMessage).toHaveBeenCalledWith(
+      'com.browser.visit.logger',
+      { tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title },
+      expect.any(Function),
+    );
+  });
+
+  test('ignores download change events for other download IDs', async () => {
+    setupSuccessFlow({ downloadId: 42 });
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+
+    fireDownloadChanged({ id: 99, state: { current: 'complete' } });
+
+    expect(mockSendNativeMessage).not.toHaveBeenCalled();
+  });
+
+  test('on download interrupted, calls sendResponse with error', async () => {
+    setupSuccessFlow({ downloadId: 42 });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+
+    fireDownloadChanged({ id: 42, state: { current: 'interrupted' } });
+
+    expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    expect(mockDownloadsOnChanged.removeListener).toHaveBeenCalled();
+  });
+
+  test('on native message success, calls sendResponse with ok', async () => {
+    setupSuccessFlow();
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+
+    expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+  });
+
+  test('on native message error, calls sendResponse with error', async () => {
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+    mockSendNativeMessage.mockImplementation((host, msg, cb) => {
+      global.chrome.runtime.lastError = { message: 'Native host error' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+    expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+  });
+
+  test('removes onChanged listener after completion', async () => {
+    setupSuccessFlow({ downloadId: 42 });
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+    expect(mockDownloadsOnChanged.removeListener).toHaveBeenCalled();
+  });
+
+  test('returns true to keep message channel open', () => {
+    setupSuccessFlow();
+    const result = messageHandler(baseMsg, {}, jest.fn());
+    expect(result).toBe(true);
   });
 });

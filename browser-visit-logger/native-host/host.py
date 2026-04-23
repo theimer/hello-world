@@ -19,6 +19,9 @@ Tag action (from popup.js):
     { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read"|"skimmed" }
     → UPDATE memorable, read, or skimmed column on the row for that URL using
       the message timestamp; append 4-field TSV line.
+      For "read": the MHTML snapshot is saved by Chrome directly to
+      ~/Downloads/browser-visit-snapshots/<sha256(url)>.mhtml; the host only
+      records the timestamp.
 
 Schema
 ------

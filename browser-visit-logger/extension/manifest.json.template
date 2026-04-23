@@ -6,7 +6,9 @@
   "permissions": [
     "tabs",
     "webNavigation",
-    "nativeMessaging"
+    "nativeMessaging",
+    "pageCapture",
+    "downloads"
   ],
   "background": {
     "service_worker": "background.js"
