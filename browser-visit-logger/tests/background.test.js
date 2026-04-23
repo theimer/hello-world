@@ -401,13 +401,15 @@ describe('read-and-snapshot message handler', () => {
     expect(mockSaveAsMHTML).not.toHaveBeenCalled();
   });
 
-  test('calls pageCapture.saveAsMHTML with the tabId', () => {
+  // --- HTML page path (saveAsMHTML) ---
+
+  test('calls pageCapture.saveAsMHTML with the tabId for non-PDF pages', () => {
     setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
     expect(mockSaveAsMHTML).toHaveBeenCalledWith({ tabId: 1 }, expect.any(Function));
   });
 
-  test('on pageCapture error, calls sendResponse with error', () => {
+  test('on pageCapture error, calls sendResponse with error', async () => {
     mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => {
       global.chrome.runtime.lastError = { message: 'Tab not found' };
       cb(null);
@@ -415,11 +417,12 @@ describe('read-and-snapshot message handler', () => {
     });
     const sendResponse = jest.fn();
     messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
     expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
     expect(mockDownloadsDownload).not.toHaveBeenCalled();
   });
 
-  test('on successful capture, downloads to browser-visit-snapshots/<sha256>.mhtml', async () => {
+  test('HTML page: downloads to browser-visit-snapshots/<sha256>.mhtml', async () => {
     setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
@@ -432,7 +435,7 @@ describe('read-and-snapshot message handler', () => {
     );
   });
 
-  test('reads blob as data URL and passes it to downloads.download', async () => {
+  test('HTML page: reads blob as data URL and passes it to downloads.download', async () => {
     setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
@@ -441,6 +444,70 @@ describe('read-and-snapshot message handler', () => {
       expect.objectContaining({ url: 'data:message/rfc822;base64,MOCKED_DATA' }),
       expect.any(Function),
     );
+  });
+
+  // --- PDF path (direct URL download) ---
+
+  describe('PDF URL handling', () => {
+    const pdfUrls = [
+      'https://example.com/paper.pdf',
+      'https://example.com/paper.PDF',
+      'https://example.com/paper.pdf?v=2',
+      'https://example.com/paper.pdf#page=3',
+    ];
+    const nonPdfUrls = [
+      'https://example.com/',
+      'https://example.com/page.html',
+      'https://example.com/pdf-viewer',
+    ];
+
+    pdfUrls.forEach((url) => {
+      test(`treats "${url}" as PDF`, async () => {
+        mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+        mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
+        const pdfMsg = { ...baseMsg, url };
+        messageHandler(pdfMsg, {}, jest.fn());
+        await flushPromises();
+        // Should NOT call saveAsMHTML
+        expect(mockSaveAsMHTML).not.toHaveBeenCalled();
+        // Should download the original URL directly with .pdf extension
+        expect(mockDownloadsDownload).toHaveBeenCalledWith(
+          expect.objectContaining({ url, filename: expect.stringMatching(/\.pdf$/) }),
+          expect.any(Function),
+        );
+      });
+    });
+
+    nonPdfUrls.forEach((url) => {
+      test(`treats "${url}" as HTML (uses saveAsMHTML)`, () => {
+        setupSuccessFlow();
+        messageHandler({ ...baseMsg, url }, {}, jest.fn());
+        expect(mockSaveAsMHTML).toHaveBeenCalled();
+      });
+    });
+
+    test('PDF: filename uses sha256 hash with .pdf extension', async () => {
+      mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+      mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
+      const pdfMsg = { ...baseMsg, url: 'https://example.com/paper.pdf' };
+      messageHandler(pdfMsg, {}, jest.fn());
+      await flushPromises();
+      expect(mockDownloadsDownload).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.pdf`,
+          saveAs: false,
+        }),
+        expect.any(Function),
+      );
+    });
+
+    test('PDF: does not call FileReader', async () => {
+      mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+      mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
+      messageHandler({ ...baseMsg, url: 'https://example.com/doc.pdf' }, {}, jest.fn());
+      await flushPromises();
+      expect(mockFileReaderInstance.readAsDataURL).not.toHaveBeenCalled();
+    });
   });
 
   test('on download error, calls sendResponse with error', async () => {
