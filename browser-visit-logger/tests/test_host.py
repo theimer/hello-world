@@ -426,6 +426,60 @@ class TestTagVisit(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# query_visit
+# ---------------------------------------------------------------------------
+
+class TestQueryVisit(unittest.TestCase):
+
+    def _conn(self):
+        conn = sqlite3.connect(':memory:')
+        host.ensure_db(conn)
+        return conn
+
+    def test_returns_none_for_unknown_url(self):
+        conn = self._conn()
+        result = host.query_visit(conn, 'https://unknown.com')
+        conn.close()
+        self.assertIsNone(result)
+
+    def test_returns_record_for_known_url(self):
+        conn = self._conn()
+        host.insert_visit(conn, '2026-01-01T00:00:00Z', 'https://example.com', 'Example')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertIsNotNone(result)
+        self.assertEqual(result['timestamp'], '2026-01-01T00:00:00Z')
+        self.assertEqual(result['title'], 'Example')
+
+    def test_tag_fields_are_none_before_tagging(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertIsNone(result['memorable'])
+        self.assertIsNone(result['read'])
+        self.assertIsNone(result['skimmed'])
+
+    def test_tag_fields_reflect_applied_tags(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts-visit', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'memorable', 'ts-mem')
+        host.tag_visit(conn, 'https://example.com', 'read', 'ts-read')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertEqual(result['memorable'], 'ts-mem')
+        self.assertEqual(result['read'], 'ts-read')
+        self.assertIsNone(result['skimmed'])
+
+    def test_does_not_return_record_for_different_url(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://a.com', 'A')
+        result = host.query_visit(conn, 'https://b.com')
+        conn.close()
+        self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
 # Integration: run host.py as a subprocess (mirrors Chrome's usage)
 # ---------------------------------------------------------------------------
 
@@ -736,10 +790,49 @@ class TestIntegration(unittest.TestCase):
             self.assertIn('No record found', lines[1])
 
 
-# ---------------------------------------------------------------------------
-# save_snapshot
-# ---------------------------------------------------------------------------
+    def test_query_unknown_url_returns_null_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
+            self.assertEqual(resp['status'], 'ok')
+            self.assertIsNone(resp['record'])
 
+    def test_query_known_url_returns_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            resp = self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
+            self.assertEqual(resp['status'], 'ok')
+            self.assertIsNotNone(resp['record'])
+            self.assertEqual(resp['record']['timestamp'], 'ts-visit')
+            self.assertEqual(resp['record']['title'], 'Example')
+
+    def test_query_reflects_applied_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            self._invoke(
+                {'timestamp': 'ts-mem', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
+                tmp,
+            )
+            resp = self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
+            self.assertEqual(resp['record']['memorable'], 'ts-mem')
+            self.assertIsNone(resp['record']['read'])
+            self.assertIsNone(resp['record']['skimmed'])
+
+    def test_query_does_not_write_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    def test_query_missing_url_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._invoke({'action': 'query'}, tmp)
+            self.assertEqual(resp['status'], 'error')
+            self.assertIn('url', resp.get('message', ''))
 
 
 if __name__ == '__main__':
