@@ -4,16 +4,44 @@
   <meta charset="utf-8">
   <style>
     body {
-      width: 200px;
+      width: 220px;
       padding: 14px;
       font-family: sans-serif;
       margin: 0;
     }
     h3 {
-      margin: 0 0 12px;
+      margin: 0 0 10px;
       font-size: 14px;
       color: #333;
     }
+    /* Visit history */
+    #visit-info {
+      display: none;
+      margin-bottom: 10px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: #444;
+    }
+    .info-label {
+      white-space: nowrap;
+      color: #666;
+    }
+    .info-value {
+      text-align: right;
+      color: #222;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #ddd;
+      margin: 10px 0;
+    }
+    /* Tag buttons */
     button {
       display: block;
       width: 100%;
@@ -37,6 +65,10 @@
   </style>
 </head>
 <body>
+  <div id="visit-info">
+    <div id="visit-rows"></div>
+    <hr>
+  </div>
   <h3>Mark this page</h3>
   <button data-tag="memorable">&#9733; Memorable</button>
   <button data-tag="read">&#10003; Read</button>

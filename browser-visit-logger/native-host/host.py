@@ -142,6 +142,23 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
     conn.commit()
 
 
+def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
+    """Return the visit record for url as a dict, or None if no record exists."""
+    row = conn.execute(
+        "SELECT timestamp, title, memorable, read, skimmed FROM visits WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        'timestamp': row[0],
+        'title':     row[1],
+        'memorable': row[2],
+        'read':      row[3],
+        'skimmed':   row[4],
+    }
+
+
 def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> bool:
     """Set the memorable, read, or skimmed timestamp on the visit record for url.
 
@@ -208,7 +225,26 @@ def main() -> None:
         write_message({'status': 'error', 'message': str(exc)})
         return
 
-    url       = (message.get('url') or '').strip()
+    url    = (message.get('url') or '').strip()
+    action = (message.get('action') or '').strip()
+
+    # Query action: read-only lookup, no log writes.
+    if action == 'query':
+        if not url:
+            write_message({'status': 'error', 'message': 'url is required'})
+            return
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            ensure_db(conn)
+            record = query_visit(conn, url)
+            conn.close()
+        except Exception as exc:
+            logger.error('SQLite query failed: %s', exc)
+            write_message({'status': 'error', 'message': str(exc)})
+            return
+        write_message({'status': 'ok', 'record': record})
+        return
+
     timestamp = (message.get('timestamp') or '').strip()
     title     = message.get('title') or ''
     tag       = (message.get('tag') or '').strip()
