@@ -16,12 +16,12 @@ Auto-log (from background.js):
     → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
 
 Tag action (from popup.js):
-    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read"|"skimmed",
-      "snapshot_download_path": "..." (optional, read tag only) }
+    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read"|"skimmed" }
     → UPDATE memorable, read, or skimmed column on the row for that URL using
       the message timestamp; append 4-field TSV line.
-      For "read" with snapshot_download_path: move the MHTML file to
-      SNAPSHOTS_DIR/<md5(url)>.mhtml.
+      For "read": the MHTML snapshot is saved by Chrome directly to
+      ~/Downloads/browser-visit-snapshots/<sha256(url)>.mhtml; the host only
+      records the timestamp.
 
 Schema
 ------
@@ -35,11 +35,9 @@ Schema
     )
 """
 
-import hashlib
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import struct
 import sys
@@ -49,11 +47,10 @@ from logging.handlers import RotatingFileHandler
 # Paths — default to the user's home directory; overrideable via env vars
 # (env var overrides are used by the test suite to isolate test output)
 # ---------------------------------------------------------------------------
-HOME          = os.path.expanduser('~')
-LOG_FILE      = os.environ.get('BVL_LOG_FILE',      os.path.join(HOME, 'browser-visits.log'))
-DB_FILE       = os.environ.get('BVL_DB_FILE',       os.path.join(HOME, 'browser-visits.db'))
-HOST_LOG      = os.environ.get('BVL_HOST_LOG',      os.path.join(HOME, 'browser-visits-host.log'))
-SNAPSHOTS_DIR = os.environ.get('BVL_SNAPSHOTS_DIR', os.path.join(HOME, 'browser-visit-snapshots'))
+HOME     = os.path.expanduser('~')
+LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
+DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
+HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 
 # ---------------------------------------------------------------------------
 # Host process logging (errors/debug — never written to stderr)
@@ -196,21 +193,6 @@ def append_result_log(result: str) -> None:
         f.write(sanitise(result) + '\n')
 
 # ---------------------------------------------------------------------------
-# Snapshot helper
-# ---------------------------------------------------------------------------
-
-def save_snapshot(url: str, tmp_path: str) -> str:
-    """Move MHTML file from tmp_path to SNAPSHOTS_DIR/<md5(url)>.mhtml.
-
-    Returns the destination path.
-    """
-    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-    md5 = hashlib.md5(url.encode('utf-8')).hexdigest()
-    dest = os.path.join(SNAPSHOTS_DIR, md5 + '.mhtml')
-    shutil.move(tmp_path, dest)
-    return dest
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -241,12 +223,9 @@ def main() -> None:
         write_message({'status': 'error', 'message': f'invalid tag: {tag}'})
         return
 
-    snapshot_download_path = (message.get('snapshot_download_path') or '').strip()
-
     errors = []
     no_record = False
     no_record_msg = 'No record found for this URL — visit the page before tagging'
-    snapshot_error = ''
 
     # First write: record the intended action
     try:
@@ -270,21 +249,11 @@ def main() -> None:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
 
-    # Move snapshot file (read tag only; non-fatal if it fails)
-    if tag == 'read' and snapshot_download_path and not no_record:
-        try:
-            save_snapshot(url, snapshot_download_path)
-        except Exception as exc:
-            logger.error('Snapshot move failed: %s', exc)
-            snapshot_error = str(exc)
-
     # Second write: record the result
     if no_record:
         log_result = f'error: {no_record_msg}'
     elif errors:
         log_result = f'error: {"; ".join(errors)}'
-    elif snapshot_error:
-        log_result = f'success (snapshot error: {snapshot_error})'
     else:
         log_result = 'success'
     try:
