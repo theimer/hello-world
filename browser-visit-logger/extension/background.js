@@ -92,47 +92,53 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
 
-    const blobUrl = URL.createObjectURL(mhtmlData);
+    // URL.createObjectURL is not available in MV3 service workers; use a data
+    // URL instead so chrome.downloads can access the blob data.
     const tmpFilename = `bvl-snapshot-${Date.now()}.mhtml`;
-
-    chrome.downloads.download({ url: blobUrl, filename: tmpFilename, saveAs: false }, (downloadId) => {
-      if (chrome.runtime.lastError || downloadId === undefined) {
-        URL.revokeObjectURL(blobUrl);
-        sendResponse({
-          status: 'error',
-          message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
-        });
+    const reader = new FileReader();
+    reader.addEventListener('loadend', () => {
+      if (reader.error) {
+        sendResponse({ status: 'error', message: 'Failed to read snapshot: ' + reader.error });
         return;
       }
 
-      const onChanged = (delta) => {
-        if (delta.id !== downloadId) return;
-
-        if (delta.state?.current === 'complete') {
-          chrome.downloads.onChanged.removeListener(onChanged);
-          URL.revokeObjectURL(blobUrl);
-          chrome.downloads.search({ id: downloadId }, ([item]) => {
-            chrome.runtime.sendNativeMessage(NATIVE_HOST, {
-              timestamp, url, title,
-              tag: 'read',
-              snapshot_download_path: item.filename,
-            }, (response) => {
-              if (chrome.runtime.lastError) {
-                sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
-              } else {
-                sendResponse(response);
-              }
-            });
+      chrome.downloads.download({ url: reader.result, filename: tmpFilename, saveAs: false }, (downloadId) => {
+        if (chrome.runtime.lastError || downloadId === undefined) {
+          sendResponse({
+            status: 'error',
+            message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
           });
-        } else if (delta.state?.current === 'interrupted') {
-          chrome.downloads.onChanged.removeListener(onChanged);
-          URL.revokeObjectURL(blobUrl);
-          sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
+          return;
         }
-      };
 
-      chrome.downloads.onChanged.addListener(onChanged);
+        const onChanged = (delta) => {
+          if (delta.id !== downloadId) return;
+
+          if (delta.state?.current === 'complete') {
+            chrome.downloads.onChanged.removeListener(onChanged);
+            chrome.downloads.search({ id: downloadId }, ([item]) => {
+              chrome.runtime.sendNativeMessage(NATIVE_HOST, {
+                timestamp, url, title,
+                tag: 'read',
+                snapshot_download_path: item.filename,
+              }, (response) => {
+                if (chrome.runtime.lastError) {
+                  sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
+                } else {
+                  sendResponse(response);
+                }
+              });
+            });
+          } else if (delta.state?.current === 'interrupted') {
+            chrome.downloads.onChanged.removeListener(onChanged);
+            sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
+          }
+        };
+
+        chrome.downloads.onChanged.addListener(onChanged);
+      });
     });
+    reader.readAsDataURL(mhtmlData);
   });
 
   return true; // Keep message channel open for async response

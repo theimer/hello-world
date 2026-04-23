@@ -20,9 +20,27 @@ const addTabUpdateListener  = jest.fn();
 const addMessageListener    = jest.fn();
 
 // Snapshot-related mocks
-const mockSaveAsMHTML      = jest.fn();
+const mockSaveAsMHTML       = jest.fn();
 const mockDownloadsDownload = jest.fn();
-const mockDownloadsSearch  = jest.fn();
+const mockDownloadsSearch   = jest.fn();
+
+// FileReader mock — readAsDataURL fires 'loadend' synchronously by default.
+// Tests that need to simulate a read error can set mockFileReaderInstance.error.
+let mockFileReaderInstance;
+function buildFileReaderMock() {
+  mockFileReaderInstance = {
+    addEventListener: jest.fn(),
+    readAsDataURL:    jest.fn(),
+    result: 'data:message/rfc822;base64,MOCKED_DATA',
+    error:  null,
+  };
+  mockFileReaderInstance.readAsDataURL.mockImplementation(() => {
+    for (const [event, cb] of mockFileReaderInstance.addEventListener.mock.calls) {
+      if (event === 'loadend') cb();
+    }
+  });
+  global.FileReader = jest.fn(() => mockFileReaderInstance);
+}
 
 // downloads.onChanged needs add/removeListener so tests can fire deltas
 const onChangedListeners = [];
@@ -39,10 +57,6 @@ function fireDownloadChanged(delta) {
 }
 
 function buildChromeMock() {
-  // Preserve the real URL constructor so new URL(...) works in isTitleMeaningful;
-  // only mock the static methods used by the snapshot download flow.
-  global.URL.createObjectURL = jest.fn(() => 'blob:mock-url');
-  global.URL.revokeObjectURL = jest.fn();
 
   global.chrome = {
     runtime: {
@@ -90,8 +104,9 @@ beforeEach(() => {
   mockDownloadsOnChanged.removeListener.mockClear();
   onChangedListeners.length = 0;
 
-  // Fresh chrome mock
+  // Fresh chrome mock and FileReader mock
   buildChromeMock();
+  buildFileReaderMock();
 
   // Fresh module (new pendingVisits Map, fresh listener registrations)
   jest.resetModules();
@@ -400,13 +415,14 @@ describe('read-and-snapshot message handler', () => {
     );
   });
 
-  test('creates and revokes a blob URL around the download', () => {
-    setupSuccessFlow({ downloadId: 42 });
+  test('reads blob as data URL and passes it to downloads.download', () => {
+    setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
-    expect(global.URL.createObjectURL).toHaveBeenCalledTimes(1);
-    expect(global.URL.revokeObjectURL).not.toHaveBeenCalled(); // not yet — download still in progress
-    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
-    expect(global.URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
+    expect(mockFileReaderInstance.readAsDataURL).toHaveBeenCalledTimes(1);
+    expect(mockDownloadsDownload).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'data:message/rfc822;base64,MOCKED_DATA' }),
+      expect.any(Function),
+    );
   });
 
   test('on download error, calls sendResponse with error', () => {
