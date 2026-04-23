@@ -255,8 +255,13 @@ class TestDatabase(unittest.TestCase):
     def test_ensure_db_is_idempotent(self):
         conn = sqlite3.connect(':memory:')
         host.ensure_db(conn)
-        host.ensure_db(conn)  # second call must not raise
+        host.ensure_db(conn)  # second call must not raise or corrupt the schema
+        cols = self._cols(conn)
         conn.close()
+        self.assertIn('url', cols)
+        self.assertIn('memorable', cols)
+        self.assertIn('read', cols)
+        self.assertIn('skimmed', cols)
 
     def test_ensure_db_migrates_old_id_based_schema(self):
         # Simulate a database created before the url-PK redesign
