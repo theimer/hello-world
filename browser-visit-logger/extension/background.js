@@ -1,3 +1,5 @@
+'use strict';
+
 const NATIVE_HOST = 'com.browser.visit.logger';
 const TITLE_FLUSH_TIMEOUT_MS = 5000;
 
@@ -73,4 +75,64 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
   entry.title = changeInfo.title;
   flushVisit(tabId);
+});
+
+// Handle "read" tag from popup: capture MHTML snapshot, download it, then tag via native host.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type !== 'read-and-snapshot') return false;
+
+  const { tabId, timestamp, url, title } = msg;
+
+  chrome.pageCapture.saveAsMHTML({ tabId }, (mhtmlData) => {
+    if (chrome.runtime.lastError || !mhtmlData) {
+      sendResponse({
+        status: 'error',
+        message: 'Snapshot capture failed: ' + (chrome.runtime.lastError?.message || 'no data'),
+      });
+      return;
+    }
+
+    const blobUrl = URL.createObjectURL(mhtmlData);
+    const tmpFilename = `bvl-snapshot-${Date.now()}.mhtml`;
+
+    chrome.downloads.download({ url: blobUrl, filename: tmpFilename, saveAs: false }, (downloadId) => {
+      URL.revokeObjectURL(blobUrl);
+
+      if (chrome.runtime.lastError || downloadId === undefined) {
+        sendResponse({
+          status: 'error',
+          message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
+        });
+        return;
+      }
+
+      const onChanged = (delta) => {
+        if (delta.id !== downloadId) return;
+
+        if (delta.state?.current === 'complete') {
+          chrome.downloads.onChanged.removeListener(onChanged);
+          chrome.downloads.search({ id: downloadId }, ([item]) => {
+            chrome.runtime.sendNativeMessage(NATIVE_HOST, {
+              timestamp, url, title,
+              tag: 'read',
+              snapshot_download_path: item.filename,
+            }, (response) => {
+              if (chrome.runtime.lastError) {
+                sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
+              } else {
+                sendResponse(response);
+              }
+            });
+          });
+        } else if (delta.state?.current === 'interrupted') {
+          chrome.downloads.onChanged.removeListener(onChanged);
+          sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
+        }
+      };
+
+      chrome.downloads.onChanged.addListener(onChanged);
+    });
+  });
+
+  return true; // Keep message channel open for async response
 });
