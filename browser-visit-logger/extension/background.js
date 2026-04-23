@@ -96,9 +96,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const tmpFilename = `bvl-snapshot-${Date.now()}.mhtml`;
 
     chrome.downloads.download({ url: blobUrl, filename: tmpFilename, saveAs: false }, (downloadId) => {
-      URL.revokeObjectURL(blobUrl);
-
       if (chrome.runtime.lastError || downloadId === undefined) {
+        URL.revokeObjectURL(blobUrl);
         sendResponse({
           status: 'error',
           message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
@@ -111,6 +110,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         if (delta.state?.current === 'complete') {
           chrome.downloads.onChanged.removeListener(onChanged);
+          URL.revokeObjectURL(blobUrl);
           chrome.downloads.search({ id: downloadId }, ([item]) => {
             chrome.runtime.sendNativeMessage(NATIVE_HOST, {
               timestamp, url, title,
@@ -126,6 +126,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           });
         } else if (delta.state?.current === 'interrupted') {
           chrome.downloads.onChanged.removeListener(onChanged);
+          URL.revokeObjectURL(blobUrl);
           sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
         }
       };

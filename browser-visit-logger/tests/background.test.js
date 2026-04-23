@@ -401,9 +401,11 @@ describe('read-and-snapshot message handler', () => {
   });
 
   test('creates and revokes a blob URL around the download', () => {
-    setupSuccessFlow();
+    setupSuccessFlow({ downloadId: 42 });
     messageHandler(baseMsg, {}, jest.fn());
     expect(global.URL.createObjectURL).toHaveBeenCalledTimes(1);
+    expect(global.URL.revokeObjectURL).not.toHaveBeenCalled(); // not yet — download still in progress
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
     expect(global.URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock-url');
   });
 
