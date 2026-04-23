@@ -77,12 +77,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   flushVisit(tabId);
 });
 
-// Handle "read" tag from popup: capture MHTML snapshot, save it to
-// ~/Downloads/browser-visit-snapshots/<sha256(url)>.mhtml, then tag via native host.
+// Handle "read" tag from popup: save a snapshot of the tab to
+// ~/Downloads/browser-visit-snapshots/<sha256(url)>.<ext>, then tag via native host.
+//
+// For PDF URLs the original file is downloaded directly (MHTML capture of the
+// PDF viewer produces garbled output). For all other pages, chrome.pageCapture
+// saves a complete offline-capable MHTML bundle.
 //
 // Chrome's downloads API can only write within the Downloads directory, so the
 // snapshot lives there. The native host never touches the file; it only records
 // the read timestamp in the database.
+
+function isPdfUrl(url) {
+  // Match .pdf at end of path, before query string or fragment.
+  return /\.pdf([?#]|$)/i.test(url);
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type !== 'read-and-snapshot') return false;
 
@@ -97,67 +107,70 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .join('')
     );
 
-  chrome.pageCapture.saveAsMHTML({ tabId }, (mhtmlData) => {
-    if (chrome.runtime.lastError || !mhtmlData) {
-      sendResponse({
-        status: 'error',
-        message: 'Snapshot capture failed: ' + (chrome.runtime.lastError?.message || 'no data'),
-      });
-      return;
-    }
+  // For PDFs: download the original URL directly (avoids the garbled-viewer
+  // problem). For everything else: capture MHTML via pageCapture and convert
+  // the blob to a data URL (URL.createObjectURL is unavailable in MV3 workers).
+  const isPdf = isPdfUrl(url);
+  const ext   = isPdf ? 'pdf' : 'mhtml';
 
-    // URL.createObjectURL is not available in MV3 service workers; convert
-    // the blob to a data URL so chrome.downloads can read it.
-    const dataUrlPromise = new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.addEventListener('loadend', () => {
-        if (reader.error) reject(reader.error);
-        else resolve(reader.result);
-      });
-      reader.readAsDataURL(mhtmlData);
-    });
-
-    Promise.all([hashPromise, dataUrlPromise])
-      .then(([hexHash, dataUrl]) => {
-        const filename = `browser-visit-snapshots/${hexHash}.mhtml`;
-
-        chrome.downloads.download({ url: dataUrl, filename, saveAs: false }, (downloadId) => {
-          if (chrome.runtime.lastError || downloadId === undefined) {
-            sendResponse({
-              status: 'error',
-              message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
-            });
+  const contentPromise = isPdf
+    ? Promise.resolve(url)
+    : new Promise((resolve, reject) => {
+        chrome.pageCapture.saveAsMHTML({ tabId }, (mhtmlData) => {
+          if (chrome.runtime.lastError || !mhtmlData) {
+            reject(new Error('Snapshot capture failed: ' +
+              (chrome.runtime.lastError?.message || 'no data')));
             return;
           }
-
-          const onChanged = (delta) => {
-            if (delta.id !== downloadId) return;
-
-            if (delta.state?.current === 'complete') {
-              chrome.downloads.onChanged.removeListener(onChanged);
-              chrome.runtime.sendNativeMessage(NATIVE_HOST, {
-                timestamp, url, title,
-                tag: 'read',
-              }, (response) => {
-                if (chrome.runtime.lastError) {
-                  sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
-                } else {
-                  sendResponse(response);
-                }
-              });
-            } else if (delta.state?.current === 'interrupted') {
-              chrome.downloads.onChanged.removeListener(onChanged);
-              sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
-            }
-          };
-
-          chrome.downloads.onChanged.addListener(onChanged);
+          const reader = new FileReader();
+          reader.addEventListener('loadend', () => {
+            if (reader.error) reject(reader.error);
+            else resolve(reader.result);
+          });
+          reader.readAsDataURL(mhtmlData);
         });
-      })
-      .catch((err) => {
-        sendResponse({ status: 'error', message: 'Snapshot preparation failed: ' + err });
       });
-  });
+
+  Promise.all([hashPromise, contentPromise])
+    .then(([hexHash, downloadUrl]) => {
+      const filename = `browser-visit-snapshots/${hexHash}.${ext}`;
+
+      chrome.downloads.download({ url: downloadUrl, filename, saveAs: false }, (downloadId) => {
+        if (chrome.runtime.lastError || downloadId === undefined) {
+          sendResponse({
+            status: 'error',
+            message: 'Snapshot download failed: ' + (chrome.runtime.lastError?.message || 'unknown'),
+          });
+          return;
+        }
+
+        const onChanged = (delta) => {
+          if (delta.id !== downloadId) return;
+
+          if (delta.state?.current === 'complete') {
+            chrome.downloads.onChanged.removeListener(onChanged);
+            chrome.runtime.sendNativeMessage(NATIVE_HOST, {
+              timestamp, url, title,
+              tag: 'read',
+            }, (response) => {
+              if (chrome.runtime.lastError) {
+                sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
+              } else {
+                sendResponse(response);
+              }
+            });
+          } else if (delta.state?.current === 'interrupted') {
+            chrome.downloads.onChanged.removeListener(onChanged);
+            sendResponse({ status: 'error', message: 'Snapshot download was interrupted' });
+          }
+        };
+
+        chrome.downloads.onChanged.addListener(onChanged);
+      });
+    })
+    .catch((err) => {
+      sendResponse({ status: 'error', message: String(err) });
+    });
 
   return true; // Keep message channel open for async response
 });
