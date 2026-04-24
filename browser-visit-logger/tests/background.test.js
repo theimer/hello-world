@@ -508,13 +508,13 @@ describe('read-and-snapshot message handler', () => {
     expect(mockDownloadsDownload).not.toHaveBeenCalled();
   });
 
-  test('HTML page: downloads to browser-visit-snapshots/<sha256>.mhtml', async () => {
+  test('HTML page: downloads to <sha256>.mhtml in Downloads root', async () => {
     setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
     expect(mockDownloadsDownload).toHaveBeenCalledWith(
       expect.objectContaining({
-        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+        filename: `${MOCK_HEX_HASH}.mhtml`,
         saveAs: false,
       }),
       expect.any(Function),
@@ -580,7 +580,7 @@ describe('read-and-snapshot message handler', () => {
       await flushPromises();
       expect(mockDownloadsDownload).toHaveBeenCalledWith(
         expect.objectContaining({
-          filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.pdf`,
+          filename: `${MOCK_HEX_HASH}.pdf`,
           saveAs: false,
         }),
         expect.any(Function),

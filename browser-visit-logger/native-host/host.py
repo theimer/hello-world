@@ -35,9 +35,12 @@ Schema
     )
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import sqlite3
 import struct
 import sys
@@ -47,10 +50,12 @@ from logging.handlers import RotatingFileHandler
 # Paths — default to the user's home directory; overrideable via env vars
 # (env var overrides are used by the test suite to isolate test output)
 # ---------------------------------------------------------------------------
-HOME     = os.path.expanduser('~')
-LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
-DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
-HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
+HOME          = os.path.expanduser('~')
+LOG_FILE      = os.environ.get('BVL_LOG_FILE',      os.path.join(HOME, 'browser-visits.log'))
+DB_FILE       = os.environ.get('BVL_DB_FILE',       os.path.join(HOME, 'browser-visits.db'))
+HOST_LOG      = os.environ.get('BVL_HOST_LOG',      os.path.join(HOME, 'browser-visits-host.log'))
+DOWNLOADS_DIR = os.environ.get('BVL_DOWNLOADS_DIR', os.path.join(HOME, 'Downloads'))
+SNAPSHOTS_DIR = os.environ.get('BVL_SNAPSHOTS_DIR', os.path.join(HOME, 'browser-visit-snapshots'))
 
 # ---------------------------------------------------------------------------
 # Host process logging (errors/debug — never written to stderr)
@@ -235,6 +240,38 @@ def append_result_log(result: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Snapshot helpers
+# ---------------------------------------------------------------------------
+
+def _snapshot_filename(url: str) -> str:
+    """Compute the snapshot filename for a URL.
+
+    Mirrors the logic in background.js: SHA-256 of the UTF-8-encoded URL,
+    hex-encoded, with extension .pdf for PDF URLs and .mhtml otherwise.
+    """
+    hex_hash = hashlib.sha256(url.encode('utf-8')).hexdigest()
+    ext = 'pdf' if re.search(r'\.pdf([?#]|$)', url, re.IGNORECASE) else 'mhtml'
+    return f'{hex_hash}.{ext}'
+
+
+def move_snapshot(url: str) -> None:
+    """Move the downloaded snapshot for *url* from DOWNLOADS_DIR to SNAPSHOTS_DIR.
+
+    Raises FileNotFoundError if the expected file is not present in DOWNLOADS_DIR.
+    """
+    filename = _snapshot_filename(url)
+    src = os.path.join(DOWNLOADS_DIR, filename)
+    if not os.path.exists(src):
+        raise FileNotFoundError(f'Snapshot not found in Downloads: {filename}')
+    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+    shutil.move(src, os.path.join(SNAPSHOTS_DIR, filename))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 VALID_TAGS = {'of_interest', 'read', 'skimmed'}
 
 
@@ -307,9 +344,22 @@ def main() -> None:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
 
+    # Move snapshot for read tag (only when a record exists for the URL)
+    snapshot_error = None
+    if tag == 'read' and not no_record:
+        try:
+            move_snapshot(url)
+        except FileNotFoundError as exc:
+            snapshot_error = str(exc)
+        except Exception as exc:
+            logger.error('Snapshot move failed: %s', exc)
+            snapshot_error = f'Snapshot move failed: {exc}'
+
     # Second write: record the result
     if no_record:
         log_result = f'error: {no_record_msg}'
+    elif snapshot_error:
+        log_result = f'error: {snapshot_error}'
     elif errors:
         log_result = f'error: {"; ".join(errors)}'
     else:
@@ -321,6 +371,8 @@ def main() -> None:
 
     if no_record:
         write_message({'status': 'error', 'message': no_record_msg})
+    elif snapshot_error:
+        write_message({'status': 'error', 'message': snapshot_error})
     elif errors:
         write_message({'status': 'error', 'errors': errors})
     else:

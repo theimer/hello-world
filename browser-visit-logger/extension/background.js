@@ -134,7 +134,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   Promise.all([hashPromise, contentPromise])
     .then(([hexHash, downloadUrl]) => {
-      const filename = `browser-visit-snapshots/${hexHash}.${ext}`;
+      const filename = `${hexHash}.${ext}`;
 
       chrome.downloads.download({ url: downloadUrl, filename, saveAs: false }, (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {
