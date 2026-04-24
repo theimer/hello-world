@@ -201,11 +201,11 @@ describe('showVisitInfo', () => {
     expect(labels).not.toContain('~ Skimmed');
   });
 
-  test('renders the "Visited" row from record.timestamp', async () => {
+  test('renders the "First visited" row from record.timestamp', async () => {
     nativeReturns({ status: 'ok', record: RECORD });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
-    expect(labels).toContain('Visited');
+    expect(labels).toContain('First visited');
   });
 
   test('renders the "★ Memorable" row when memorable is set', async () => {
