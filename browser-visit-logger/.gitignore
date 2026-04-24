@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 native-host/generated_key.pem
 extension/manifest.json
+.coverage
+coverage/
