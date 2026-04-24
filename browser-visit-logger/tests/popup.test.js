@@ -159,7 +159,7 @@ describe('formatTs', () => {
 describe('showVisitInfo', () => {
   const RECORD = {
     timestamp: '2026-04-23T02:10:31.451Z',
-    of_interest: '2026-04-23T14:09:34.261Z',
+    of_interest: true,
     read:      '2026-04-23T02:27:10.366Z',
     skimmed:   null,
   };

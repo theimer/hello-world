@@ -173,11 +173,11 @@ def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
     if row is None:
         return None
     return {
-        'timestamp': row[0],
-        'title':     row[1],
-        'of_interest': row[2],
-        'read':      row[3],
-        'skimmed':   row[4],
+        'timestamp':   row[0],
+        'title':       row[1],
+        'of_interest': True if row[2] else None,
+        'read':        row[3],
+        'skimmed':     row[4],
     }
 
 
@@ -188,8 +188,8 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
     """
     if tag == 'of_interest':
         cursor = conn.execute(
-            "UPDATE visits SET of_interest = ? WHERE url = ?",
-            (tag_timestamp, url),
+            "UPDATE visits SET of_interest = 1 WHERE url = ?",
+            (url,),
         )
     elif tag == 'read':
         cursor = conn.execute(
