@@ -156,6 +156,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }, (response) => {
               if (chrome.runtime.lastError) {
                 sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
+              } else if (response && response.status === 'ok') {
+                // host.py copied the file to ~/browser-visit-snapshots/.
+                // Now delete the original from ~/Downloads/ — Chrome has
+                // permission to remove its own downloaded files.
+                chrome.downloads.removeFile(downloadId, () => {
+                  void chrome.runtime.lastError; // ignore cleanup errors
+                });
+                sendResponse(response);
               } else {
                 sendResponse(response);
               }

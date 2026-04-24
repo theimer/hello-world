@@ -255,8 +255,12 @@ def _snapshot_filename(url: str) -> str:
     return f'{hex_hash}.{ext}'
 
 
-def move_snapshot(url: str) -> None:
-    """Move the downloaded snapshot for *url* from DOWNLOADS_DIR to SNAPSHOTS_DIR.
+def save_snapshot(url: str) -> None:
+    """Copy the downloaded snapshot for *url* from DOWNLOADS_DIR to SNAPSHOTS_DIR.
+
+    Uses copy rather than move because macOS TCC blocks Python (launched as a
+    native messaging host by Chrome) from deleting files in ~/Downloads.  Chrome
+    is responsible for removing the source file via chrome.downloads.removeFile().
 
     Raises FileNotFoundError if the expected file is not present in DOWNLOADS_DIR.
     """
@@ -265,7 +269,7 @@ def move_snapshot(url: str) -> None:
     if not os.path.exists(src):
         raise FileNotFoundError(f'Snapshot not found in Downloads: {filename}')
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-    shutil.move(src, os.path.join(SNAPSHOTS_DIR, filename))
+    shutil.copy2(src, os.path.join(SNAPSHOTS_DIR, filename))
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +352,12 @@ def main() -> None:
     snapshot_error = None
     if tag == 'read' and not no_record:
         try:
-            move_snapshot(url)
+            save_snapshot(url)
         except FileNotFoundError as exc:
             snapshot_error = str(exc)
         except Exception as exc:
-            logger.error('Snapshot move failed: %s', exc)
-            snapshot_error = f'Snapshot move failed: {exc}'
+            logger.error('Snapshot save failed: %s', exc)
+            snapshot_error = f'Snapshot save failed: {exc}'
 
     # Second write: record the result
     if no_record:

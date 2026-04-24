@@ -20,8 +20,9 @@ const addTabUpdateListener  = jest.fn();
 const addMessageListener    = jest.fn();
 
 // Snapshot-related mocks
-const mockSaveAsMHTML       = jest.fn();
-const mockDownloadsDownload = jest.fn();
+const mockSaveAsMHTML         = jest.fn();
+const mockDownloadsDownload   = jest.fn();
+const mockDownloadsRemoveFile = jest.fn();
 
 // FileReader mock — readAsDataURL fires 'loadend' synchronously by default.
 // Tests that need to simulate a read error can set mockFileReaderInstance.error.
@@ -84,8 +85,9 @@ function buildChromeMock() {
       saveAsMHTML: mockSaveAsMHTML,
     },
     downloads: {
-      download:  mockDownloadsDownload,
-      onChanged: mockDownloadsOnChanged,
+      download:   mockDownloadsDownload,
+      removeFile: mockDownloadsRemoveFile,
+      onChanged:  mockDownloadsOnChanged,
     },
   };
 }
@@ -107,6 +109,7 @@ beforeEach(() => {
   addMessageListener.mockClear();
   mockSaveAsMHTML.mockClear();
   mockDownloadsDownload.mockClear();
+  mockDownloadsRemoveFile.mockClear();
   mockDownloadsOnChanged.addListener.mockClear();
   mockDownloadsOnChanged.removeListener.mockClear();
   onChangedListeners.length = 0;
@@ -478,6 +481,7 @@ describe('read-and-snapshot message handler', () => {
     const fakeBlob = { type: 'message/rfc822' }; // stand-in for a Blob
     mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
     mockDownloadsDownload.mockImplementation((opts, cb) => cb(downloadId));
+    mockDownloadsRemoveFile.mockImplementation((id, cb) => cb && cb());
     mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
   }
 
@@ -663,6 +667,50 @@ describe('read-and-snapshot message handler', () => {
     fireDownloadChanged({ id: 42, state: { current: 'complete' } });
 
     expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+  });
+
+  test('on native message success, removes the download file using the correct downloadId', async () => {
+    setupSuccessFlow({ downloadId: 99 });
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+
+    fireDownloadChanged({ id: 99, state: { current: 'complete' } });
+
+    expect(mockDownloadsRemoveFile).toHaveBeenCalledWith(99, expect.any(Function));
+  });
+
+  test('on native message error (lastError), does not call removeFile', async () => {
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+    mockSendNativeMessage.mockImplementation((host, msg, cb) => {
+      global.chrome.runtime.lastError = { message: 'Native host error' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    messageHandler(baseMsg, {}, jest.fn());
+    await flushPromises();
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+    expect(mockDownloadsRemoveFile).not.toHaveBeenCalled();
+  });
+
+  test('on native message error response (no lastError), forwards error and does not call removeFile', async () => {
+    // Covers the else-branch where host.py returns {status:'error'} without a lastError
+    // (e.g. snapshot file not found in Downloads)
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
+    mockSendNativeMessage.mockImplementation((host, msg, cb) =>
+      cb({ status: 'error', message: 'Snapshot not found in Downloads' })
+    );
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'error', message: 'Snapshot not found in Downloads' })
+    );
+    expect(mockDownloadsRemoveFile).not.toHaveBeenCalled();
   });
 
   test('on native message error, calls sendResponse with error', async () => {

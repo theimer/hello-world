@@ -586,12 +586,12 @@ class TestSnapshotFilename(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# move_snapshot
+# save_snapshot
 # ---------------------------------------------------------------------------
 
-class TestMoveSnapshot(unittest.TestCase):
+class TestSaveSnapshot(unittest.TestCase):
 
-    def test_moves_file_from_downloads_to_snapshots(self):
+    def test_copies_file_to_snapshots_leaving_source_in_downloads(self):
         url = 'https://example.com/'
         with tempfile.TemporaryDirectory() as tmp:
             downloads = os.path.join(tmp, 'downloads')
@@ -601,9 +601,10 @@ class TestMoveSnapshot(unittest.TestCase):
             Path(downloads, filename).write_text('content')
             with patch.object(host, 'DOWNLOADS_DIR', downloads), \
                  patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.move_snapshot(url)
+                host.save_snapshot(url)
+            # File is copied to snapshots; source remains (Chrome removes it via removeFile)
             self.assertTrue(Path(snapshots, filename).exists())
-            self.assertFalse(Path(downloads, filename).exists())
+            self.assertTrue(Path(downloads, filename).exists())
 
     def test_raises_file_not_found_when_file_missing(self):
         url = 'https://example.com/'
@@ -613,7 +614,7 @@ class TestMoveSnapshot(unittest.TestCase):
             with patch.object(host, 'DOWNLOADS_DIR', downloads), \
                  patch.object(host, 'SNAPSHOTS_DIR', os.path.join(tmp, 'snapshots')):
                 with self.assertRaises(FileNotFoundError) as ctx:
-                    host.move_snapshot(url)
+                    host.save_snapshot(url)
             self.assertIn('Snapshot not found', str(ctx.exception))
 
     def test_creates_snapshots_dir_if_absent(self):
@@ -627,7 +628,7 @@ class TestMoveSnapshot(unittest.TestCase):
             self.assertFalse(os.path.exists(snapshots))
             with patch.object(host, 'DOWNLOADS_DIR', downloads), \
                  patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.move_snapshot(url)
+                host.save_snapshot(url)
             self.assertTrue(os.path.isdir(snapshots))
 
     def test_overwrites_existing_snapshot(self):
@@ -644,7 +645,7 @@ class TestMoveSnapshot(unittest.TestCase):
             Path(downloads, filename).write_text('new content')
             with patch.object(host, 'DOWNLOADS_DIR', downloads), \
                  patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.move_snapshot(url)
+                host.save_snapshot(url)
             self.assertEqual(Path(snapshots, filename).read_text(), 'new content')
 
 
@@ -884,7 +885,7 @@ class TestMain(unittest.TestCase):
 
     # --- read tag: snapshot move via main() ---
 
-    def test_read_tag_moves_snapshot_to_snapshots_dir(self):
+    def test_read_tag_copies_snapshot_to_snapshots_dir(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
@@ -894,8 +895,9 @@ class TestMain(unittest.TestCase):
             resp = self._call_main(
                 {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
             self.assertEqual(resp['status'], 'ok')
+            # File copied to snapshots; source left for Chrome to remove via removeFile
             self.assertTrue(Path(os.path.join(tmp, 'snapshots', filename)).exists())
-            self.assertFalse(Path(os.path.join(tmp, 'downloads', filename)).exists())
+            self.assertTrue(Path(os.path.join(tmp, 'downloads', filename)).exists())
 
     def test_read_tag_snapshot_not_found_returns_error(self):
         url = 'https://example.com'
@@ -919,7 +921,7 @@ class TestMain(unittest.TestCase):
         # lines: [visit-action, visit-success, tag-action, tag-error]
         self.assertIn('Snapshot not found', lines[-1])
 
-    def test_read_retag_moves_new_snapshot_and_overwrites_old(self):
+    def test_read_retag_copies_new_snapshot_overwriting_old(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
@@ -939,7 +941,7 @@ class TestMain(unittest.TestCase):
             self.assertEqual(resp['status'], 'ok')
             self.assertEqual(Path(os.path.join(snapshots, filename)).read_text(), 'snap v2')
 
-    def test_read_tag_move_exception_returns_error(self):
+    def test_read_tag_save_exception_returns_error(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
@@ -950,10 +952,10 @@ class TestMain(unittest.TestCase):
                 {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'},
                 tmp,
                 extra_patches=[patch.object(
-                    host, 'move_snapshot', side_effect=OSError('permission denied'))],
+                    host, 'save_snapshot', side_effect=OSError('permission denied'))],
             )
         self.assertEqual(resp['status'], 'error')
-        self.assertIn('Snapshot move failed', resp['message'])
+        self.assertIn('Snapshot save failed', resp['message'])
 
     # --- result-log write failure ---
 
