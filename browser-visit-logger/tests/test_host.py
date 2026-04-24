@@ -415,7 +415,8 @@ class TestTagVisit(unittest.TestCase):
         host.tag_visit(conn, 'https://example.com', 'of_interest', '2026-01-01T12:00:00Z')
         row = conn.execute('SELECT of_interest FROM visits').fetchone()
         conn.close()
-        self.assertIsNotNone(row[0])  # boolean set (stored as truthy value)
+        # SQLite TEXT affinity coerces the integer literal 1 to the string '1'
+        self.assertEqual(row[0], '1')
 
     def test_tag_visit_sets_read(self):
         conn = self._conn()
@@ -484,7 +485,7 @@ class TestTagVisit(unittest.TestCase):
         rows = conn.execute('SELECT url, of_interest FROM visits ORDER BY url').fetchall()
         conn.close()
         self.assertEqual(rows[0][0], 'https://a.com')
-        self.assertIsNotNone(rows[0][1])  # of_interest is set (boolean)
+        self.assertEqual(rows[0][1], '1')  # of_interest set; TEXT affinity stores literal 1 as '1'
         self.assertIsNone(rows[1][1])  # https://b.com unchanged
 
 
@@ -1214,7 +1215,7 @@ class TestIntegration(unittest.TestCase):
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
             conn.close()
-        self.assertIsNotNone(row[0])  # of_interest set (boolean)
+        self.assertEqual(row[0], '1')  # of_interest set; TEXT affinity stores literal 1 as '1'
         self.assertIsNone(row[1])
         self.assertIsNone(row[2])
 
