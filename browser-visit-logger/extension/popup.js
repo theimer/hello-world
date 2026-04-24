@@ -27,7 +27,7 @@ function showVisitInfo(record) {
 
   const rows = [
     { label: 'First visited', value: formatTs(record.timestamp) },
-    { label: '★ Memorable', value: formatTs(record.memorable) },
+    { label: '★ Of Interest', value: formatTs(record.of_interest) },
     { label: '✓ Read',      value: formatTs(record.read) },
     { label: '~ Skimmed',   value: formatTs(record.skimmed) },
   ].filter((r) => r.value !== null);

@@ -154,10 +154,10 @@ class TestAppendLog(unittest.TestCase):
         self.assertIn('https://b.com', lines[1])
 
     def test_tag_produces_four_fields(self):
-        content = self._run('ts', 'https://example.com', 'Example', tag='memorable')
+        content = self._run('ts', 'https://example.com', 'Example', tag='of_interest')
         parts = content.rstrip('\n').split('\t')
         self.assertEqual(len(parts), 4)
-        self.assertEqual(parts[3], 'memorable')
+        self.assertEqual(parts[3], 'of_interest')
 
     def test_append_result_log_writes_single_field(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -216,9 +216,9 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('idx_visits_timestamp', indexes)
         conn.close()
 
-    def test_ensure_db_creates_memorable_column(self):
+    def test_ensure_db_creates_of_interest_column(self):
         conn = self._conn()
-        self.assertIn('memorable', self._cols(conn))
+        self.assertIn('of_interest', self._cols(conn))
         conn.close()
 
     def test_ensure_db_creates_read_column(self):
@@ -231,7 +231,35 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('skimmed', self._cols(conn))
         conn.close()
 
-    def test_ensure_db_adds_skimmed_column_to_existing_schema(self):
+    def test_ensure_db_migrates_memorable_to_of_interest(self):
+        # Simulate a database using the old 'memorable' column name
+        conn = sqlite3.connect(':memory:')
+        conn.execute("""
+            CREATE TABLE visits (
+                url       TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                title     TEXT NOT NULL DEFAULT '',
+                memorable TEXT,
+                read      TEXT,
+                skimmed   TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO visits (url, timestamp, title, memorable) VALUES (?, ?, ?, ?)",
+            ('https://example.com', 'ts1', 'Example', 'ts-mem'),
+        )
+        conn.commit()
+        host.ensure_db(conn)
+        cols = self._cols(conn)
+        self.assertIn('of_interest', cols)
+        self.assertNotIn('memorable', cols)
+        # Existing value was carried over from memorable → of_interest
+        row = conn.execute('SELECT of_interest FROM visits').fetchone()
+        conn.close()
+        self.assertEqual(row[0], 'ts-mem')
+
+    def test_ensure_db_migrates_memorable_without_skimmed(self):
+        # Simulate an even older schema: memorable + read but no skimmed
         conn = sqlite3.connect(':memory:')
         conn.execute("""
             CREATE TABLE visits (
@@ -244,7 +272,10 @@ class TestDatabase(unittest.TestCase):
         """)
         conn.commit()
         host.ensure_db(conn)
-        self.assertIn('skimmed', self._cols(conn))
+        cols = self._cols(conn)
+        self.assertIn('of_interest', cols)
+        self.assertIn('skimmed', cols)
+        self.assertNotIn('memorable', cols)
         conn.close()
 
     def test_ensure_db_url_is_primary_key(self):
@@ -260,7 +291,7 @@ class TestDatabase(unittest.TestCase):
         cols = self._cols(conn)
         conn.close()
         self.assertIn('url', cols)
-        self.assertIn('memorable', cols)
+        self.assertIn('of_interest', cols)
         self.assertIn('read', cols)
         self.assertIn('skimmed', cols)
 
@@ -286,7 +317,7 @@ class TestDatabase(unittest.TestCase):
         cols = self._cols(conn)
         self.assertNotIn('id', cols)
         self.assertNotIn('tag', cols)
-        self.assertIn('memorable', cols)
+        self.assertIn('of_interest', cols)
         self.assertIn('read', cols)
         # Existing data preserved
         row = conn.execute('SELECT url, timestamp, title FROM visits').fetchone()
@@ -300,10 +331,10 @@ class TestDatabase(unittest.TestCase):
         conn.close()
         self.assertEqual(row, ('https://example.com', '2026-01-01T00:00:00Z', 'Example'))
 
-    def test_insert_visit_memorable_and_read_default_to_null(self):
+    def test_insert_visit_of_interest_and_read_default_to_null(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Title')
-        row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+        row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
         conn.close()
         self.assertIsNone(row[0])
         self.assertIsNone(row[1])
@@ -359,11 +390,11 @@ class TestTagVisit(unittest.TestCase):
         host.ensure_db(conn)
         return conn
 
-    def test_tag_visit_sets_memorable(self):
+    def test_tag_visit_sets_of_interest(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
-        host.tag_visit(conn, 'https://example.com', 'memorable', '2026-01-01T12:00:00Z')
-        row = conn.execute('SELECT memorable FROM visits').fetchone()
+        host.tag_visit(conn, 'https://example.com', 'of_interest', '2026-01-01T12:00:00Z')
+        row = conn.execute('SELECT of_interest FROM visits').fetchone()
         conn.close()
         self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
@@ -375,10 +406,10 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
-    def test_tag_visit_memorable_does_not_set_read(self):
+    def test_tag_visit_of_interest_does_not_set_read(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
-        host.tag_visit(conn, 'https://example.com', 'memorable', '2026-01-01T12:00:00Z')
+        host.tag_visit(conn, 'https://example.com', 'of_interest', '2026-01-01T12:00:00Z')
         row = conn.execute('SELECT read FROM visits').fetchone()
         conn.close()
         self.assertIsNone(row[0])
@@ -391,18 +422,18 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
-    def test_tag_visit_skimmed_does_not_set_memorable_or_read(self):
+    def test_tag_visit_skimmed_does_not_set_of_interest_or_read(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
-        row = conn.execute('SELECT memorable, read FROM visits').fetchone()
+        row = conn.execute('SELECT of_interest, read FROM visits').fetchone()
         conn.close()
         self.assertIsNone(row[0])
         self.assertIsNone(row[1])
 
     def test_tag_visit_no_existing_visit_returns_false(self):
         conn = self._conn()
-        found = host.tag_visit(conn, 'https://example.com', 'memorable', 'ts')
+        found = host.tag_visit(conn, 'https://example.com', 'of_interest', 'ts')
         count = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
         conn.close()
         self.assertFalse(found)
@@ -411,7 +442,7 @@ class TestTagVisit(unittest.TestCase):
     def test_tag_visit_existing_visit_returns_true(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
-        found = host.tag_visit(conn, 'https://example.com', 'memorable', 'ts-tag')
+        found = host.tag_visit(conn, 'https://example.com', 'of_interest', 'ts-tag')
         conn.close()
         self.assertTrue(found)
 
@@ -419,10 +450,10 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         result = host.tag_visit(conn, 'https://example.com', 'favourite', 'ts-tag')
-        row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+        row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
         conn.close()
         self.assertFalse(result)
-        self.assertIsNone(row[0])  # memorable untouched
+        self.assertIsNone(row[0])  # of_interest untouched
         self.assertIsNone(row[1])  # read untouched
         self.assertIsNone(row[2])  # skimmed untouched
 
@@ -430,8 +461,8 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts1', 'https://a.com', 'A')
         host.insert_visit(conn, 'ts2', 'https://b.com', 'B')
-        host.tag_visit(conn, 'https://a.com', 'memorable', '2026-01-01T12:00:00Z')
-        rows = conn.execute('SELECT url, memorable FROM visits ORDER BY url').fetchall()
+        host.tag_visit(conn, 'https://a.com', 'of_interest', '2026-01-01T12:00:00Z')
+        rows = conn.execute('SELECT url, of_interest FROM visits ORDER BY url').fetchall()
         conn.close()
         self.assertEqual(rows[0], ('https://a.com', '2026-01-01T12:00:00Z'))
         self.assertIsNone(rows[1][1])  # https://b.com unchanged
@@ -468,18 +499,18 @@ class TestQueryVisit(unittest.TestCase):
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertIsNone(result['memorable'])
+        self.assertIsNone(result['of_interest'])
         self.assertIsNone(result['read'])
         self.assertIsNone(result['skimmed'])
 
     def test_tag_fields_reflect_applied_tags(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts-visit', 'https://example.com', 'Example')
-        host.tag_visit(conn, 'https://example.com', 'memorable', 'ts-mem')
+        host.tag_visit(conn, 'https://example.com', 'of_interest', 'ts-mem')
         host.tag_visit(conn, 'https://example.com', 'read', 'ts-read')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertEqual(result['memorable'], 'ts-mem')
+        self.assertEqual(result['of_interest'], 'ts-mem')
         self.assertEqual(result['read'], 'ts-read')
         self.assertIsNone(result['skimmed'])
 
@@ -676,7 +707,7 @@ class TestMain(unittest.TestCase):
                 {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Title'}, tmp)
             resp = self._call_main(
                 {'timestamp': 'ts-tag', 'url': 'https://example.com',
-                 'title': 'Title', 'tag': 'memorable'},
+                 'title': 'Title', 'tag': 'of_interest'},
                 tmp,
             )
         self.assertEqual(resp['status'], 'ok')
@@ -685,7 +716,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._call_main(
                 {'timestamp': 'ts', 'url': 'https://example.com',
-                 'title': 'Title', 'tag': 'memorable'},
+                 'title': 'Title', 'tag': 'of_interest'},
                 tmp,
             )
         self.assertEqual(resp['status'], 'error')
@@ -695,7 +726,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
                 {'timestamp': 'ts', 'url': 'https://example.com',
-                 'title': 'Title', 'tag': 'memorable'},
+                 'title': 'Title', 'tag': 'of_interest'},
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
@@ -704,7 +735,7 @@ class TestMain(unittest.TestCase):
         self.assertIn('No record found', lines[1])
 
     def test_all_three_valid_tags_succeed_after_visit(self):
-        for tag in ('memorable', 'read', 'skimmed'):
+        for tag in ('of_interest', 'read', 'skimmed'):
             with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
                 self._call_main(
                     {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'T'}, tmp)
@@ -734,7 +765,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._call_main(
                 {'timestamp': 'ts', 'url': 'https://example.com',
-                 'title': 'Title', 'tag': 'memorable'},  # no prior visit → no_record
+                 'title': 'Title', 'tag': 'of_interest'},  # no prior visit → no_record
                 tmp,
                 extra_patches=[patch.object(host, 'append_result_log',
                                             side_effect=OSError('disk full'))],
@@ -793,11 +824,11 @@ class TestIntegration(unittest.TestCase):
             )
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             row = conn.execute(
-                'SELECT url, timestamp, title, memorable, read FROM visits'
+                'SELECT url, timestamp, title, of_interest, read FROM visits'
             ).fetchone()
             conn.close()
         self.assertEqual(row[:3], ('https://example.com', '2026-01-01T00:00:00Z', 'Example Domain'))
-        self.assertIsNone(row[3])  # memorable
+        self.assertIsNone(row[3])  # of_interest
         self.assertIsNone(row[4])  # read
 
     def test_missing_timestamp_rejected(self):
@@ -955,19 +986,19 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(any('db' in e for e in resp.get('errors', [])))
         self.assertIn('https://example.com', log_content)
 
-    def test_tag_message_sets_memorable_column(self):
+    def test_tag_message_sets_of_interest_column(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
                 {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
                 tmp,
             )
             resp = self._invoke(
-                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
+                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'of_interest'},
                 tmp,
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+            row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
             conn.close()
         self.assertEqual(row[0], 'ts-tag')
         self.assertIsNone(row[1])
@@ -985,7 +1016,7 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+            row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
             conn.close()
         self.assertIsNone(row[0])
         self.assertEqual(row[1], 'ts-tag')
@@ -1003,7 +1034,7 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+            row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
             conn.close()
         self.assertIsNone(row[0])
         self.assertIsNone(row[1])
@@ -1041,7 +1072,7 @@ class TestIntegration(unittest.TestCase):
     def test_tag_without_prior_visit_returns_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke(
-                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'of_interest'},
                 tmp,
             )
             self.assertEqual(resp['status'], 'error')
@@ -1050,7 +1081,7 @@ class TestIntegration(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             action = lines[0].split('\t')
             self.assertEqual(len(action), 4)
-            self.assertEqual(action[3], 'memorable')
+            self.assertEqual(action[3], 'of_interest')
             self.assertIn('No record found', lines[1])
 
 
@@ -1079,11 +1110,11 @@ class TestIntegration(unittest.TestCase):
                 tmp,
             )
             self._invoke(
-                {'timestamp': 'ts-mem', 'url': 'https://example.com', 'title': 'Example', 'tag': 'memorable'},
+                {'timestamp': 'ts-mem', 'url': 'https://example.com', 'title': 'Example', 'tag': 'of_interest'},
                 tmp,
             )
             resp = self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
-            self.assertEqual(resp['record']['memorable'], 'ts-mem')
+            self.assertEqual(resp['record']['of_interest'], 'ts-mem')
             self.assertIsNone(resp['record']['read'])
             self.assertIsNone(resp['record']['skimmed'])
 

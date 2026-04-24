@@ -16,8 +16,8 @@ Auto-log (from background.js):
     → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
 
 Tag action (from popup.js):
-    { "timestamp": "...", "url": "...", "title": "...", "tag": "memorable"|"read"|"skimmed" }
-    → UPDATE memorable, read, or skimmed column on the row for that URL using
+    { "timestamp": "...", "url": "...", "title": "...", "tag": "of_interest"|"read"|"skimmed" }
+    → UPDATE of_interest, read, or skimmed column on the row for that URL using
       the message timestamp; append 4-field TSV line.
       For "read": the MHTML snapshot is saved by Chrome directly to
       ~/Downloads/browser-visit-snapshots/<sha256(url)>.mhtml; the host only
@@ -29,7 +29,7 @@ Schema
         url       TEXT PRIMARY KEY,
         timestamp TEXT NOT NULL,        -- set on first visit, never updated
         title     TEXT NOT NULL DEFAULT '',
-        memorable TEXT,                 -- ISO timestamp, NULL until tagged
+        of_interest TEXT,               -- ISO timestamp, NULL until tagged
         read      TEXT,                 -- ISO timestamp, NULL until tagged
         skimmed   TEXT                  -- ISO timestamp, NULL until tagged
     )
@@ -95,29 +95,51 @@ def ensure_db(conn: sqlite3.Connection) -> None:
         # Fresh database
         conn.execute("""
             CREATE TABLE visits (
-                url       TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                title     TEXT NOT NULL DEFAULT '',
-                memorable TEXT,
-                read      TEXT,
-                skimmed   TEXT
+                url         TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                of_interest TEXT,
+                read        TEXT,
+                skimmed     TEXT
             )
         """)
     elif 'id' in cols:
         # Old id-based schema — migrate to url-primary-key schema
         conn.execute("""
             CREATE TABLE visits_new (
-                url       TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                title     TEXT NOT NULL DEFAULT '',
-                memorable TEXT,
-                read      TEXT,
-                skimmed   TEXT
+                url         TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                of_interest TEXT,
+                read        TEXT,
+                skimmed     TEXT
             )
         """)
         conn.execute("""
             INSERT OR IGNORE INTO visits_new (url, timestamp, title)
             SELECT url, timestamp, title FROM visits
+        """)
+        conn.execute("DROP TABLE visits")
+        conn.execute("ALTER TABLE visits_new RENAME TO visits")
+
+    elif 'memorable' in cols:
+        # Rename memorable → of_interest; also ensures skimmed is present
+        skimmed_col = 'skimmed' if 'skimmed' in cols else 'NULL'
+        conn.execute("""
+            CREATE TABLE visits_new (
+                url         TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                of_interest TEXT,
+                read        TEXT,
+                skimmed     TEXT
+            )
+        """)
+        conn.execute(f"""
+            INSERT OR IGNORE INTO visits_new
+                (url, timestamp, title, of_interest, read, skimmed)
+            SELECT url, timestamp, title, memorable, read, {skimmed_col}
+            FROM visits
         """)
         conn.execute("DROP TABLE visits")
         conn.execute("ALTER TABLE visits_new RENAME TO visits")
@@ -145,7 +167,7 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
 def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
     """Return the visit record for url as a dict, or None if no record exists."""
     row = conn.execute(
-        "SELECT timestamp, title, memorable, read, skimmed FROM visits WHERE url = ?",
+        "SELECT timestamp, title, of_interest, read, skimmed FROM visits WHERE url = ?",
         (url,),
     ).fetchone()
     if row is None:
@@ -153,20 +175,20 @@ def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
     return {
         'timestamp': row[0],
         'title':     row[1],
-        'memorable': row[2],
+        'of_interest': row[2],
         'read':      row[3],
         'skimmed':   row[4],
     }
 
 
 def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> bool:
-    """Set the memorable, read, or skimmed timestamp on the visit record for url.
+    """Set the of_interest, read, or skimmed timestamp on the visit record for url.
 
     Returns True if a row was found and updated, False if no record exists for url.
     """
-    if tag == 'memorable':
+    if tag == 'of_interest':
         cursor = conn.execute(
-            "UPDATE visits SET memorable = ? WHERE url = ?",
+            "UPDATE visits SET of_interest = ? WHERE url = ?",
             (tag_timestamp, url),
         )
     elif tag == 'read':
@@ -213,7 +235,7 @@ def append_result_log(result: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-VALID_TAGS = {'memorable', 'read', 'skimmed'}
+VALID_TAGS = {'of_interest', 'read', 'skimmed'}
 
 
 def main() -> None:

@@ -43,7 +43,7 @@ function setupDOM() {
       <hr>
     </div>
     <h3>Mark this page</h3>
-    <button data-tag="memorable">&#9733; Memorable</button>
+    <button data-tag="of_interest">&#9733; Of Interest</button>
     <button data-tag="read">&#10003; Read</button>
     <button data-tag="skimmed">&#126; Skimmed</button>
     <div id="status"></div>
@@ -125,7 +125,7 @@ describe('formatTs', () => {
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
 
   test('renders nothing when timestamp is null', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: null, memorable: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: null, skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     expect(document.querySelectorAll('.info-row').length).toBe(0);
@@ -133,7 +133,7 @@ describe('formatTs', () => {
 
   test('renders a human-readable date string, not the raw ISO timestamp', async () => {
     const ISO = '2026-04-23T14:09:34.261Z';
-    nativeReturns({ status: 'ok', record: { timestamp: ISO, memorable: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: ISO, of_interest: null, read: null, skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     const valueEl = document.querySelector('.info-value');
@@ -145,7 +145,7 @@ describe('formatTs', () => {
   });
 
   test('formatted string includes the year for a 2026 timestamp', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: '2026-04-23T14:09:34.261Z', memorable: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: '2026-04-23T14:09:34.261Z', of_interest: null, read: null, skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     const valueEl = document.querySelector('.info-value');
@@ -159,7 +159,7 @@ describe('formatTs', () => {
 describe('showVisitInfo', () => {
   const RECORD = {
     timestamp: '2026-04-23T02:10:31.451Z',
-    memorable: '2026-04-23T14:09:34.261Z',
+    of_interest: '2026-04-23T14:09:34.261Z',
     read:      '2026-04-23T02:27:10.366Z',
     skimmed:   null,
   };
@@ -182,7 +182,7 @@ describe('showVisitInfo', () => {
   });
 
   test('leaves #visit-info hidden when all timestamps are null', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: null, memorable: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: null, skimmed: null } });
     await loadPopup();
     expect(document.getElementById('visit-info').style.display).toBe('none');
   });
@@ -190,7 +190,7 @@ describe('showVisitInfo', () => {
   test('renders a row for each non-null timestamp', async () => {
     nativeReturns({ status: 'ok', record: RECORD });
     await loadPopup();
-    // RECORD: timestamp, memorable, read are set (3); skimmed is null
+    // RECORD: timestamp, of_interest, read are set (3); skimmed is null
     expect(document.querySelectorAll('.info-row').length).toBe(3);
   });
 
@@ -208,11 +208,11 @@ describe('showVisitInfo', () => {
     expect(labels).toContain('First visited');
   });
 
-  test('renders the "★ Memorable" row when memorable is set', async () => {
+  test('renders the "★ Of Interest" row when of_interest is set', async () => {
     nativeReturns({ status: 'ok', record: RECORD });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
-    expect(labels).toContain('★ Memorable');
+    expect(labels).toContain('★ Of Interest');
   });
 
   test('renders the "✓ Read" row when read is set', async () => {
@@ -276,7 +276,7 @@ describe('DOMContentLoaded handler', () => {
   test('renders visit info from the host response', async () => {
     nativeReturns({ status: 'ok', record: {
       timestamp: '2026-04-23T02:10:31.451Z',
-      memorable: null, read: null, skimmed: null,
+      of_interest: null, read: null, skimmed: null,
     }});
     tabReturns(TAB);
     await loadPopup();
@@ -320,12 +320,12 @@ describe('setupButtons', () => {
     document.querySelector(`[data-tag="${tag}"]`).click();
   }
 
-  test('clicking "memorable" sends a native message with tag "memorable"', async () => {
+  test('clicking "of_interest" sends a native message with tag "of_interest"', async () => {
     nativeReturns({ status: 'ok', record: null });
-    await clickTag('memorable');
+    await clickTag('of_interest');
     expect(mockSendNativeMessage).toHaveBeenCalledWith(
       'com.browser.visit.logger',
-      expect.objectContaining({ tag: 'memorable', url: TAB.url, title: TAB.title }),
+      expect.objectContaining({ tag: 'of_interest', url: TAB.url, title: TAB.title }),
       expect.any(Function),
     );
   });
@@ -342,7 +342,7 @@ describe('setupButtons', () => {
 
   test('tag message includes a valid ISO timestamp', async () => {
     nativeReturns({ status: 'ok', record: null });
-    await clickTag('memorable');
+    await clickTag('of_interest');
     const msg = mockSendNativeMessage.mock.calls[0][1];
     const parsed = new Date(msg.timestamp);
     expect(isNaN(parsed.getTime())).toBe(false);
@@ -366,7 +366,7 @@ describe('setupButtons', () => {
     await loadPopup();
     // Override mock so the tag-click native message never calls back
     mockSendNativeMessage.mockImplementation(() => {});
-    document.querySelector('[data-tag="memorable"]').click();
+    document.querySelector('[data-tag="of_interest"]').click();
     document.querySelectorAll('[data-tag]').forEach(btn => {
       expect(btn.disabled).toBe(true);
     });
@@ -376,7 +376,7 @@ describe('setupButtons', () => {
     // Set the mock so the tag-click returns ok before loadPopup so both
     // the query and the tag response return ok (record null is fine)
     nativeReturns({ status: 'ok', record: null });
-    await clickTag('memorable');
+    await clickTag('of_interest');
     expect(window.close).toHaveBeenCalled();
   });
 
@@ -386,7 +386,7 @@ describe('setupButtons', () => {
       cb({ status: 'error', message: 'No record found for this URL — visit the page before tagging' })
     );
     mockSendNativeMessage.mockClear();
-    document.querySelector('[data-tag="memorable"]').click();
+    document.querySelector('[data-tag="of_interest"]').click();
     expect(document.getElementById('status').textContent).toBe(
       'No record found for this URL — visit the page before tagging'
     );
@@ -422,12 +422,12 @@ describe('setupButtons', () => {
     );
   });
 
-  test('uses tab.url as title fallback for "memorable" when tab.title is empty', async () => {
+  test('uses tab.url as title fallback for "of_interest" when tab.title is empty', async () => {
     tabReturns({ id: 1, url: 'https://example.com/', title: '' });
     nativeReturns({ status: 'ok', record: null });
     await loadPopup();
     mockSendNativeMessage.mockClear();
-    document.querySelector('[data-tag="memorable"]').click();
+    document.querySelector('[data-tag="of_interest"]').click();
     expect(mockSendNativeMessage).toHaveBeenCalledWith(
       'com.browser.visit.logger',
       expect.objectContaining({ title: 'https://example.com/' }),
@@ -439,7 +439,7 @@ describe('setupButtons', () => {
     await loadPopup();
     mockSendNativeMessage.mockImplementation((_host, _msg, cb) => cb({ status: 'error' }));
     mockSendNativeMessage.mockClear();
-    document.querySelector('[data-tag="memorable"]').click();
+    document.querySelector('[data-tag="of_interest"]').click();
     expect(document.getElementById('status').textContent).toBe(
       'Write failed — check host log.'
     );
