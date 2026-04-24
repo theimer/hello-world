@@ -8,6 +8,7 @@ Run with:
 Or the full suite:
     pytest tests/ -v
 """
+import contextlib
 import io
 import json
 import os
@@ -414,6 +415,17 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertTrue(found)
 
+    def test_invalid_tag_returns_false_without_modifying_db(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        result = host.tag_visit(conn, 'https://example.com', 'favourite', 'ts-tag')
+        row = conn.execute('SELECT memorable, read, skimmed FROM visits').fetchone()
+        conn.close()
+        self.assertFalse(result)
+        self.assertIsNone(row[0])  # memorable untouched
+        self.assertIsNone(row[1])  # read untouched
+        self.assertIsNone(row[2])  # skimmed untouched
+
     def test_tag_visit_does_not_affect_other_urls(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts1', 'https://a.com', 'A')
@@ -477,6 +489,258 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://b.com')
         conn.close()
         self.assertIsNone(result)
+
+
+# ---------------------------------------------------------------------------
+# main() — unit tests that call main() directly with mocked I/O
+# (subprocess-based integration tests don't contribute to coverage)
+# ---------------------------------------------------------------------------
+
+class TestMain(unittest.TestCase):
+    """Exercise every branch of main() by calling it in-process."""
+
+    def _call_main(self, message: dict, tmp: str, extra_patches=()) -> dict:
+        """Call host.main() with fake stdin/stdout and isolated temp paths."""
+        out_buf = io.BytesIO()
+        mock_stdout = MagicMock()
+        mock_stdout.buffer = out_buf
+
+        mock_stdin = MagicMock()
+        mock_stdin.buffer = io.BytesIO(_frame(message))
+
+        base_patches = [
+            patch('sys.stdin',  mock_stdin),
+            patch('sys.stdout', mock_stdout),
+            patch.object(host, 'LOG_FILE', os.path.join(tmp, 'visits.log')),
+            patch.object(host, 'DB_FILE',  os.path.join(tmp, 'visits.db')),
+        ]
+
+        with contextlib.ExitStack() as stack:
+            for p in (*base_patches, *extra_patches):
+                stack.enter_context(p)
+            host.main()
+
+        out_buf.seek(0)
+        return _unframe(out_buf.read())
+
+    # --- read_message failure ---
+
+    def test_read_message_failure_returns_error(self):
+        out_buf = io.BytesIO()
+        mock_stdout = MagicMock()
+        mock_stdout.buffer = out_buf
+        mock_stdin = MagicMock()
+        mock_stdin.buffer = io.BytesIO(b'')  # empty → EOFError
+
+        with patch('sys.stdin', mock_stdin), patch('sys.stdout', mock_stdout):
+            host.main()
+
+        out_buf.seek(0)
+        resp = _unframe(out_buf.read())
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('stdin', resp['message'])
+
+    # --- query action ---
+
+    def test_query_missing_url_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main({'action': 'query'}, tmp)
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('url', resp['message'])
+
+    def test_query_db_failure_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'action': 'query', 'url': 'https://example.com'},
+                tmp,
+                extra_patches=[patch('sqlite3.connect',
+                                     side_effect=sqlite3.OperationalError('disk full'))],
+            )
+        self.assertEqual(resp['status'], 'error')
+
+    def test_query_unknown_url_returns_null_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main({'action': 'query', 'url': 'https://unknown.com'}, tmp)
+        self.assertEqual(resp['status'], 'ok')
+        self.assertIsNone(resp['record'])
+
+    def test_query_known_url_returns_full_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
+                tmp,
+            )
+            resp = self._call_main({'action': 'query', 'url': 'https://example.com'}, tmp)
+        self.assertEqual(resp['status'], 'ok')
+        self.assertEqual(resp['record']['timestamp'], 'ts-visit')
+        self.assertEqual(resp['record']['title'], 'Example')
+
+    def test_query_does_not_write_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main({'action': 'query', 'url': 'https://example.com'}, tmp)
+            self.assertFalse(Path(tmp, 'visits.log').exists())
+
+    # --- input validation ---
+
+    def test_missing_url_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main({'timestamp': 'ts', 'title': 'Title'}, tmp)
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('url', resp['message'])
+
+    def test_empty_url_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main({'timestamp': 'ts', 'url': '', 'title': 'Title'}, tmp)
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('url', resp['message'])
+
+    def test_missing_timestamp_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main({'url': 'https://example.com', 'title': 'Title'}, tmp)
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('timestamp', resp['message'])
+
+    def test_empty_timestamp_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': '', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('timestamp', resp['message'])
+
+    def test_invalid_tag_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Title', 'tag': 'favourite'},
+                tmp,
+            )
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('tag', resp['message'])
+
+    # --- auto-log (no tag) success path ---
+
+    def test_auto_log_returns_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+        self.assertEqual(resp['status'], 'ok')
+
+    def test_auto_log_writes_action_and_success_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn('https://example.com', lines[0])
+        self.assertEqual(lines[1], 'success')
+
+    def test_auto_log_inserts_db_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+            row = sqlite3.connect(os.path.join(tmp, 'visits.db')).execute(
+                'SELECT url, timestamp, title FROM visits').fetchone()
+        self.assertEqual(row, ('https://example.com', 'ts', 'Title'))
+
+    # --- log write failure ---
+
+    def test_log_write_failure_returns_error_with_log_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
+                tmp,
+                extra_patches=[patch.object(host, 'append_log',
+                                            side_effect=OSError('permission denied'))],
+            )
+        self.assertEqual(resp['status'], 'error')
+        self.assertTrue(any('log' in e for e in resp.get('errors', [])))
+
+    # --- db write failure ---
+
+    def test_db_write_failure_returns_error_with_db_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
+                tmp,
+                extra_patches=[patch('sqlite3.connect',
+                                     side_effect=sqlite3.OperationalError('disk full'))],
+            )
+        self.assertEqual(resp['status'], 'error')
+        self.assertTrue(any('db' in e for e in resp.get('errors', [])))
+
+    # --- tag path ---
+
+    def test_tag_found_returns_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main(
+                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Title'}, tmp)
+            resp = self._call_main(
+                {'timestamp': 'ts-tag', 'url': 'https://example.com',
+                 'title': 'Title', 'tag': 'memorable'},
+                tmp,
+            )
+        self.assertEqual(resp['status'], 'ok')
+
+    def test_tag_not_found_returns_no_record_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Title', 'tag': 'memorable'},
+                tmp,
+            )
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('No record found', resp['message'])
+
+    def test_tag_not_found_writes_error_result_to_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Title', 'tag': 'memorable'},
+                tmp,
+            )
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+        # line 0 = action (4-field TSV), line 1 = 'error: No record found...'
+        self.assertEqual(len(lines), 2)
+        self.assertIn('No record found', lines[1])
+
+    def test_all_three_valid_tags_succeed_after_visit(self):
+        for tag in ('memorable', 'read', 'skimmed'):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
+                self._call_main(
+                    {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'T'}, tmp)
+                resp = self._call_main(
+                    {'timestamp': 'ts-tag', 'url': 'https://example.com',
+                     'title': 'T', 'tag': tag},
+                    tmp,
+                )
+                self.assertEqual(resp['status'], 'ok')
+
+    # --- result-log write failure ---
+
+    def test_append_result_log_failure_still_returns_response(self):
+        """If append_result_log raises, main() logs the error but still sends a response."""
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
+                tmp,
+                extra_patches=[patch.object(host, 'append_result_log',
+                                            side_effect=OSError('disk full'))],
+            )
+        # The DB write succeeded, so the response should still be ok
+        self.assertEqual(resp['status'], 'ok')
+
+    def test_result_log_failure_on_error_path_still_returns_error_response(self):
+        """append_result_log failure on the error path doesn't swallow the error response."""
+        with tempfile.TemporaryDirectory() as tmp:
+            resp = self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Title', 'tag': 'memorable'},  # no prior visit → no_record
+                tmp,
+                extra_patches=[patch.object(host, 'append_result_log',
+                                            side_effect=OSError('disk full'))],
+            )
+        self.assertEqual(resp['status'], 'error')
+        self.assertIn('No record found', resp['message'])
 
 
 # ---------------------------------------------------------------------------

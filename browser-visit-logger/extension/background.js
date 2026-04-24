@@ -18,6 +18,7 @@ function isTitleMeaningful(title, url) {
 
 function flushVisit(tabId) {
   const entry = pendingVisits.get(tabId);
+  /* istanbul ignore next -- defensive guard, unreachable via normal event flow */
   if (!entry) return;
   pendingVisits.delete(tabId);
   clearTimeout(entry.timerId);

@@ -43,7 +43,7 @@ function showVisitInfo(record) {
     )
     .join('');
 
-  document.getElementById('visit-info').style.display = '';
+  document.getElementById('visit-info').style.display = 'block';
 }
 
 document.addEventListener('DOMContentLoaded', () => {

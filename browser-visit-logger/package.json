@@ -5,7 +5,8 @@
     "test": "jest --testPathPattern=tests/"
   },
   "devDependencies": {
-    "jest": "^29.0.0"
+    "jest": "^29.0.0",
+    "jest-environment-jsdom": "^30.3.0"
   },
   "jest": {
     "testEnvironment": "node",

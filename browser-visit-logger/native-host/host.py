@@ -305,5 +305,5 @@ def main() -> None:
         write_message({'status': 'ok'})
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()

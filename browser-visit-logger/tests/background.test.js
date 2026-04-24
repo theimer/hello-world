@@ -369,6 +369,92 @@ describe('tabs.onUpdated', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Error-handling branches in sendNativeMessage callbacks
+// ---------------------------------------------------------------------------
+describe('sendNativeMessage error handling', () => {
+  test('immediate-flush callback logs error when lastError is set', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockSendNativeMessage.mockImplementation((_host, _msg, cb) => {
+      global.chrome.runtime.lastError = { message: 'Host not found' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    tabReturns('Real Title');
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[BVL]'), expect.any(String),
+    );
+    consoleSpy.mockRestore();
+  });
+
+  test('flushVisit callback logs error when lastError is set', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockSendNativeMessage.mockImplementation((_host, _msg, cb) => {
+      global.chrome.runtime.lastError = { message: 'Host not found' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    tabReturns('');
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    // Title arrives, triggers flushVisit → sendNativeMessage
+    tabUpdateHandler(1, { title: 'Real Title' }, {});
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[BVL]'), expect.any(String),
+    );
+    consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isTitleMeaningful — catch branch (invalid URL)
+// ---------------------------------------------------------------------------
+describe('isTitleMeaningful — invalid URL catch branch', () => {
+  test('immediate-flush callback with no lastError does not log an error', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    // Invoke the callback successfully (no lastError) so the false-branch of the if is taken
+    mockSendNativeMessage.mockImplementation((_host, _msg, cb) => cb({ status: 'ok' }));
+    tabReturns('Real Title');
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    expect(consoleSpy).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+
+  test('flushVisit callback with no lastError does not log an error', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    mockSendNativeMessage.mockImplementation((_host, _msg, cb) => cb({ status: 'ok' }));
+    tabReturns('');
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    tabUpdateHandler(1, { title: 'Real Title' }, {});
+    expect(consoleSpy).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+
+  test('non-parseable URL is handled gracefully; meaningful title still flushes immediately', () => {
+    tabReturns('Some Title');
+    // 'not-a-valid-url' throws inside new URL() — the catch block swallows it
+    // and isTitleMeaningful returns true (title is non-empty and not the URL itself)
+    navHandler({ frameId: 0, tabId: 1, url: 'not-a-valid-url' });
+    expect(mockSendNativeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendNativeMessage.mock.calls[0][1].title).toBe('Some Title');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defensive null-tab branch (tabs.get returns null without lastError)
+// ---------------------------------------------------------------------------
+describe('tabs.get null-tab defensive branch', () => {
+  test('null tab without lastError is treated as empty title and parked', () => {
+    mockTabsGet.mockImplementation((_tabId, cb) => cb(null)); // null tab, no lastError
+    navHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    expect(mockSendNativeMessage).not.toHaveBeenCalled();
+    // Falls back to URL title after timeout
+    jest.advanceTimersByTime(5000);
+    expect(mockSendNativeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendNativeMessage.mock.calls[0][1].title).toBe('https://example.com/');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // read-and-snapshot message handler
 // ---------------------------------------------------------------------------
 describe('read-and-snapshot message handler', () => {
@@ -607,5 +693,61 @@ describe('read-and-snapshot message handler', () => {
     setupSuccessFlow();
     const result = messageHandler(baseMsg, {}, jest.fn());
     expect(result).toBe(true);
+  });
+
+  test('pageCapture null data without lastError uses "no data" fallback in error message', async () => {
+    // The condition is `lastError || !mhtmlData`; here lastError is null but data is null,
+    // so the `|| 'no data'` right-hand side of the error string is taken.
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(null)); // no lastError, null data
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'error', message: expect.stringContaining('no data') }),
+    );
+  });
+
+  test('FileReader error rejects contentPromise and calls sendResponse with error', async () => {
+    // Triggers the `if (reader.error) reject(reader.error)` true-branch.
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockFileReaderInstance.error = new Error('Read failed');
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    expect(mockDownloadsDownload).not.toHaveBeenCalled();
+  });
+
+  test('download failure with lastError but no message field uses "unknown" fallback', async () => {
+    // Triggers the `|| 'unknown'` branch in the downloads.download callback.
+    const fakeBlob = { type: 'message/rfc822' };
+    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
+    mockDownloadsDownload.mockImplementation((opts, cb) => {
+      global.chrome.runtime.lastError = {}; // set but no .message property
+      cb(undefined);
+      global.chrome.runtime.lastError = null;
+    });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+    expect(sendResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'error', message: expect.stringContaining('unknown') }),
+    );
+  });
+
+  test('download state changes other than complete/interrupted are ignored', async () => {
+    // Triggers the false-branch of `else if (delta.state?.current === 'interrupted')`.
+    setupSuccessFlow({ downloadId: 42 });
+    const sendResponse = jest.fn();
+    messageHandler(baseMsg, {}, sendResponse);
+    await flushPromises();
+
+    fireDownloadChanged({ id: 42, state: { current: 'in_progress' } });
+
+    // Neither complete nor interrupted — sendResponse should not have been called yet
+    expect(sendResponse).not.toHaveBeenCalled();
+    // The listener should still be registered (not removed)
+    expect(mockDownloadsOnChanged.removeListener).not.toHaveBeenCalled();
   });
 });
