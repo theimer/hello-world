@@ -285,6 +285,24 @@ class TestDatabase(unittest.TestCase):
         conn.close()
         self.assertEqual(pk_cols, {'url'})
 
+    def test_ensure_db_adds_skimmed_to_url_pk_schema_missing_it(self):
+        # Simulate a url-PK schema that predates the skimmed column
+        conn = sqlite3.connect(':memory:')
+        conn.execute("""
+            CREATE TABLE visits (
+                url         TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                of_interest TEXT,
+                read        TEXT
+            )
+        """)
+        conn.commit()
+        host.ensure_db(conn)
+        cols = self._cols(conn)
+        conn.close()
+        self.assertIn('skimmed', cols)
+
     def test_ensure_db_is_idempotent(self):
         conn = sqlite3.connect(':memory:')
         host.ensure_db(conn)
