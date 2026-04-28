@@ -9,7 +9,6 @@ Or the full suite:
     pytest tests/ -v
 """
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -544,112 +543,6 @@ class TestQueryVisit(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# _snapshot_filename
-# ---------------------------------------------------------------------------
-
-class TestSnapshotFilename(unittest.TestCase):
-
-    def test_mhtml_extension_for_regular_url(self):
-        self.assertTrue(host._snapshot_filename('https://example.com/').endswith('.mhtml'))
-
-    def test_pdf_extension_for_pdf_url(self):
-        self.assertTrue(host._snapshot_filename('https://example.com/paper.pdf').endswith('.pdf'))
-
-    def test_pdf_extension_with_query_string(self):
-        self.assertTrue(host._snapshot_filename('https://example.com/doc.pdf?v=2').endswith('.pdf'))
-
-    def test_pdf_extension_with_fragment(self):
-        self.assertTrue(host._snapshot_filename('https://example.com/doc.pdf#page=3').endswith('.pdf'))
-
-    def test_pdf_case_insensitive(self):
-        self.assertTrue(host._snapshot_filename('https://example.com/DOC.PDF').endswith('.pdf'))
-
-    def test_non_pdf_with_pdf_in_path_segment(self):
-        # '/pdf-viewer' does not end the path with .pdf before ?/#
-        self.assertTrue(host._snapshot_filename('https://example.com/pdf-viewer').endswith('.mhtml'))
-
-    def test_hash_is_64_hex_chars(self):
-        fn = host._snapshot_filename('https://example.com/')
-        hex_part = fn.rsplit('.', 1)[0]
-        self.assertEqual(len(hex_part), 64)
-        int(hex_part, 16)  # raises ValueError if not valid hex
-
-    def test_hash_matches_sha256_of_url(self):
-        url = 'https://example.com/'
-        expected = hashlib.sha256(url.encode('utf-8')).hexdigest()
-        self.assertTrue(host._snapshot_filename(url).startswith(expected))
-
-    def test_different_urls_produce_different_filenames(self):
-        a = host._snapshot_filename('https://a.com/')
-        b = host._snapshot_filename('https://b.com/')
-        self.assertNotEqual(a, b)
-
-
-# ---------------------------------------------------------------------------
-# save_snapshot
-# ---------------------------------------------------------------------------
-
-class TestSaveSnapshot(unittest.TestCase):
-
-    def test_copies_file_to_snapshots_leaving_source_in_downloads(self):
-        url = 'https://example.com/'
-        with tempfile.TemporaryDirectory() as tmp:
-            downloads = os.path.join(tmp, 'downloads')
-            snapshots = os.path.join(tmp, 'snapshots')
-            os.makedirs(downloads)
-            filename = host._snapshot_filename(url)
-            Path(downloads, filename).write_text('content')
-            with patch.object(host, 'DOWNLOADS_DIR', downloads), \
-                 patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.save_snapshot(url)
-            # File is copied to snapshots; source remains (Chrome removes it via removeFile)
-            self.assertTrue(Path(snapshots, filename).exists())
-            self.assertTrue(Path(downloads, filename).exists())
-
-    def test_raises_file_not_found_when_file_missing(self):
-        url = 'https://example.com/'
-        with tempfile.TemporaryDirectory() as tmp:
-            downloads = os.path.join(tmp, 'downloads')
-            os.makedirs(downloads)
-            with patch.object(host, 'DOWNLOADS_DIR', downloads), \
-                 patch.object(host, 'SNAPSHOTS_DIR', os.path.join(tmp, 'snapshots')):
-                with self.assertRaises(FileNotFoundError) as ctx:
-                    host.save_snapshot(url)
-            self.assertIn('Snapshot not found', str(ctx.exception))
-
-    def test_creates_snapshots_dir_if_absent(self):
-        url = 'https://example.com/'
-        with tempfile.TemporaryDirectory() as tmp:
-            downloads = os.path.join(tmp, 'downloads')
-            snapshots = os.path.join(tmp, 'snapshots')
-            os.makedirs(downloads)
-            filename = host._snapshot_filename(url)
-            Path(downloads, filename).write_text('content')
-            self.assertFalse(os.path.exists(snapshots))
-            with patch.object(host, 'DOWNLOADS_DIR', downloads), \
-                 patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.save_snapshot(url)
-            self.assertTrue(os.path.isdir(snapshots))
-
-    def test_overwrites_existing_snapshot(self):
-        url = 'https://example.com/'
-        with tempfile.TemporaryDirectory() as tmp:
-            downloads = os.path.join(tmp, 'downloads')
-            snapshots = os.path.join(tmp, 'snapshots')
-            os.makedirs(downloads)
-            os.makedirs(snapshots)
-            filename = host._snapshot_filename(url)
-            # Put an old snapshot in the destination
-            Path(snapshots, filename).write_text('old content')
-            # Put a new snapshot in downloads
-            Path(downloads, filename).write_text('new content')
-            with patch.object(host, 'DOWNLOADS_DIR', downloads), \
-                 patch.object(host, 'SNAPSHOTS_DIR', snapshots):
-                host.save_snapshot(url)
-            self.assertEqual(Path(snapshots, filename).read_text(), 'new content')
-
-
-# ---------------------------------------------------------------------------
 # main() — unit tests that call main() directly with mocked I/O
 # (subprocess-based integration tests don't contribute to coverage)
 # ---------------------------------------------------------------------------
@@ -666,17 +559,11 @@ class TestMain(unittest.TestCase):
         mock_stdin = MagicMock()
         mock_stdin.buffer = io.BytesIO(_frame(message))
 
-        downloads_dir = os.path.join(tmp, 'downloads')
-        snapshots_dir = os.path.join(tmp, 'snapshots')
-        os.makedirs(downloads_dir, exist_ok=True)
-
         base_patches = [
             patch('sys.stdin',  mock_stdin),
             patch('sys.stdout', mock_stdout),
-            patch.object(host, 'LOG_FILE',      os.path.join(tmp, 'visits.log')),
-            patch.object(host, 'DB_FILE',       os.path.join(tmp, 'visits.db')),
-            patch.object(host, 'DOWNLOADS_DIR', downloads_dir),
-            patch.object(host, 'SNAPSHOTS_DIR', snapshots_dir),
+            patch.object(host, 'LOG_FILE', os.path.join(tmp, 'visits.log')),
+            patch.object(host, 'DB_FILE',  os.path.join(tmp, 'visits.db')),
         ]
 
         with contextlib.ExitStack() as stack:
@@ -872,90 +759,12 @@ class TestMain(unittest.TestCase):
             with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
                 self._call_main(
                     {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'T'}, tmp)
-                if tag == 'read':
-                    # Create the snapshot file that host.py will move
-                    filename = host._snapshot_filename('https://example.com')
-                    Path(os.path.join(tmp, 'downloads', filename)).write_text('snap')
                 resp = self._call_main(
                     {'timestamp': 'ts-tag', 'url': 'https://example.com',
                      'title': 'T', 'tag': tag},
                     tmp,
                 )
                 self.assertEqual(resp['status'], 'ok')
-
-    # --- read tag: snapshot move via main() ---
-
-    def test_read_tag_copies_snapshot_to_snapshots_dir(self):
-        url = 'https://example.com'
-        with tempfile.TemporaryDirectory() as tmp:
-            self._call_main(
-                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            filename = host._snapshot_filename(url)
-            Path(os.path.join(tmp, 'downloads', filename)).write_text('snap')
-            resp = self._call_main(
-                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
-            self.assertEqual(resp['status'], 'ok')
-            # File copied to snapshots; source left for Chrome to remove via removeFile
-            self.assertTrue(Path(os.path.join(tmp, 'snapshots', filename)).exists())
-            self.assertTrue(Path(os.path.join(tmp, 'downloads', filename)).exists())
-
-    def test_read_tag_snapshot_not_found_returns_error(self):
-        url = 'https://example.com'
-        with tempfile.TemporaryDirectory() as tmp:
-            self._call_main(
-                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            # Do NOT create snapshot file
-            resp = self._call_main(
-                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
-        self.assertEqual(resp['status'], 'error')
-        self.assertIn('Snapshot not found', resp['message'])
-
-    def test_read_tag_snapshot_not_found_writes_error_to_log(self):
-        url = 'https://example.com'
-        with tempfile.TemporaryDirectory() as tmp:
-            self._call_main(
-                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            self._call_main(
-                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
-        # lines: [visit-action, visit-success, tag-action, tag-error]
-        self.assertIn('Snapshot not found', lines[-1])
-
-    def test_read_retag_copies_new_snapshot_overwriting_old(self):
-        url = 'https://example.com'
-        with tempfile.TemporaryDirectory() as tmp:
-            self._call_main(
-                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            filename = host._snapshot_filename(url)
-            downloads = os.path.join(tmp, 'downloads')
-            snapshots = os.path.join(tmp, 'snapshots')
-            # First read tag
-            Path(os.path.join(downloads, filename)).write_text('snap v1')
-            self._call_main(
-                {'timestamp': 'ts-tag-1', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
-            self.assertEqual(Path(os.path.join(snapshots, filename)).read_text(), 'snap v1')
-            # Re-tag: new snapshot appears in downloads
-            Path(os.path.join(downloads, filename)).write_text('snap v2')
-            resp = self._call_main(
-                {'timestamp': 'ts-tag-2', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
-            self.assertEqual(resp['status'], 'ok')
-            self.assertEqual(Path(os.path.join(snapshots, filename)).read_text(), 'snap v2')
-
-    def test_read_tag_save_exception_returns_error(self):
-        url = 'https://example.com'
-        with tempfile.TemporaryDirectory() as tmp:
-            self._call_main(
-                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            filename = host._snapshot_filename(url)
-            Path(os.path.join(tmp, 'downloads', filename)).write_text('snap')
-            resp = self._call_main(
-                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'},
-                tmp,
-                extra_patches=[patch.object(
-                    host, 'save_snapshot', side_effect=OSError('permission denied'))],
-            )
-        self.assertEqual(resp['status'], 'error')
-        self.assertIn('Snapshot save failed', resp['message'])
 
     # --- result-log write failure ---
 
@@ -993,16 +802,10 @@ class TestIntegration(unittest.TestCase):
 
     def _invoke(self, message: dict, tmp: str) -> dict:
         """Send one native message to host.py as a subprocess; return response."""
-        downloads_dir = os.path.join(tmp, 'downloads')
-        snapshots_dir = os.path.join(tmp, 'snapshots')
-        os.makedirs(downloads_dir, exist_ok=True)
-
         env = os.environ.copy()
-        env['BVL_LOG_FILE']      = os.path.join(tmp, 'visits.log')
-        env['BVL_DB_FILE']       = os.path.join(tmp, 'visits.db')
-        env['BVL_HOST_LOG']      = os.path.join(tmp, 'host.log')
-        env['BVL_DOWNLOADS_DIR'] = downloads_dir
-        env['BVL_SNAPSHOTS_DIR'] = snapshots_dir
+        env['BVL_LOG_FILE'] = os.path.join(tmp, 'visits.log')
+        env['BVL_DB_FILE']  = os.path.join(tmp, 'visits.db')
+        env['BVL_HOST_LOG'] = os.path.join(tmp, 'host.log')
 
         result = subprocess.run(
             [sys.executable, HOST_PY],
@@ -1226,9 +1029,6 @@ class TestIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
                 {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            # Create the snapshot file that host.py will move
-            filename = host._snapshot_filename(url)
-            Path(os.path.join(tmp, 'downloads', filename)).write_text('snap')
             resp = self._invoke(
                 {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
             self.assertEqual(resp['status'], 'ok')
@@ -1262,8 +1062,6 @@ class TestIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
                 {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
-            filename = host._snapshot_filename(url)
-            Path(os.path.join(tmp, 'downloads', filename)).write_text('snap')
             self._invoke(
                 {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
             lines = Path(tmp, 'visits.log').read_text().splitlines()
@@ -1299,7 +1097,6 @@ class TestIntegration(unittest.TestCase):
             self.assertEqual(len(action), 4)
             self.assertEqual(action[3], 'of_interest')
             self.assertIn('No record found', lines[1])
-
 
     def test_query_unknown_url_returns_null_record(self):
         with tempfile.TemporaryDirectory() as tmp:

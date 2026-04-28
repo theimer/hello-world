@@ -20,9 +20,8 @@ const addTabUpdateListener  = jest.fn();
 const addMessageListener    = jest.fn();
 
 // Snapshot-related mocks
-const mockSaveAsMHTML         = jest.fn();
-const mockDownloadsDownload   = jest.fn();
-const mockDownloadsRemoveFile = jest.fn();
+const mockSaveAsMHTML       = jest.fn();
+const mockDownloadsDownload = jest.fn();
 
 // FileReader mock — readAsDataURL fires 'loadend' synchronously by default.
 // Tests that need to simulate a read error can set mockFileReaderInstance.error.
@@ -85,9 +84,8 @@ function buildChromeMock() {
       saveAsMHTML: mockSaveAsMHTML,
     },
     downloads: {
-      download:   mockDownloadsDownload,
-      removeFile: mockDownloadsRemoveFile,
-      onChanged:  mockDownloadsOnChanged,
+      download:  mockDownloadsDownload,
+      onChanged: mockDownloadsOnChanged,
     },
   };
 }
@@ -109,7 +107,6 @@ beforeEach(() => {
   addMessageListener.mockClear();
   mockSaveAsMHTML.mockClear();
   mockDownloadsDownload.mockClear();
-  mockDownloadsRemoveFile.mockClear();
   mockDownloadsOnChanged.addListener.mockClear();
   mockDownloadsOnChanged.removeListener.mockClear();
   onChangedListeners.length = 0;
@@ -481,7 +478,6 @@ describe('read-and-snapshot message handler', () => {
     const fakeBlob = { type: 'message/rfc822' }; // stand-in for a Blob
     mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
     mockDownloadsDownload.mockImplementation((opts, cb) => cb(downloadId));
-    mockDownloadsRemoveFile.mockImplementation((id, cb) => cb && cb());
     mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
   }
 
@@ -512,13 +508,13 @@ describe('read-and-snapshot message handler', () => {
     expect(mockDownloadsDownload).not.toHaveBeenCalled();
   });
 
-  test('HTML page: downloads to <sha256>.mhtml in Downloads root', async () => {
+  test('HTML page: downloads to browser-visit-snapshots/<sha256>.mhtml', async () => {
     setupSuccessFlow();
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
     expect(mockDownloadsDownload).toHaveBeenCalledWith(
       expect.objectContaining({
-        filename: `${MOCK_HEX_HASH}.mhtml`,
+        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
         saveAs: false,
       }),
       expect.any(Function),
@@ -560,9 +556,9 @@ describe('read-and-snapshot message handler', () => {
         await flushPromises();
         // Should NOT call saveAsMHTML
         expect(mockSaveAsMHTML).not.toHaveBeenCalled();
-        // Should download the original URL directly with .pdf extension
+        // Should download the original URL directly with .pdf extension under browser-visit-snapshots/
         expect(mockDownloadsDownload).toHaveBeenCalledWith(
-          expect.objectContaining({ url, filename: expect.stringMatching(/\.pdf$/) }),
+          expect.objectContaining({ url, filename: expect.stringMatching(/^browser-visit-snapshots\/.*\.pdf$/) }),
           expect.any(Function),
         );
       });
@@ -576,7 +572,7 @@ describe('read-and-snapshot message handler', () => {
       });
     });
 
-    test('PDF: filename uses sha256 hash with .pdf extension', async () => {
+    test('PDF: filename is browser-visit-snapshots/<sha256>.pdf', async () => {
       mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
       mockSendNativeMessage.mockImplementation((host, msg, cb) => cb({ status: 'ok' }));
       const pdfMsg = { ...baseMsg, url: 'https://example.com/paper.pdf' };
@@ -584,7 +580,7 @@ describe('read-and-snapshot message handler', () => {
       await flushPromises();
       expect(mockDownloadsDownload).toHaveBeenCalledWith(
         expect.objectContaining({
-          filename: `${MOCK_HEX_HASH}.pdf`,
+          filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.pdf`,
           saveAs: false,
         }),
         expect.any(Function),
@@ -669,51 +665,24 @@ describe('read-and-snapshot message handler', () => {
     expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
   });
 
-  test('on native message success, removes the download file using the correct downloadId', async () => {
-    setupSuccessFlow({ downloadId: 99 });
-    messageHandler(baseMsg, {}, jest.fn());
-    await flushPromises();
-
-    fireDownloadChanged({ id: 99, state: { current: 'complete' } });
-
-    expect(mockDownloadsRemoveFile).toHaveBeenCalledWith(99, expect.any(Function));
-  });
-
-  test('on native message error (lastError), does not call removeFile', async () => {
-    const fakeBlob = { type: 'message/rfc822' };
-    mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
-    mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
-    mockSendNativeMessage.mockImplementation((host, msg, cb) => {
-      global.chrome.runtime.lastError = { message: 'Native host error' };
-      cb(null);
-      global.chrome.runtime.lastError = null;
-    });
-    messageHandler(baseMsg, {}, jest.fn());
-    await flushPromises();
-    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
-    expect(mockDownloadsRemoveFile).not.toHaveBeenCalled();
-  });
-
-  test('on native message error response (no lastError), forwards error and does not call removeFile', async () => {
-    // Covers the else-branch where host.py returns {status:'error'} without a lastError
-    // (e.g. snapshot file not found in Downloads)
+  test('on native message error response (no lastError), forwards error to sendResponse', async () => {
+    // Covers the else-branch: host returns {status:'error'} without a Chrome lastError
     const fakeBlob = { type: 'message/rfc822' };
     mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
     mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));
     mockSendNativeMessage.mockImplementation((host, msg, cb) =>
-      cb({ status: 'error', message: 'Snapshot not found in Downloads' })
+      cb({ status: 'error', message: 'Write failed' })
     );
     const sendResponse = jest.fn();
     messageHandler(baseMsg, {}, sendResponse);
     await flushPromises();
     fireDownloadChanged({ id: 42, state: { current: 'complete' } });
     expect(sendResponse).toHaveBeenCalledWith(
-      expect.objectContaining({ status: 'error', message: 'Snapshot not found in Downloads' })
+      expect.objectContaining({ status: 'error', message: 'Write failed' })
     );
-    expect(mockDownloadsRemoveFile).not.toHaveBeenCalled();
   });
 
-  test('on native message error, calls sendResponse with error', async () => {
+  test('on native message error (lastError), calls sendResponse with error', async () => {
     const fakeBlob = { type: 'message/rfc822' };
     mockSaveAsMHTML.mockImplementation(({ tabId }, cb) => cb(fakeBlob));
     mockDownloadsDownload.mockImplementation((opts, cb) => cb(42));

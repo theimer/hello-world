@@ -85,8 +85,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // PDF viewer produces garbled output). For all other pages, chrome.pageCapture
 // saves a complete offline-capable MHTML bundle.
 //
-// Chrome's downloads API can only write within the Downloads directory, so the
-// snapshot lives there. The native host never touches the file; it only records
+// Snapshots are saved directly into a browser-visit-snapshots/ subfolder of
+// ~/Downloads by Chrome. The native host never touches the file; it only records
 // the read timestamp in the database.
 
 function isPdfUrl(url) {
@@ -134,7 +134,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   Promise.all([hashPromise, contentPromise])
     .then(([hexHash, downloadUrl]) => {
-      const filename = `${hexHash}.${ext}`;
+      const filename = `browser-visit-snapshots/${hexHash}.${ext}`;
 
       chrome.downloads.download({ url: downloadUrl, filename, saveAs: false }, (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {
@@ -156,14 +156,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }, (response) => {
               if (chrome.runtime.lastError) {
                 sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
-              } else if (response && response.status === 'ok') {
-                // host.py copied the file to ~/browser-visit-snapshots/.
-                // Now delete the original from ~/Downloads/ — Chrome has
-                // permission to remove its own downloaded files.
-                chrome.downloads.removeFile(downloadId, () => {
-                  void chrome.runtime.lastError; // ignore cleanup errors
-                });
-                sendResponse(response);
               } else {
                 sendResponse(response);
               }
