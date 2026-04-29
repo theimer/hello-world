@@ -160,8 +160,8 @@ describe('showVisitInfo', () => {
   const RECORD = {
     timestamp: '2026-04-23T02:10:31.451Z',
     of_interest: true,
-    read:      ['2026-04-23T02:27:10.366Z'],
-    skimmed:   [],
+    read:    [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/abc.mhtml' }],
+    skimmed: [],
   };
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
 
@@ -197,7 +197,10 @@ describe('showVisitInfo', () => {
   test('renders a separate row for each read event when read multiple times', async () => {
     const multiReadRecord = {
       ...RECORD,
-      read: ['2026-04-23T02:27:10.366Z', '2026-04-24T09:15:00.000Z'],
+      read: [
+        { timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/abc.mhtml' },
+        { timestamp: '2026-04-24T09:15:00.000Z', filename: 'browser-visit-snapshots/def.mhtml' },
+      ],
     };
     nativeReturns({ status: 'ok', record: multiReadRecord });
     await loadPopup();
@@ -225,7 +228,10 @@ describe('showVisitInfo', () => {
   test('renders a separate row for each skimmed event when skimmed multiple times', async () => {
     const multiSkimRecord = {
       ...RECORD,
-      skimmed: ['2026-04-23T02:27:10.366Z', '2026-04-24T09:15:00.000Z'],
+      skimmed: [
+        { timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/s1.mhtml' },
+        { timestamp: '2026-04-24T09:15:00.000Z', filename: 'browser-visit-snapshots/s2.mhtml' },
+      ],
     };
     nativeReturns({ status: 'ok', record: multiSkimRecord });
     await loadPopup();
@@ -279,7 +285,7 @@ describe('showVisitInfo', () => {
   });
 
   test('renders the "~ Skimmed" row when skimmed array has one entry', async () => {
-    nativeReturns({ status: 'ok', record: { ...RECORD, skimmed: ['2026-04-23T02:27:10.366Z'] } });
+    nativeReturns({ status: 'ok', record: { ...RECORD, skimmed: [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/sk.mhtml' }] } });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
     expect(labels).toContain('~ Skimmed');

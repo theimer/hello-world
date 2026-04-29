@@ -619,7 +619,7 @@ describe('tag-and-snapshot message handler', () => {
     expect(mockDownloadsOnChanged.addListener).toHaveBeenCalledTimes(1);
   });
 
-  test('on download complete, sends native message with the tag from the message', async () => {
+  test('on download complete, sends native message with the tag and filename', async () => {
     setupSuccessFlow({ downloadId: 42 });
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
@@ -628,12 +628,15 @@ describe('tag-and-snapshot message handler', () => {
 
     expect(mockSendNativeMessage).toHaveBeenCalledWith(
       'com.browser.visit.logger',
-      { tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title },
+      {
+        tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title,
+        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+      },
       expect.any(Function),
     );
   });
 
-  test('skimmed tag: snapshot flow works and native message carries tag "skimmed"', async () => {
+  test('skimmed tag: snapshot flow works and native message carries tag "skimmed" and filename', async () => {
     setupSuccessFlow({ downloadId: 43 });
     const skimMsg = { ...baseMsg, tag: 'skimmed' };
     const sendResponse = jest.fn();
@@ -644,7 +647,10 @@ describe('tag-and-snapshot message handler', () => {
 
     expect(mockSendNativeMessage).toHaveBeenCalledWith(
       'com.browser.visit.logger',
-      { tag: 'skimmed', url: skimMsg.url, timestamp: skimMsg.timestamp, title: skimMsg.title },
+      {
+        tag: 'skimmed', url: skimMsg.url, timestamp: skimMsg.timestamp, title: skimMsg.title,
+        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+      },
       expect.any(Function),
     );
     expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });

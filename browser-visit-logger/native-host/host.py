@@ -15,14 +15,14 @@ Auto-log (from background.js):
     { "timestamp": "...", "url": "...", "title": "..." }
     → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
 
-Tag action (from popup.js):
-    { "timestamp": "...", "url": "...", "title": "...", "tag": "of_interest"|"read"|"skimmed" }
+Tag action (from popup.js / background.js):
+    { "timestamp": "...", "url": "...", "title": "...", "tag": "of_interest"|"read"|"skimmed"
+      [, "filename": "browser-visit-snapshots/<hash>.<ext>"] }
     → INSERT OR IGNORE the visit row first (so tagging always works even if the
       auto-log hasn't fired yet), then update of_interest, read, or skimmed;
       append 4-field TSV line.
-      For "read": Chrome saves the snapshot directly to
-      ~/Downloads/browser-visit-snapshots/<sha256(url)>.<ext>;
-      this host only records the read timestamp in the database.
+      For "read" and "skimmed": Chrome saves a snapshot and sends its filename;
+      this host stores both the timestamp and the filename in the events table.
 
 Schema
 ------
@@ -38,12 +38,14 @@ Schema
     read_events (
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
+        filename  TEXT NOT NULL DEFAULT '',  -- snapshot filename, e.g. browser-visit-snapshots/<hash>.mhtml
         PRIMARY KEY (url, timestamp)
     )
 
     skimmed_events (
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
+        filename  TEXT NOT NULL DEFAULT '',  -- snapshot filename, e.g. browser-visit-snapshots/<hash>.mhtml
         PRIMARY KEY (url, timestamp)
     )
 """
@@ -128,7 +130,7 @@ def ensure_db(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
-    """Create an events table (url, timestamp PRIMARY KEY) if it does not yet exist.
+    """Create an events table (url, timestamp, filename PRIMARY KEY) if it does not yet exist.
 
     table is a trusted internal constant, never user-supplied.
     """
@@ -136,13 +138,15 @@ def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
         CREATE TABLE IF NOT EXISTS {table} (
             url       TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            filename  TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (url, timestamp)
         )
     """)
 
 
 def _insert_event(
-    conn: sqlite3.Connection, table: str, url: str, timestamp: str, visits_col: str
+    conn: sqlite3.Connection, table: str, url: str, timestamp: str,
+    visits_col: str, filename: str = '',
 ) -> bool:
     """Insert a timestamped event for url into table if the URL exists in visits,
     and increment the corresponding counter column in visits by 1.
@@ -155,8 +159,8 @@ def _insert_event(
     exists = conn.execute("SELECT 1 FROM visits WHERE url = ?", (url,)).fetchone()
     if exists:
         conn.execute(
-            f"INSERT OR IGNORE INTO {table} (url, timestamp) VALUES (?, ?)",
-            (url, timestamp),
+            f"INSERT OR IGNORE INTO {table} (url, timestamp, filename) VALUES (?, ?, ?)",
+            (url, timestamp, filename),
         )
         conn.execute(
             f"UPDATE visits SET {visits_col} = {visits_col} + 1 WHERE url = ?",
@@ -166,14 +170,15 @@ def _insert_event(
     return exists is not None
 
 
-def _fetch_event_timestamps(conn: sqlite3.Connection, table: str, url: str) -> list:
-    """Return all event timestamps for url from table, sorted ascending.
+def _fetch_events(conn: sqlite3.Connection, table: str, url: str) -> list:
+    """Return all events for url from table as dicts {timestamp, filename}, sorted ascending.
 
     table is a trusted internal constant, never user-supplied.
     """
     return [
-        r[0] for r in conn.execute(
-            f"SELECT timestamp FROM {table} WHERE url = ? ORDER BY timestamp ASC",
+        {'timestamp': r[0], 'filename': r[1]}
+        for r in conn.execute(
+            f"SELECT timestamp, filename FROM {table} WHERE url = ? ORDER BY timestamp ASC",
             (url,),
         ).fetchall()
     ]
@@ -200,13 +205,18 @@ def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
         'timestamp':   row[0],
         'title':       row[1],
         'of_interest': True if row[2] else None,
-        'read':        _fetch_event_timestamps(conn, 'read_events',    url),
-        'skimmed':     _fetch_event_timestamps(conn, 'skimmed_events', url),
+        'read':        _fetch_events(conn, 'read_events',    url),
+        'skimmed':     _fetch_events(conn, 'skimmed_events', url),
     }
 
 
-def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) -> bool:
+def tag_visit(
+    conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str, filename: str = '',
+) -> bool:
     """Set the of_interest, read, or skimmed timestamp on the visit record for url.
+
+    For 'read' and 'skimmed' tags, filename is the snapshot filename stored in the
+    events table (e.g. 'browser-visit-snapshots/<hash>.mhtml').
 
     Returns True if a row was found and updated, False if no record exists for url.
     """
@@ -217,7 +227,7 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
         )
     elif tag in ('read', 'skimmed'):
         table = 'read_events' if tag == 'read' else 'skimmed_events'
-        return _insert_event(conn, table, url, tag_timestamp, tag)
+        return _insert_event(conn, table, url, tag_timestamp, tag, filename)
     else:
         return False
     conn.commit()
@@ -286,7 +296,8 @@ def main() -> None:
 
     timestamp = (message.get('timestamp') or '').strip()
     title     = message.get('title') or ''
-    tag       = (message.get('tag') or '').strip()
+    tag       = (message.get('tag')      or '').strip()
+    filename  = (message.get('filename') or '').strip()
 
     if not url:
         write_message({'status': 'error', 'message': 'url is required'})
@@ -316,7 +327,7 @@ def main() -> None:
         ensure_db(conn)
         insert_visit(conn, timestamp, url, title)
         if tag:
-            tag_visit(conn, url, tag, timestamp)
+            tag_visit(conn, url, tag, timestamp, filename)
         conn.close()
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)

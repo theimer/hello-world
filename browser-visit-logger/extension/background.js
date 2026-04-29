@@ -153,6 +153,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             chrome.runtime.sendNativeMessage(NATIVE_HOST, {
               timestamp, url, title,
               tag,
+              filename,
             }, (response) => {
               if (chrome.runtime.lastError) {
                 sendResponse({ status: 'error', message: chrome.runtime.lastError.message });

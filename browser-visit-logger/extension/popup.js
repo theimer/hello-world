@@ -28,8 +28,8 @@ function showVisitInfo(record) {
   const rows = [
     { label: 'First visited', value: formatTs(record.timestamp) },
     { label: '★ Of Interest', value: record.of_interest ? '' : null },
-    ...(record.read || []).map((ts) => ({ label: '✓ Read', value: formatTs(ts) })),
-    ...(record.skimmed || []).map((ts) => ({ label: '~ Skimmed', value: formatTs(ts) })),
+    ...(record.read || []).map((r) => ({ label: '✓ Read', value: formatTs(r.timestamp) })),
+    ...(record.skimmed || []).map((r) => ({ label: '~ Skimmed', value: formatTs(r.timestamp) })),
   ].filter((r) => r.value !== null);
 
   if (rows.length === 0) return;
