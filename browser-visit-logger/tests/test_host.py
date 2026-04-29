@@ -508,10 +508,11 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
-        row = conn.execute('SELECT of_interest, read FROM visits').fetchone()
+        row = conn.execute('SELECT of_interest FROM visits').fetchone()
+        read_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
         conn.close()
-        self.assertIsNone(row[0])
-        self.assertIsNone(row[1])
+        self.assertIsNone(row[0])         # of_interest untouched
+        self.assertEqual(read_count, 0)   # no read_events row created
 
     def test_tag_visit_no_existing_visit_returns_false(self):
         conn = self._conn()
@@ -532,12 +533,13 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         result = host.tag_visit(conn, 'https://example.com', 'favourite', 'ts-tag')
-        row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
+        row = conn.execute('SELECT of_interest, skimmed FROM visits').fetchone()
+        read_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
         conn.close()
         self.assertFalse(result)
-        self.assertIsNone(row[0])  # of_interest untouched
-        self.assertIsNone(row[1])  # read untouched
-        self.assertIsNone(row[2])  # skimmed untouched
+        self.assertIsNone(row[0])         # of_interest untouched
+        self.assertIsNone(row[1])         # skimmed untouched
+        self.assertEqual(read_count, 0)   # no read_events row created
 
     def test_tag_visit_does_not_affect_other_urls(self):
         conn = self._conn()
