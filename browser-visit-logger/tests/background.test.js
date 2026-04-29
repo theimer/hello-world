@@ -455,11 +455,12 @@ describe('tabs.get null-tab defensive branch', () => {
 });
 
 // ---------------------------------------------------------------------------
-// read-and-snapshot message handler
+// tag-and-snapshot message handler
 // ---------------------------------------------------------------------------
-describe('read-and-snapshot message handler', () => {
+describe('tag-and-snapshot message handler', () => {
   const baseMsg = {
-    type:      'read-and-snapshot',
+    type:      'tag-and-snapshot',
+    tag:       'read',
     tabId:     1,
     timestamp: '2026-01-01T00:00:00Z',
     url:       'https://example.com/',
@@ -618,7 +619,7 @@ describe('read-and-snapshot message handler', () => {
     expect(mockDownloadsOnChanged.addListener).toHaveBeenCalledTimes(1);
   });
 
-  test('on download complete, sends native message with read tag (no snapshot path)', async () => {
+  test('on download complete, sends native message with the tag from the message', async () => {
     setupSuccessFlow({ downloadId: 42 });
     messageHandler(baseMsg, {}, jest.fn());
     await flushPromises();
@@ -630,6 +631,23 @@ describe('read-and-snapshot message handler', () => {
       { tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title },
       expect.any(Function),
     );
+  });
+
+  test('skimmed tag: snapshot flow works and native message carries tag "skimmed"', async () => {
+    setupSuccessFlow({ downloadId: 43 });
+    const skimMsg = { ...baseMsg, tag: 'skimmed' };
+    const sendResponse = jest.fn();
+    messageHandler(skimMsg, {}, sendResponse);
+    await flushPromises();
+
+    fireDownloadChanged({ id: 43, state: { current: 'complete' } });
+
+    expect(mockSendNativeMessage).toHaveBeenCalledWith(
+      'com.browser.visit.logger',
+      { tag: 'skimmed', url: skimMsg.url, timestamp: skimMsg.timestamp, title: skimMsg.title },
+      expect.any(Function),
+    );
+    expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
   });
 
   test('ignores download change events for other download IDs', async () => {

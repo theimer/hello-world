@@ -89,10 +89,11 @@ function setupButtons(tab) {
         }
       }
 
-      if (tag === 'read') {
+      if (tag === 'read' || tag === 'skimmed') {
         showStatus('Saving snapshot\u2026');
         chrome.runtime.sendMessage({
-          type:      'read-and-snapshot',
+          type:      'tag-and-snapshot',
+          tag,
           tabId:     tab.id,
           timestamp,
           url:       tab.url,

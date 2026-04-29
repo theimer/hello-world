@@ -393,14 +393,16 @@ describe('setupButtons', () => {
     );
   });
 
-  test('clicking "skimmed" sends a native message with tag "skimmed"', async () => {
-    nativeReturns({ status: 'ok', record: null });
-    await clickTag('skimmed');
-    expect(mockSendNativeMessage).toHaveBeenCalledWith(
-      'com.browser.visit.logger',
-      expect.objectContaining({ tag: 'skimmed', url: TAB.url }),
+  test('clicking "skimmed" sends runtime.sendMessage (not sendNativeMessage) for snapshot', async () => {
+    await loadPopup();
+    mockSendNativeMessage.mockClear();
+    mockSendMessage.mockClear();
+    document.querySelector('[data-tag="skimmed"]').click();
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'skimmed', url: TAB.url, tabId: TAB.id }),
       expect.any(Function),
     );
+    expect(mockSendNativeMessage).not.toHaveBeenCalled();
   });
 
   test('tag message includes a valid ISO timestamp', async () => {
@@ -418,7 +420,7 @@ describe('setupButtons', () => {
     mockSendMessage.mockClear();
     document.querySelector('[data-tag="read"]').click();
     expect(mockSendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'read-and-snapshot', url: TAB.url, tabId: TAB.id }),
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'read', url: TAB.url, tabId: TAB.id }),
       expect.any(Function),
     );
     expect(mockSendNativeMessage).not.toHaveBeenCalled();
@@ -466,7 +468,7 @@ describe('setupButtons', () => {
       global.chrome.runtime.lastError = null;
     });
     mockSendNativeMessage.mockClear();
-    document.querySelector('[data-tag="skimmed"]').click();
+    document.querySelector('[data-tag="of_interest"]').click();
     expect(document.getElementById('status').textContent).toContain('Error:');
     document.querySelectorAll('[data-tag]').forEach(btn => {
       expect(btn.disabled).toBe(false);

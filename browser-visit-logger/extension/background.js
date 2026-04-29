@@ -95,9 +95,9 @@ function isPdfUrl(url) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type !== 'read-and-snapshot') return false;
+  if (msg.type !== 'tag-and-snapshot') return false;
 
-  const { tabId, timestamp, url, title } = msg;
+  const { tabId, timestamp, url, title, tag } = msg;
 
   // Compute SHA-256 of the URL for a stable, deduplicated snapshot filename.
   const hashPromise = crypto.subtle
@@ -152,7 +152,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             chrome.downloads.onChanged.removeListener(onChanged);
             chrome.runtime.sendNativeMessage(NATIVE_HOST, {
               timestamp, url, title,
-              tag: 'read',
+              tag,
             }, (response) => {
               if (chrome.runtime.lastError) {
                 sendResponse({ status: 'error', message: chrome.runtime.lastError.message });
