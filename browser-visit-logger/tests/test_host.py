@@ -426,14 +426,18 @@ class TestDatabase(unittest.TestCase):
         conn.close()
         self.assertEqual(row, ('https://example.com', '2026-01-01T00:00:00Z', 'Example'))
 
-    def test_insert_visit_of_interest_and_read_default_to_null(self):
+    def test_insert_visit_does_not_set_status_fields(self):
+        # insert_visit only writes url/timestamp/title; it must not touch any
+        # status field — of_interest in visits, or either events table.
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Title')
-        row = conn.execute('SELECT of_interest, read, skimmed FROM visits').fetchone()
+        of_interest   = conn.execute('SELECT of_interest FROM visits').fetchone()[0]
+        read_count    = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+        skimmed_count = conn.execute('SELECT COUNT(*) FROM skimmed_events').fetchone()[0]
         conn.close()
-        self.assertIsNone(row[0])
-        self.assertIsNone(row[1])
-        self.assertIsNone(row[2])
+        self.assertIsNone(of_interest)
+        self.assertEqual(read_count,    0)
+        self.assertEqual(skimmed_count, 0)
 
     def test_insert_visit_empty_title(self):
         conn = self._conn()
