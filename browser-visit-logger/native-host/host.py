@@ -169,6 +169,22 @@ def ensure_db(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("UPDATE visits SET read = NULL WHERE read IS NOT NULL")
 
+    # skimmed_events table — one row per skimmed event, replacing the single visits.skimmed column.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS skimmed_events (
+            url       TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            PRIMARY KEY (url, timestamp)
+        )
+    """)
+    # Migrate any legacy single-skimmed timestamp from visits.skimmed into skimmed_events,
+    # then clear the old column so it is no longer used.
+    conn.execute("""
+        INSERT OR IGNORE INTO skimmed_events (url, timestamp)
+        SELECT url, skimmed FROM visits WHERE skimmed IS NOT NULL
+    """)
+    conn.execute("UPDATE visits SET skimmed = NULL WHERE skimmed IS NOT NULL")
+
     conn.commit()
 
 
@@ -184,7 +200,7 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
 def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
     """Return the visit record for url as a dict, or None if no record exists."""
     row = conn.execute(
-        "SELECT timestamp, title, of_interest, skimmed FROM visits WHERE url = ?",
+        "SELECT timestamp, title, of_interest FROM visits WHERE url = ?",
         (url,),
     ).fetchone()
     if row is None:
@@ -195,12 +211,18 @@ def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
             (url,),
         ).fetchall()
     ]
+    skimmed_timestamps = [
+        r[0] for r in conn.execute(
+            "SELECT timestamp FROM skimmed_events WHERE url = ? ORDER BY timestamp ASC",
+            (url,),
+        ).fetchall()
+    ]
     return {
         'timestamp':   row[0],
         'title':       row[1],
         'of_interest': True if row[2] else None,
         'read':        read_timestamps,
-        'skimmed':     row[3],
+        'skimmed':     skimmed_timestamps,
     }
 
 
@@ -224,10 +246,14 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
         conn.commit()
         return exists is not None
     elif tag == 'skimmed':
-        cursor = conn.execute(
-            "UPDATE visits SET skimmed = ? WHERE url = ?",
-            (tag_timestamp, url),
-        )
+        exists = conn.execute("SELECT 1 FROM visits WHERE url = ?", (url,)).fetchone()
+        if exists:
+            conn.execute(
+                "INSERT OR IGNORE INTO skimmed_events (url, timestamp) VALUES (?, ?)",
+                (url, tag_timestamp),
+            )
+        conn.commit()
+        return exists is not None
     else:
         return False
     conn.commit()

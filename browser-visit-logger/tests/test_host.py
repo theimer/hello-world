@@ -215,6 +215,11 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('read_events', self._tables(conn))
         conn.close()
 
+    def test_ensure_db_creates_skimmed_events_table(self):
+        conn = self._conn()
+        self.assertIn('skimmed_events', self._tables(conn))
+        conn.close()
+
     def test_ensure_db_migrates_legacy_read_column_to_read_events(self):
         # Simulate a database that has a non-NULL visits.read value
         conn = sqlite3.connect(':memory:')
@@ -243,6 +248,37 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(row[0], 'ts-read')
         # Old visits.read column nulled out
         old = conn.execute("SELECT read FROM visits").fetchone()
+        conn.close()
+        self.assertIsNone(old[0])
+
+    def test_ensure_db_migrates_legacy_skimmed_column_to_skimmed_events(self):
+        # Simulate a database that has a non-NULL visits.skimmed value
+        conn = sqlite3.connect(':memory:')
+        conn.execute("""
+            CREATE TABLE visits (
+                url         TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                of_interest TEXT,
+                read        TEXT,
+                skimmed     TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO visits (url, timestamp, title, skimmed) VALUES (?, ?, ?, ?)",
+            ('https://example.com', 'ts-visit', 'Example', 'ts-skimmed'),
+        )
+        conn.commit()
+        host.ensure_db(conn)
+        # Value migrated into skimmed_events
+        row = conn.execute(
+            "SELECT timestamp FROM skimmed_events WHERE url = ?",
+            ('https://example.com',)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 'ts-skimmed')
+        # Old visits.skimmed column nulled out
+        old = conn.execute("SELECT skimmed FROM visits").fetchone()
         conn.close()
         self.assertIsNone(old[0])
 
@@ -352,6 +388,7 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('read', cols)
         self.assertIn('skimmed', cols)
         self.assertIn('read_events', tables)
+        self.assertIn('skimmed_events', tables)
 
     def test_ensure_db_migrates_old_id_based_schema(self):
         # Simulate a database created before the url-PK redesign
@@ -492,17 +529,42 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'of_interest', '2026-01-01T12:00:00Z')
-        count = conn.execute("SELECT COUNT(*) FROM read_events").fetchone()[0]
+        read_count    = conn.execute("SELECT COUNT(*) FROM read_events").fetchone()[0]
+        skimmed_count = conn.execute("SELECT COUNT(*) FROM skimmed_events").fetchone()[0]
         conn.close()
-        self.assertEqual(count, 0)
+        self.assertEqual(read_count,    0)
+        self.assertEqual(skimmed_count, 0)
 
-    def test_tag_visit_sets_skimmed(self):
+    def test_tag_visit_inserts_skimmed_event(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        row = conn.execute(
+            "SELECT timestamp FROM skimmed_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row[0], '2026-01-01T12:00:00Z')
+
+    def test_tag_visit_skimmed_does_not_update_visits_skimmed_column(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
         row = conn.execute('SELECT skimmed FROM visits').fetchone()
         conn.close()
-        self.assertEqual(row[0], '2026-01-01T12:00:00Z')
+        self.assertIsNone(row[0])
+
+    def test_tag_visit_skimmed_twice_stores_both_timestamps(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-02T12:00:00Z')
+        rows = conn.execute(
+            "SELECT timestamp FROM skimmed_events WHERE url = ? ORDER BY timestamp ASC",
+            ('https://example.com',)
+        ).fetchall()
+        conn.close()
+        self.assertEqual([r[0] for r in rows],
+                         ['2026-01-01T12:00:00Z', '2026-01-02T12:00:00Z'])
 
     def test_tag_visit_skimmed_does_not_set_of_interest_or_read(self):
         conn = self._conn()
@@ -533,13 +595,14 @@ class TestTagVisit(unittest.TestCase):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         result = host.tag_visit(conn, 'https://example.com', 'favourite', 'ts-tag')
-        row = conn.execute('SELECT of_interest, skimmed FROM visits').fetchone()
-        read_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+        row = conn.execute('SELECT of_interest FROM visits').fetchone()
+        read_count    = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+        skimmed_count = conn.execute('SELECT COUNT(*) FROM skimmed_events').fetchone()[0]
         conn.close()
         self.assertFalse(result)
-        self.assertIsNone(row[0])         # of_interest untouched
-        self.assertIsNone(row[1])         # skimmed untouched
-        self.assertEqual(read_count, 0)   # no read_events row created
+        self.assertIsNone(row[0])            # of_interest untouched
+        self.assertEqual(read_count,    0)   # no read_events row created
+        self.assertEqual(skimmed_count, 0)   # no skimmed_events row created
 
     def test_tag_visit_does_not_affect_other_urls(self):
         conn = self._conn()
@@ -585,8 +648,8 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
         self.assertIsNone(result['of_interest'])
-        self.assertEqual(result['read'], [])   # empty list — never read
-        self.assertIsNone(result['skimmed'])
+        self.assertEqual(result['read'],    [])   # empty list — never read
+        self.assertEqual(result['skimmed'], [])   # empty list — never skimmed
 
     def test_tag_fields_reflect_applied_tags(self):
         conn = self._conn()
@@ -595,9 +658,9 @@ class TestQueryVisit(unittest.TestCase):
         host.tag_visit(conn, 'https://example.com', 'read', 'ts-read')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertTrue(result['of_interest'])  # boolean True (stored as 1)
-        self.assertEqual(result['read'], ['ts-read'])
-        self.assertIsNone(result['skimmed'])
+        self.assertTrue(result['of_interest'])       # boolean True (stored as 1)
+        self.assertEqual(result['read'],    ['ts-read'])
+        self.assertEqual(result['skimmed'], [])       # not skimmed — empty list
 
     def test_query_visit_returns_all_read_events_in_order(self):
         conn = self._conn()
@@ -607,6 +670,16 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
         self.assertEqual(result['read'],
+                         ['2026-01-01T10:00:00Z', '2026-01-02T10:00:00Z'])
+
+    def test_query_visit_returns_all_skimmed_events_in_order(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts-visit', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T10:00:00Z')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-02T10:00:00Z')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertEqual(result['skimmed'],
                          ['2026-01-01T10:00:00Z', '2026-01-02T10:00:00Z'])
 
     def test_does_not_return_record_for_different_url(self):
@@ -1094,12 +1167,13 @@ class TestIntegration(unittest.TestCase):
             )
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT of_interest, skimmed FROM visits').fetchone()
-            read_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+            of_interest   = conn.execute('SELECT of_interest FROM visits').fetchone()[0]
+            read_count    = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+            skimmed_count = conn.execute('SELECT COUNT(*) FROM skimmed_events').fetchone()[0]
             conn.close()
-        self.assertEqual(row[0], '1')  # of_interest set; TEXT affinity stores literal 1 as '1'
-        self.assertIsNone(row[1])      # skimmed untouched
-        self.assertEqual(read_count, 0)
+        self.assertEqual(of_interest, '1')  # TEXT affinity stores literal 1 as '1'
+        self.assertEqual(read_count,    0)   # no read_events row created
+        self.assertEqual(skimmed_count, 0)   # no skimmed_events row created
 
     def test_tag_message_inserts_read_event(self):
         url = 'https://example.com'
@@ -1134,24 +1208,42 @@ class TestIntegration(unittest.TestCase):
             conn.close()
         self.assertEqual([e[0] for e in events], ['ts-read-1', 'ts-read-2'])
 
-    def test_tag_message_sets_skimmed_column(self):
+    def test_tag_message_inserts_skimmed_event(self):
+        url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
-                {'timestamp': 'ts-visit', 'url': 'https://example.com', 'title': 'Example'},
-                tmp,
-            )
+                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
             resp = self._invoke(
-                {'timestamp': 'ts-tag', 'url': 'https://example.com', 'title': 'Example', 'tag': 'skimmed'},
-                tmp,
-            )
+                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'skimmed'}, tmp)
             self.assertEqual(resp['status'], 'ok')
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
-            row = conn.execute('SELECT of_interest, skimmed FROM visits').fetchone()
-            read_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+            event = conn.execute(
+                'SELECT timestamp FROM skimmed_events WHERE url = ?', (url,)
+            ).fetchone()
+            of_interest = conn.execute('SELECT of_interest FROM visits').fetchone()[0]
+            read_count  = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
             conn.close()
-        self.assertIsNone(row[0])       # of_interest untouched
-        self.assertEqual(row[1], 'ts-tag')
-        self.assertEqual(read_count, 0)
+        self.assertIsNotNone(event)
+        self.assertEqual(event[0], 'ts-tag')
+        self.assertIsNone(of_interest)   # of_interest untouched
+        self.assertEqual(read_count, 0)  # no read_events row created
+
+    def test_tag_message_skimmed_twice_stores_both_events(self):
+        url = 'https://example.com'
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
+            self._invoke(
+                {'timestamp': 'ts-skim-1', 'url': url, 'title': 'Example', 'tag': 'skimmed'}, tmp)
+            resp = self._invoke(
+                {'timestamp': 'ts-skim-2', 'url': url, 'title': 'Example', 'tag': 'skimmed'}, tmp)
+            self.assertEqual(resp['status'], 'ok')
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            events = conn.execute(
+                'SELECT timestamp FROM skimmed_events WHERE url = ? ORDER BY timestamp ASC', (url,)
+            ).fetchall()
+            conn.close()
+        self.assertEqual([e[0] for e in events], ['ts-skim-1', 'ts-skim-2'])
 
     def test_tag_message_appends_four_field_log_line(self):
         url = 'https://example.com'
@@ -1223,9 +1315,9 @@ class TestIntegration(unittest.TestCase):
                 tmp,
             )
             resp = self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
-            self.assertTrue(resp['record']['of_interest'])  # boolean True
-            self.assertEqual(resp['record']['read'], [])    # never read → empty list
-            self.assertIsNone(resp['record']['skimmed'])
+            self.assertTrue(resp['record']['of_interest'])       # boolean True
+            self.assertEqual(resp['record']['read'],    [])      # never read → empty list
+            self.assertEqual(resp['record']['skimmed'], [])      # never skimmed → empty list
 
     def test_query_does_not_write_log(self):
         with tempfile.TemporaryDirectory() as tmp:
