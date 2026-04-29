@@ -26,12 +26,24 @@ Tag action (from popup.js):
 Schema
 ------
     visits (
-        url       TEXT PRIMARY KEY,
-        timestamp TEXT NOT NULL,        -- set on first visit, never updated
-        title     TEXT NOT NULL DEFAULT '',
-        of_interest TEXT,               -- ISO timestamp, NULL until tagged
-        read      TEXT,                 -- ISO timestamp, NULL until tagged
-        skimmed   TEXT                  -- ISO timestamp, NULL until tagged
+        url         TEXT PRIMARY KEY,
+        timestamp   TEXT NOT NULL,           -- first-visit timestamp, never updated
+        title       TEXT NOT NULL DEFAULT '',
+        of_interest TEXT,                    -- non-NULL if ever tagged of_interest
+        read        INTEGER NOT NULL DEFAULT 0,  -- count of read clicks
+        skimmed     INTEGER NOT NULL DEFAULT 0   -- count of skimmed clicks
+    )
+
+    read_events (
+        url       TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        PRIMARY KEY (url, timestamp)
+    )
+
+    skimmed_events (
+        url       TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        PRIMARY KEY (url, timestamp)
     )
 """
 
@@ -92,80 +104,32 @@ def ensure_db(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)').fetchall()}
 
     if not cols:
-        # Fresh database
         conn.execute("""
             CREATE TABLE visits (
                 url         TEXT PRIMARY KEY,
                 timestamp   TEXT NOT NULL,
                 title       TEXT NOT NULL DEFAULT '',
                 of_interest TEXT,
-                read        TEXT,
-                skimmed     TEXT
+                read        INTEGER NOT NULL DEFAULT 0,
+                skimmed     INTEGER NOT NULL DEFAULT 0
             )
         """)
-    elif 'id' in cols:
-        # Old id-based schema — migrate to url-primary-key schema
-        conn.execute("""
-            CREATE TABLE visits_new (
-                url         TEXT PRIMARY KEY,
-                timestamp   TEXT NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                of_interest TEXT,
-                read        TEXT,
-                skimmed     TEXT
-            )
-        """)
-        conn.execute("""
-            INSERT OR IGNORE INTO visits_new (url, timestamp, title)
-            SELECT url, timestamp, title FROM visits
-        """)
-        conn.execute("DROP TABLE visits")
-        conn.execute("ALTER TABLE visits_new RENAME TO visits")
-
-    elif 'memorable' in cols:
-        # Rename memorable → of_interest; also ensures skimmed is present
-        skimmed_col = 'skimmed' if 'skimmed' in cols else 'NULL'
-        conn.execute("""
-            CREATE TABLE visits_new (
-                url         TEXT PRIMARY KEY,
-                timestamp   TEXT NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                of_interest TEXT,
-                read        TEXT,
-                skimmed     TEXT
-            )
-        """)
-        conn.execute(f"""
-            INSERT OR IGNORE INTO visits_new
-                (url, timestamp, title, of_interest, read, skimmed)
-            SELECT url, timestamp, title, memorable, read, {skimmed_col}
-            FROM visits
-        """)
-        conn.execute("DROP TABLE visits")
-        conn.execute("ALTER TABLE visits_new RENAME TO visits")
-
-    else:
-        # Add skimmed column to existing url-PK schema if missing
-        if 'skimmed' not in cols:
-            conn.execute("ALTER TABLE visits ADD COLUMN skimmed TEXT")
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)"
     )
 
-    # One row per read/skimmed event — replaces the single visits.read / visits.skimmed columns.
-    _ensure_events_table(conn, 'read_events',    'read')
-    _ensure_events_table(conn, 'skimmed_events', 'skimmed')
+    # One row per read/skimmed event (individual timestamps).
+    _ensure_events_table(conn, 'read_events')
+    _ensure_events_table(conn, 'skimmed_events')
 
     conn.commit()
 
 
-def _ensure_events_table(conn: sqlite3.Connection, table: str, legacy_col: str) -> None:
-    """Create an events table (url, timestamp PRIMARY KEY) and migrate any existing
-    single-value timestamp from visits.legacy_col into it, then null that column out.
-    Idempotent: CREATE TABLE IF NOT EXISTS and INSERT OR IGNORE make repeated calls safe.
+def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
+    """Create an events table (url, timestamp PRIMARY KEY) if it does not yet exist.
 
-    table and legacy_col are trusted internal constants, never user-supplied.
+    table is a trusted internal constant, never user-supplied.
     """
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
@@ -174,26 +138,28 @@ def _ensure_events_table(conn: sqlite3.Connection, table: str, legacy_col: str) 
             PRIMARY KEY (url, timestamp)
         )
     """)
-    conn.execute(f"""
-        INSERT OR IGNORE INTO {table} (url, timestamp)
-        SELECT url, {legacy_col} FROM visits WHERE {legacy_col} IS NOT NULL
-    """)
-    conn.execute(f"UPDATE visits SET {legacy_col} = NULL WHERE {legacy_col} IS NOT NULL")
 
 
-def _insert_event(conn: sqlite3.Connection, table: str, url: str, timestamp: str) -> bool:
-    """Insert a timestamped event for url into table if the URL exists in visits.
+def _insert_event(
+    conn: sqlite3.Connection, table: str, url: str, timestamp: str, visits_col: str
+) -> bool:
+    """Insert a timestamped event for url into table if the URL exists in visits,
+    and increment the corresponding counter column in visits by 1.
 
-    Returns True if the URL exists in visits (event inserted or duplicate silently
-    ignored), False if no visits record exists for the URL.
+    Returns True if the URL exists (event inserted or duplicate ignored),
+    False if no visits record exists for the URL.
 
-    table is a trusted internal constant, never user-supplied.
+    table and visits_col are trusted internal constants, never user-supplied.
     """
     exists = conn.execute("SELECT 1 FROM visits WHERE url = ?", (url,)).fetchone()
     if exists:
         conn.execute(
             f"INSERT OR IGNORE INTO {table} (url, timestamp) VALUES (?, ?)",
             (url, timestamp),
+        )
+        conn.execute(
+            f"UPDATE visits SET {visits_col} = {visits_col} + 1 WHERE url = ?",
+            (url,),
         )
     conn.commit()
     return exists is not None
@@ -250,7 +216,7 @@ def tag_visit(conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str) 
         )
     elif tag in ('read', 'skimmed'):
         table = 'read_events' if tag == 'read' else 'skimmed_events'
-        return _insert_event(conn, table, url, tag_timestamp)
+        return _insert_event(conn, table, url, tag_timestamp, tag)
     else:
         return False
     conn.commit()
