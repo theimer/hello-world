@@ -17,8 +17,9 @@ Auto-log (from background.js):
 
 Tag action (from popup.js):
     { "timestamp": "...", "url": "...", "title": "...", "tag": "of_interest"|"read"|"skimmed" }
-    → UPDATE of_interest, read, or skimmed column on the row for that URL using
-      the message timestamp; append 4-field TSV line.
+    → INSERT OR IGNORE the visit row first (so tagging always works even if the
+      auto-log hasn't fired yet), then update of_interest, read, or skimmed;
+      append 4-field TSV line.
       For "read": Chrome saves the snapshot directly to
       ~/Downloads/browser-visit-snapshots/<sha256(url)>.<ext>;
       this host only records the read timestamp in the database.
@@ -298,8 +299,6 @@ def main() -> None:
         return
 
     errors = []
-    no_record = False
-    no_record_msg = 'No record found for this URL — visit the page before tagging'
 
     # First write: record the intended action
     try:
@@ -308,36 +307,29 @@ def main() -> None:
         logger.error('Log file write failed: %s', exc)
         errors.append(f'log: {exc}')
 
-    # Write to SQLite
+    # Write to SQLite.  Always insert the visit first (INSERT OR IGNORE, so the
+    # original first-visit timestamp wins if the row already exists); then apply
+    # the tag if one is present.  This means tagging always works even when the
+    # background auto-log hasn't finished writing yet.
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
+        insert_visit(conn, timestamp, url, title)
         if tag:
-            found = tag_visit(conn, url, tag, timestamp)
-            if not found:
-                no_record = True
-        else:
-            insert_visit(conn, timestamp, url, title)
+            tag_visit(conn, url, tag, timestamp)
         conn.close()
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)
         errors.append(f'db: {exc}')
 
     # Second write: record the result
-    if no_record:
-        log_result = f'error: {no_record_msg}'
-    elif errors:
-        log_result = f'error: {"; ".join(errors)}'
-    else:
-        log_result = 'success'
+    log_result = f'error: {"; ".join(errors)}' if errors else 'success'
     try:
         append_result_log(log_result)
     except Exception as exc:
         logger.error('Log file result write failed: %s', exc)
 
-    if no_record:
-        write_message({'status': 'error', 'message': no_record_msg})
-    elif errors:
+    if errors:
         write_message({'status': 'error', 'errors': errors})
     else:
         write_message({'status': 'ok'})

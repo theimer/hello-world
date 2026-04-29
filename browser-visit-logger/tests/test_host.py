@@ -740,27 +740,34 @@ class TestMain(unittest.TestCase):
             )
         self.assertEqual(resp['status'], 'ok')
 
-    def test_tag_not_found_returns_no_record_error(self):
+    def test_tag_without_prior_visit_still_returns_ok(self):
+        # Tagging creates the visit row implicitly (INSERT OR IGNORE) so there is
+        # no longer a "no record found" error — the tag always succeeds.
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._call_main(
                 {'timestamp': 'ts', 'url': 'https://example.com',
                  'title': 'Title', 'tag': 'of_interest'},
                 tmp,
             )
-        self.assertEqual(resp['status'], 'error')
-        self.assertIn('No record found', resp['message'])
+        self.assertEqual(resp['status'], 'ok')
 
-    def test_tag_not_found_writes_error_result_to_log(self):
+    def test_tag_without_prior_visit_creates_visit_record(self):
+        # When a tag message arrives for a URL not yet in the DB, a visit row
+        # must be created so that subsequent queries return the record.
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
-                {'timestamp': 'ts', 'url': 'https://example.com',
+                {'timestamp': 'ts-tag', 'url': 'https://example.com',
                  'title': 'Title', 'tag': 'of_interest'},
                 tmp,
             )
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
-        # line 0 = action (4-field TSV), line 1 = 'error: No record found...'
-        self.assertEqual(len(lines), 2)
-        self.assertIn('No record found', lines[1])
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute(
+                'SELECT url, timestamp, of_interest FROM visits'
+            ).fetchone()
+            conn.close()
+        self.assertEqual(row[0], 'https://example.com')
+        self.assertEqual(row[1], 'ts-tag')
+        self.assertEqual(row[2], '1')  # of_interest was applied
 
     def test_all_three_valid_tags_succeed_after_visit(self):
         for tag in ('of_interest', 'read', 'skimmed'):
@@ -789,17 +796,20 @@ class TestMain(unittest.TestCase):
         self.assertEqual(resp['status'], 'ok')
 
     def test_result_log_failure_on_error_path_still_returns_error_response(self):
-        """append_result_log failure on the error path doesn't swallow the error response."""
+        """append_result_log failure on the DB-error path doesn't swallow the error response."""
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._call_main(
-                {'timestamp': 'ts', 'url': 'https://example.com',
-                 'title': 'Title', 'tag': 'of_interest'},  # no prior visit → no_record
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
                 tmp,
-                extra_patches=[patch.object(host, 'append_result_log',
-                                            side_effect=OSError('disk full'))],
+                extra_patches=[
+                    patch('sqlite3.connect',
+                          side_effect=sqlite3.OperationalError('disk full')),
+                    patch.object(host, 'append_result_log',
+                                 side_effect=OSError('disk full')),
+                ],
             )
         self.assertEqual(resp['status'], 'error')
-        self.assertIn('No record found', resp['message'])
+        self.assertTrue(any('db' in e for e in resp.get('errors', [])))
 
 
 # ---------------------------------------------------------------------------
@@ -1143,20 +1153,29 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(lines[0].split('\t')), 3)  # action: 3 fields
         self.assertEqual(lines[1], 'success')
 
-    def test_tag_without_prior_visit_returns_error(self):
+    def test_tag_without_prior_visit_succeeds_and_creates_visit(self):
+        # Tagging a URL with no prior auto-log entry must now succeed: the host
+        # implicitly inserts the visit row before applying the tag.
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke(
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example', 'tag': 'of_interest'},
                 tmp,
             )
-            self.assertEqual(resp['status'], 'error')
-            self.assertIn('No record found', resp.get('message', ''))
+            self.assertEqual(resp['status'], 'ok')
+            # The visit row was created with the tag timestamp
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            row = conn.execute(
+                'SELECT timestamp, of_interest FROM visits WHERE url = ?',
+                ('https://example.com',)
+            ).fetchone()
+            conn.close()
+            # Log should show action line + success (not an error)
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-            self.assertEqual(len(lines), 2)
-            action = lines[0].split('\t')
-            self.assertEqual(len(action), 4)
-            self.assertEqual(action[3], 'of_interest')
-            self.assertIn('No record found', lines[1])
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 'ts')       # timestamp from tag message
+        self.assertEqual(row[1], '1')        # of_interest applied
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1], 'success')
 
     def test_query_unknown_url_returns_null_record(self):
         with tempfile.TemporaryDirectory() as tmp:
