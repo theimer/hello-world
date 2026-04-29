@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 """
-reset.py — Delete browser-visits.log and/or browser-visits.db.
+reset.py — Delete all local data produced by the Browser Visit Logger extension.
+
+Files and directories managed:
+  browser-visits.log                    — TSV visit/action log       (BVL_LOG_FILE)
+  browser-visits-host.log               — native host process log    (BVL_HOST_LOG)
+  browser-visits.db                     — SQLite visit database      (BVL_DB_FILE)
+  ~/Downloads/browser-visit-snapshots/  — saved page snapshots
 
 Usage:
-    python reset.py           # reset both (with confirmation)
-    python reset.py --log     # reset only the log file
-    python reset.py --db      # reset only the database
-    python reset.py -f        # skip confirmation prompt
+    python reset.py                 # reset everything (with confirmation)
+    python reset.py --log           # reset only the visit log
+    python reset.py --host-log      # reset only the host process log
+    python reset.py --db            # reset only the database
+    python reset.py --snapshots     # reset only the snapshots directory
+    python reset.py -f              # skip confirmation prompt
 
-The same BVL_LOG_FILE and BVL_DB_FILE environment variables used by host.py
-are respected here, so custom paths work automatically.
+The same BVL_* environment variables used by host.py are respected here,
+so custom paths work automatically.
 """
 
 import argparse
 import os
+import shutil
 import sys
 
 HOME     = os.path.expanduser('~')
 LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
+HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
+SNAP_DIR = os.path.join(HOME, 'Downloads', 'browser-visit-snapshots')
 
 
-def _delete(path: str, label: str) -> None:
+def _delete_file(path: str, label: str) -> None:
     if os.path.exists(path):
         os.remove(path)
         print(f'Deleted {label}: {path}')
@@ -29,28 +40,44 @@ def _delete(path: str, label: str) -> None:
         print(f'{label} not found, skipping: {path}')
 
 
+def _delete_dir(path: str, label: str) -> None:
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+        print(f'Deleted {label}: {path}')
+    else:
+        print(f'{label} not found, skipping: {path}')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Delete browser-visits log file and/or SQLite database.',
+        description='Delete all local data produced by the Browser Visit Logger extension.',
     )
-    parser.add_argument('--log', action='store_true', help='reset only the log file')
-    parser.add_argument('--db',  action='store_true', help='reset only the database')
-    parser.add_argument('-f', '--force', action='store_true',
-                        help='skip confirmation prompt')
+    parser.add_argument('--log',       action='store_true', help='reset only the visit log')
+    parser.add_argument('--host-log',  action='store_true', help='reset only the host process log')
+    parser.add_argument('--db',        action='store_true', help='reset only the database')
+    parser.add_argument('--snapshots', action='store_true', help='reset only the snapshots directory')
+    parser.add_argument('-f', '--force', action='store_true', help='skip confirmation prompt')
     args = parser.parse_args()
 
-    reset_both = not args.log and not args.db
-    do_log = args.log or reset_both
-    do_db  = args.db  or reset_both
+    reset_all    = not args.log and not args.host_log and not args.db and not args.snapshots
+    do_log       = args.log       or reset_all
+    do_host_log  = args.host_log  or reset_all
+    do_db        = args.db        or reset_all
+    do_snapshots = args.snapshots or reset_all
 
+    # Each entry: (path, label, kind)  where kind is 'file' or 'dir'
     targets = []
     if do_log:
-        targets.append((LOG_FILE, 'log file'))
+        targets.append((LOG_FILE, 'visit log',            'file'))
+    if do_host_log:
+        targets.append((HOST_LOG, 'host log',             'file'))
     if do_db:
-        targets.append((DB_FILE, 'database'))
+        targets.append((DB_FILE,  'database',             'file'))
+    if do_snapshots:
+        targets.append((SNAP_DIR, 'snapshots directory',  'dir'))
 
-    print('The following files will be permanently deleted:')
-    for path, label in targets:
+    print('The following will be permanently deleted:')
+    for path, label, kind in targets:
         status = 'exists' if os.path.exists(path) else 'not found'
         print(f'  [{status}] {path}')
 
@@ -65,8 +92,11 @@ def main() -> None:
             sys.exit(0)
 
     print()
-    for path, label in targets:
-        _delete(path, label)
+    for path, label, kind in targets:
+        if kind == 'dir':
+            _delete_dir(path, label)
+        else:
+            _delete_file(path, label)
 
 
 if __name__ == '__main__':
