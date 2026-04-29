@@ -101,7 +101,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Compute SHA-256 of the URL for a stable, deduplicated snapshot filename.
   const hashPromise = crypto.subtle
-    .digest('SHA-256', new TextEncoder().encode(url))
+    .digest('SHA-256', new TextEncoder().encode(url + timestamp))
     .then((buf) =>
       Array.from(new Uint8Array(buf))
         .map((b) => b.toString(16).padStart(2, '0'))

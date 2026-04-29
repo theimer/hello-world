@@ -125,7 +125,7 @@ describe('formatTs', () => {
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
 
   test('renders nothing when timestamp is null', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     expect(document.querySelectorAll('.info-row').length).toBe(0);
@@ -133,7 +133,7 @@ describe('formatTs', () => {
 
   test('renders a human-readable date string, not the raw ISO timestamp', async () => {
     const ISO = '2026-04-23T14:09:34.261Z';
-    nativeReturns({ status: 'ok', record: { timestamp: ISO, of_interest: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: ISO, of_interest: null, read: [], skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     const valueEl = document.querySelector('.info-value');
@@ -145,7 +145,7 @@ describe('formatTs', () => {
   });
 
   test('formatted string includes the year for a 2026 timestamp', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: '2026-04-23T14:09:34.261Z', of_interest: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: '2026-04-23T14:09:34.261Z', of_interest: null, read: [], skimmed: null } });
     tabReturns(TAB);
     await loadPopup();
     const valueEl = document.querySelector('.info-value');
@@ -160,7 +160,7 @@ describe('showVisitInfo', () => {
   const RECORD = {
     timestamp: '2026-04-23T02:10:31.451Z',
     of_interest: true,
-    read:      '2026-04-23T02:27:10.366Z',
+    read:      ['2026-04-23T02:27:10.366Z'],
     skimmed:   null,
   };
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
@@ -182,7 +182,7 @@ describe('showVisitInfo', () => {
   });
 
   test('leaves #visit-info hidden when all timestamps are null', async () => {
-    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: null, skimmed: null } });
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: null } });
     await loadPopup();
     expect(document.getElementById('visit-info').style.display).toBe('none');
   });
@@ -190,8 +190,36 @@ describe('showVisitInfo', () => {
   test('renders a row for each non-null timestamp', async () => {
     nativeReturns({ status: 'ok', record: RECORD });
     await loadPopup();
-    // RECORD: timestamp, of_interest, read are set (3); skimmed is null
+    // RECORD: timestamp, of_interest, read[0] are set (3); skimmed is null
     expect(document.querySelectorAll('.info-row').length).toBe(3);
+  });
+
+  test('renders a separate row for each read event when read multiple times', async () => {
+    const multiReadRecord = {
+      ...RECORD,
+      read: ['2026-04-23T02:27:10.366Z', '2026-04-24T09:15:00.000Z'],
+    };
+    nativeReturns({ status: 'ok', record: multiReadRecord });
+    await loadPopup();
+    // timestamp + of_interest + read[0] + read[1] = 4 rows
+    expect(document.querySelectorAll('.info-row').length).toBe(4);
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels.filter(l => l === '✓ Read').length).toBe(2);
+  });
+
+  test('renders no read rows when read is an empty array', async () => {
+    nativeReturns({ status: 'ok', record: { ...RECORD, read: [] } });
+    await loadPopup();
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels).not.toContain('✓ Read');
+  });
+
+  test('handles record.read being null without throwing (defensive fallback)', async () => {
+    // The || [] guard in showVisitInfo protects against null coming from old clients
+    nativeReturns({ status: 'ok', record: { ...RECORD, read: null } });
+    await loadPopup();
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels).not.toContain('✓ Read');
   });
 
   test('does not render a row for a null timestamp', async () => {
@@ -215,7 +243,7 @@ describe('showVisitInfo', () => {
     expect(labels).toContain('★ Of Interest');
   });
 
-  test('renders the "✓ Read" row when read is set', async () => {
+  test('renders the "✓ Read" row when read array has one entry', async () => {
     nativeReturns({ status: 'ok', record: RECORD });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
@@ -276,7 +304,7 @@ describe('DOMContentLoaded handler', () => {
   test('renders visit info from the host response', async () => {
     nativeReturns({ status: 'ok', record: {
       timestamp: '2026-04-23T02:10:31.451Z',
-      of_interest: null, read: null, skimmed: null,
+      of_interest: null, read: [], skimmed: null,
     }});
     tabReturns(TAB);
     await loadPopup();
