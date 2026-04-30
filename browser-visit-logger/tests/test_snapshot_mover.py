@@ -141,6 +141,13 @@ class TestMovePass(_MoverTestBase):
         row = self._row('read_events', 'https://a.com')
         self.assertEqual(row[1], self.source_dir)
 
+    def test_moved_file_is_read_only(self):
+        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+                         age_seconds=700)
+        snapshot_mover.main()
+        mode = os.stat(os.path.join(self.dest_dir, 'a.mhtml')).st_mode & 0o777
+        self.assertEqual(mode, 0o444)
+
     def test_processes_both_read_and_skimmed_event_tables(self):
         self._make_event('read_events',    'https://r.com', 'tsr', 'r.mhtml',
                          age_seconds=700)

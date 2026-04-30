@@ -174,6 +174,8 @@ def _move_one(
     try:
         # (a) copy (preserves mtime via copy2 — overwrite is safe).
         shutil.copy2(source, dest)
+        # (a2) make the archived copy read-only.
+        os.chmod(dest, 0o444)
         # (b) commit the move in the DB.
         conn.execute(
             f"UPDATE {table} SET directory = ? WHERE rowid = ?",
@@ -182,7 +184,7 @@ def _move_one(
         conn.commit()
         # (c) remove the original.
         os.unlink(source)
-        logger.info('Moved %s -> %s', source, dest)
+        logger.info('Moved %s -> %s (read-only)', source, dest)
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to move %s: %s', source, exc)
 
