@@ -79,13 +79,28 @@ snapshots (
     date   TEXT PRIMARY KEY,                   -- 'YYYY-MM-DD' (UTC)
     sealed INTEGER NOT NULL DEFAULT 0          -- 0 = unsealed, 1 = sealed
 )
+
+mover_errors (
+    key        TEXT PRIMARY KEY,               -- '<op>:<target>'
+    operation  TEXT NOT NULL,                  -- 'move'|'seal'|'rewrite_manifest'|'top_level'
+    target     TEXT NOT NULL,                  -- file path / date dir
+    message    TEXT NOT NULL,                  -- last exception message
+    first_seen TEXT NOT NULL,
+    last_seen  TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 1,
+    notified   INTEGER NOT NULL DEFAULT 0,
+    immediate  INTEGER NOT NULL DEFAULT 0
+)
 ```
 
 The `visits` / `*_events` tables are owned by `host.py`; the `snapshots`
-table is owned by the mover and sealer. The mover INSERTs a row
-(`sealed=0`) the first time it places a file in a new daily directory;
-the seal pass and the manual sealer flip `sealed=1`. The seal pass
-queries this table to find work — no filesystem rescan needed.
+and `mover_errors` tables are owned by the mover and sealer. The mover
+INSERTs a `snapshots` row (`sealed=0`) the first time it places a file
+in a new daily directory; the seal pass and the manual sealer flip
+`sealed=1`. The seal pass queries this table to find work — no
+filesystem rescan needed. The `mover_errors` table tracks unresolved
+mover failures so they can be surfaced to the user — see
+[When something goes wrong](#when-something-goes-wrong).
 
 ---
 
@@ -207,9 +222,16 @@ Flags:
 | `--dry-run` | Log intentions but don't write or modify anything |
 | `-v`, `--verbose` | DEBUG log level |
 | `--min-age-seconds N` | Override the file-age threshold (default 60) |
+| `--error-threshold N` | Override the persistent-error notification threshold (default 3) |
 | `--source DIR` | Override `BVL_DOWNLOADS_SNAPSHOTS_DIR` |
 | `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
 | `--db FILE` | Override `BVL_DB_FILE` |
+| `--show-errors` | Print pending mover errors and exit (skips the move/seal pass) |
+| `--clear-errors` | Wipe every row from the `mover_errors` table and exit |
+| `--clear-error N` | Delete the Nth row (1-indexed, matching `--show-errors` order) and exit |
+
+`--show-errors`, `--clear-errors`, and `--clear-error N` are mutually
+exclusive.
 
 **What it does each run:**
 
@@ -318,6 +340,51 @@ python3 point-to-worktree.py
 
 ---
 
+## When something goes wrong
+
+The mover catches `(OSError, sqlite3.Error)` from each per-file move,
+per-directory seal, and per-directory straggler-rewrite, and logs to
+`~/browser-visits-mover.log` (captured by the LaunchAgent's stdout/stderr).
+Transient failures (one bad tick) clear themselves on the next successful
+attempt; the user never sees them.
+
+For everything else, the mover writes a row into the `mover_errors`
+table keyed by `<operation>:<target>` and escalates it to a macOS
+notification once the row qualifies:
+
+- **Persistent failure**: the same `(operation, target)` has failed
+  `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3, configurable
+  via env var or `--error-threshold N`). One notification per streak.
+- **Catastrophic failure**: notified on the first occurrence regardless
+  of attempts. Includes:
+  - Top-level uncaught exception (`operation = 'top_level'`).
+  - `OSError` with errno in `{ENOSPC, EROFS, EDQUOT}` — disk full,
+    read-only filesystem, or quota exceeded.
+  - `sqlite3.DatabaseError` other than `OperationalError` — typically
+    means the DB file is corrupt.
+
+A row stays in the table until the underlying problem is resolved.
+Three paths clear it:
+
+1. **Automatic** — the next successful run of the same operation
+   `_clear_error`s the row. Most users never need to touch the table.
+2. **Manual, all rows** — `python3 native-host/snapshot_mover.py
+   --clear-errors`. Use after acknowledging a batch of stale rows.
+3. **Manual, one row** — `python3 native-host/snapshot_mover.py
+   --clear-error N`, where `N` is the index from `--show-errors`.
+
+To inspect: `python3 native-host/snapshot_mover.py --show-errors`.
+Skips the move/seal pass and prints a numbered list of currently
+pending errors with `attempts`, `first_seen`, `last_seen`, message,
+and whether the user has been notified.
+
+If macOS Notification Center can't be reached (`osascript` missing,
+non-Darwin platform), the mover falls back to creating
+`~/browser-visits-mover-needs-attention` so the user can spot it via
+shell or Finder.
+
+---
+
 ## Configuration
 
 Every script honours these environment variables. CLI flags override
@@ -332,6 +399,7 @@ env vars; env vars override defaults.
 | `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, reset |
 | `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer |
 | `BVL_MOVER_MIN_AGE_SECONDS` | `60` | mover |
+| `BVL_MOVER_ERROR_THRESHOLD` | `3` | mover (consecutive failures before persistent-error notification) |
 
 ---
 

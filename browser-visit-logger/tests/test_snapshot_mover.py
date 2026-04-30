@@ -14,6 +14,8 @@ Run with:
     pytest tests/test_snapshot_mover.py -v
 """
 import datetime
+import errno
+import io
 import logging
 import os
 import sqlite3
@@ -77,6 +79,7 @@ class _MoverTestBase(unittest.TestCase):
         conn = sqlite3.connect(self.db_file)
         host.ensure_db(conn)
         snapshot_mover._ensure_snapshots_table(conn)
+        snapshot_mover._ensure_mover_errors_table(conn)
         conn.close()
 
     # -- helpers --
@@ -884,6 +887,557 @@ class TestSnapshotsTableSchema(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# mover_errors table — schema, helpers, classification, escalation, notify
+# ---------------------------------------------------------------------------
+class TestMoverErrorsSchema(unittest.TestCase):
+
+    def _conn(self):
+        conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_mover_errors_table(conn)
+        return conn
+
+    def _cols(self, conn):
+        return {r[1] for r in conn.execute('PRAGMA table_info(mover_errors)')}
+
+    def test_creates_mover_errors_table(self):
+        conn = self._conn()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        conn.close()
+        self.assertIn('mover_errors', tables)
+
+    def test_has_expected_columns(self):
+        conn = self._conn()
+        expected = {'key', 'operation', 'target', 'message',
+                    'first_seen', 'last_seen', 'attempts',
+                    'notified', 'immediate'}
+        self.assertEqual(self._cols(conn), expected)
+        conn.close()
+
+    def test_key_is_primary_key(self):
+        conn = self._conn()
+        pk = {r[1] for r in conn.execute('PRAGMA table_info(mover_errors)')
+              if r[5] == 1}
+        conn.close()
+        self.assertEqual(pk, {'key'})
+
+    def test_is_idempotent(self):
+        conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_mover_errors_table(conn)
+        snapshot_mover._ensure_mover_errors_table(conn)  # must not raise
+        self.assertIn('key', self._cols(conn))
+        conn.close()
+
+
+class TestErrorRecording(unittest.TestCase):
+    """Direct tests for _record_error / _try_record_error / _clear_error /
+    _is_immediate, all in-memory."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_mover_errors_table(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _row(self, key):
+        return self.conn.execute(
+            "SELECT operation, target, message, attempts, notified, immediate "
+            "FROM mover_errors WHERE key = ?", (key,)
+        ).fetchone()
+
+    # --- _is_immediate ---
+
+    def test_is_immediate_top_level(self):
+        self.assertTrue(snapshot_mover._is_immediate('top_level', RuntimeError('x')))
+
+    def test_is_immediate_disk_full_oserror(self):
+        exc = OSError(errno.ENOSPC, 'No space left on device')
+        self.assertTrue(snapshot_mover._is_immediate('move', exc))
+
+    def test_is_immediate_readonly_filesystem_oserror(self):
+        exc = OSError(errno.EROFS, 'Read-only file system')
+        self.assertTrue(snapshot_mover._is_immediate('move', exc))
+
+    def test_is_immediate_quota_exceeded_oserror(self):
+        exc = OSError(errno.EDQUOT, 'Disk quota exceeded')
+        self.assertTrue(snapshot_mover._is_immediate('move', exc))
+
+    def test_is_immediate_db_integrity_error(self):
+        # IntegrityError is a DatabaseError but NOT an OperationalError.
+        self.assertTrue(snapshot_mover._is_immediate(
+            'move', sqlite3.IntegrityError('corrupt')))
+
+    def test_is_immediate_false_for_transient_oserror(self):
+        exc = OSError(errno.EACCES, 'Permission denied')
+        self.assertFalse(snapshot_mover._is_immediate('move', exc))
+
+    def test_is_immediate_false_for_sqlite_operational_error(self):
+        # OperationalError covers transient locks / busy timeouts.
+        self.assertFalse(snapshot_mover._is_immediate(
+            'move', sqlite3.OperationalError('database is locked')))
+
+    # --- _record_error ---
+
+    def test_record_error_inserts_first_occurrence(self):
+        snapshot_mover._record_error(
+            self.conn, 'move', '/path/file', OSError('boom'))
+        row = self._row('move:/path/file')
+        self.assertEqual(row[0], 'move')
+        self.assertEqual(row[1], '/path/file')
+        self.assertIn('boom', row[2])
+        self.assertEqual(row[3], 1)        # attempts
+        self.assertEqual(row[4], 0)        # notified
+        self.assertEqual(row[5], 0)        # immediate (transient)
+
+    def test_record_error_increments_attempts_on_repeat(self):
+        for _ in range(3):
+            snapshot_mover._record_error(
+                self.conn, 'move', '/p', OSError('boom'))
+        self.assertEqual(self._row('move:/p')[3], 3)
+
+    def test_record_error_updates_message_on_repeat(self):
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('first'))
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('second'))
+        self.assertIn('second', self._row('move:/p')[2])
+
+    def test_record_error_preserves_first_seen_on_repeat(self):
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('a'))
+        first_seen = self.conn.execute(
+            "SELECT first_seen FROM mover_errors WHERE key = ?",
+            ('move:/p',)).fetchone()[0]
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('b'))
+        new_first_seen = self.conn.execute(
+            "SELECT first_seen FROM mover_errors WHERE key = ?",
+            ('move:/p',)).fetchone()[0]
+        self.assertEqual(first_seen, new_first_seen)
+
+    def test_record_error_promotes_immediate_to_one(self):
+        # Persistent first, then catastrophic — immediate should flip 0→1.
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', OSError(errno.EACCES, 'no access'))
+        self.assertEqual(self._row('move:/p')[5], 0)
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', OSError(errno.ENOSPC, 'disk full'))
+        self.assertEqual(self._row('move:/p')[5], 1)
+
+    def test_record_error_does_not_demote_immediate(self):
+        # Catastrophic first, then transient — immediate must stay 1.
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', OSError(errno.ENOSPC, 'disk full'))
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', OSError(errno.EACCES, 'no access'))
+        self.assertEqual(self._row('move:/p')[5], 1)
+
+    def test_record_error_sanitises_message(self):
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', RuntimeError('a\tb\nc\rd'))
+        message = self._row('move:/p')[2]
+        self.assertNotIn('\t', message)
+        self.assertNotIn('\n', message)
+        self.assertNotIn('\r', message)
+
+    def test_record_error_truncates_long_messages(self):
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', RuntimeError('x' * 5000))
+        self.assertLessEqual(len(self._row('move:/p')[2]), 500)
+
+    # --- _try_record_error ---
+
+    def test_try_record_error_swallows_db_failures(self):
+        bad_conn = sqlite3.connect(':memory:')   # no mover_errors table
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._try_record_error(
+                bad_conn, 'move', '/p', RuntimeError('orig'))
+        bad_conn.close()
+        self.assertTrue(any('Could not record' in m for m in cm.output))
+
+    # --- _clear_error / _try_clear_error ---
+
+    def test_clear_error_removes_matching_row(self):
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        snapshot_mover._record_error(self.conn, 'seal', '/d', OSError('bork'))
+        snapshot_mover._clear_error(self.conn, 'move', '/p')
+        self.assertIsNone(self._row('move:/p'))
+        self.assertIsNotNone(self._row('seal:/d'))
+
+    def test_clear_error_is_noop_when_no_matching_row(self):
+        snapshot_mover._clear_error(self.conn, 'move', '/missing')   # must not raise
+        self.assertIsNone(self._row('move:/missing'))
+
+    def test_try_clear_error_swallows_db_failures(self):
+        bad_conn = sqlite3.connect(':memory:')
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._try_clear_error(bad_conn, 'move', '/p')
+        bad_conn.close()
+        self.assertTrue(any('Could not clear' in m for m in cm.output))
+
+
+class TestEscalation(unittest.TestCase):
+    """Tests for _escalate_errors — when does it notify, when doesn't it?"""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_mover_errors_table(self.conn)
+        # Pin threshold so tests don't depend on env var.
+        self._saved_threshold = snapshot_mover.MOVER_ERROR_THRESHOLD
+        snapshot_mover.MOVER_ERROR_THRESHOLD = 3
+
+    def tearDown(self):
+        snapshot_mover.MOVER_ERROR_THRESHOLD = self._saved_threshold
+        self.conn.close()
+
+    def _notified(self, key):
+        return self.conn.execute(
+            "SELECT notified FROM mover_errors WHERE key = ?", (key,)
+        ).fetchone()[0]
+
+    def test_persistent_below_threshold_does_not_notify(self):
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_not_called()
+        self.assertEqual(self._notified('move:/p'), 0)
+
+    def test_persistent_at_threshold_notifies_and_marks(self):
+        for _ in range(3):
+            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_called_once()
+        title, body = mock_notify.call_args[0]
+        self.assertIn('mover error', title)
+        self.assertIn('move', body)
+        self.assertIn('/p', body)
+        self.assertEqual(self._notified('move:/p'), 1)
+
+    def test_immediate_notifies_on_first_occurrence(self):
+        snapshot_mover._record_error(
+            self.conn, 'move', '/p', OSError(errno.ENOSPC, 'disk full'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_called_once()
+        self.assertEqual(self._notified('move:/p'), 1)
+
+    def test_top_level_notifies_on_first_occurrence(self):
+        snapshot_mover._record_error(
+            self.conn, 'top_level', '', RuntimeError('crash'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_called_once()
+        title, body = mock_notify.call_args[0]
+        self.assertIn('crashed', body)
+        self.assertEqual(self._notified('top_level:'), 1)
+
+    def test_already_notified_rows_are_skipped(self):
+        for _ in range(3):
+            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        # First escalation marks notified=1.
+        with patch.object(snapshot_mover, '_notify_user'):
+            snapshot_mover._escalate_errors(self.conn)
+        # Subsequent failures keep accruing attempts.
+        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        # Second escalation must not fire.
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_not_called()
+
+    def test_escalate_db_query_failure_logs_and_returns(self):
+        bad_conn = sqlite3.connect(':memory:')   # no mover_errors table
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._escalate_errors(bad_conn)
+        bad_conn.close()
+        self.assertTrue(any('Could not query mover_errors' in m for m in cm.output))
+
+    def test_escalate_update_failure_logs_but_continues(self):
+        for _ in range(3):
+            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+
+        # Wrap the connection so the UPDATE for `notified=1` raises but
+        # everything else (including the SELECT) passes through.
+        # sqlite3.Connection.execute is a C method and can't be patched
+        # directly, so a thin proxy is the cleanest workaround.
+        real_conn = self.conn
+
+        class _FailingOnUpdateConn:
+            def execute(self, sql, *args, **kwargs):
+                if sql.lstrip().upper().startswith('UPDATE MOVER_ERRORS'):
+                    raise sqlite3.OperationalError('fake update failure')
+                return real_conn.execute(sql, *args, **kwargs)
+
+            def commit(self):
+                return real_conn.commit()
+
+        with patch.object(snapshot_mover, '_notify_user'), \
+             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._escalate_errors(_FailingOnUpdateConn())
+        self.assertTrue(any('Could not mark' in m for m in cm.output))
+
+
+class TestNotifyUser(unittest.TestCase):
+    """_notify_user is a thin shell around osascript / a marker file."""
+
+    def setUp(self):
+        # Redirect the attention-file path to a temp location so we don't
+        # touch the real $HOME.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._saved = snapshot_mover._ATTENTION_FILE
+        snapshot_mover._ATTENTION_FILE = os.path.join(
+            self.tmp.name, 'mover-needs-attention')
+
+    def tearDown(self):
+        snapshot_mover._ATTENTION_FILE = self._saved
+
+    def test_macos_invokes_osascript(self):
+        with patch.object(snapshot_mover.sys, 'platform', 'darwin'), \
+             patch.object(snapshot_mover.subprocess, 'run') as mock_run:
+            snapshot_mover._notify_user('Title', 'Body')
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        self.assertEqual(args[0], 'osascript')
+        # AppleScript should embed both title and body.
+        joined = ' '.join(args)
+        self.assertIn('Title', joined)
+        self.assertIn('Body', joined)
+
+    def test_macos_subprocess_failure_falls_back_to_marker_file(self):
+        with patch.object(snapshot_mover.sys, 'platform', 'darwin'), \
+             patch.object(snapshot_mover.subprocess, 'run',
+                          side_effect=FileNotFoundError('osascript missing')), \
+             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._notify_user('T', 'B')
+        self.assertTrue(any('osascript' in m for m in cm.output))
+        self.assertTrue(os.path.exists(snapshot_mover._ATTENTION_FILE))
+        contents = Path(snapshot_mover._ATTENTION_FILE).read_text()
+        self.assertIn('T', contents)
+        self.assertIn('B', contents)
+
+    def test_non_macos_writes_marker_file(self):
+        with patch.object(snapshot_mover.sys, 'platform', 'linux'):
+            snapshot_mover._notify_user('T', 'B')
+        self.assertTrue(os.path.exists(snapshot_mover._ATTENTION_FILE))
+
+    def test_non_macos_marker_file_failure_is_swallowed(self):
+        # Point the marker path at an unwritable location.
+        snapshot_mover._ATTENTION_FILE = os.path.join(
+            self.tmp.name, 'no', 'such', 'dir', 'marker')
+        with patch.object(snapshot_mover.sys, 'platform', 'linux'), \
+             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover._notify_user('T', 'B')   # must not raise
+        self.assertTrue(any('attention file' in m for m in cm.output))
+
+    def test_applescript_quote_escapes_quotes_and_backslashes(self):
+        self.assertEqual(
+            snapshot_mover._applescript_quote('hello "world"'),
+            '"hello \\"world\\""',
+        )
+        self.assertEqual(
+            snapshot_mover._applescript_quote(r'a\b'),
+            '"a\\\\b"',
+        )
+
+
+class TestErrorWiring(_MoverTestBase):
+    """End-to-end: per-op exceptions create rows; subsequent successes clear them."""
+
+    def test_move_failure_records_error_row(self):
+        # Inject an OSError into shutil.copy2 so the move pass fails.
+        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
+                         'a.mhtml', age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        with patch('shutil.copy2', side_effect=OSError(errno.EACCES, 'denied')):
+            conn = sqlite3.connect(self.db_file)
+            try:
+                snapshot_mover._move_pass(conn)
+            finally:
+                conn.close()
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation, attempts, immediate FROM mover_errors"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 'move')
+        self.assertEqual(rows[0][1], 1)
+        self.assertEqual(rows[0][2], 0)   # EACCES is not immediate
+
+    def test_repeated_move_failure_increments_attempts(self):
+        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
+                         'a.mhtml', age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        for _ in range(3):
+            with patch('shutil.copy2',
+                        side_effect=OSError(errno.EACCES, 'denied')):
+                conn = sqlite3.connect(self.db_file)
+                try:
+                    snapshot_mover._move_pass(conn)
+                finally:
+                    conn.close()
+        conn = sqlite3.connect(self.db_file)
+        attempts = conn.execute(
+            "SELECT attempts FROM mover_errors").fetchone()[0]
+        conn.close()
+        self.assertEqual(attempts, 3)
+
+    def test_disk_full_during_move_records_immediate_error(self):
+        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
+                         'a.mhtml', age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        with patch('shutil.copy2',
+                    side_effect=OSError(errno.ENOSPC, 'disk full')):
+            conn = sqlite3.connect(self.db_file)
+            try:
+                snapshot_mover._move_pass(conn)
+            finally:
+                conn.close()
+        conn = sqlite3.connect(self.db_file)
+        immediate = conn.execute(
+            "SELECT immediate FROM mover_errors").fetchone()[0]
+        conn.close()
+        self.assertEqual(immediate, 1)
+
+    def test_successful_move_clears_prior_error_row(self):
+        # Pre-seed an error row, then run a successful move.
+        conn = sqlite3.connect(self.db_file)
+        prefixed = _snap('2024-01-15T10:00:00.000Z', 'a.mhtml')
+        source_path = os.path.join(self.source_dir, prefixed)
+        snapshot_mover._record_error(
+            conn, 'move', source_path, OSError('boom'))
+        conn.close()
+        # Now the same move succeeds.
+        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
+                         'a.mhtml', age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+        finally:
+            conn.close()
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'move'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    def test_seal_failure_records_error_row(self):
+        # Pre-seed an unsealed past-date row + dir, then inject a manifest
+        # write failure.  Because the seal pass calls main(), patch
+        # _today_utc so the row qualifies.
+        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
+        os.makedirs(date_subdir)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
+                     ('2024-01-15',))
+        conn.commit()
+        conn.close()
+        with patch.object(snapshot_mover, '_today_utc',
+                          return_value=datetime.date(2024, 1, 20)), \
+             patch.object(snapshot_mover, '_write_manifest_file',
+                          side_effect=OSError('disk full while sealing')):
+            snapshot_mover.main()
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation, target FROM mover_errors").fetchall()
+        conn.close()
+        self.assertTrue(any(op == 'seal' and target == date_subdir
+                            for op, target in rows))
+
+    def test_successful_seal_clears_prior_error_row(self):
+        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
+        os.makedirs(date_subdir)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
+                     ('2024-01-15',))
+        snapshot_mover._record_error(
+            conn, 'seal', date_subdir, OSError('previous failure'))
+        conn.commit()
+        conn.close()
+        with patch.object(snapshot_mover, '_today_utc',
+                          return_value=datetime.date(2024, 1, 20)):
+            snapshot_mover.main()
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'seal'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    def test_straggler_rewrite_failure_records_error_row(self):
+        date_str = '2024-01-15'
+        date_subdir = os.path.join(self.dest_dir, date_str)
+        os.makedirs(date_subdir)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
+                     (date_str,))
+        conn.commit()
+        conn.close()
+        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
+                         'a.mhtml', age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        with patch.object(snapshot_mover, '_write_manifest_file',
+                          side_effect=OSError('disk full')):
+            conn = sqlite3.connect(self.db_file)
+            try:
+                snapshot_mover._move_pass(conn)
+            finally:
+                conn.close()
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation, target FROM mover_errors").fetchall()
+        conn.close()
+        self.assertTrue(any(op == 'rewrite_manifest' and target == date_subdir
+                            for op, target in rows))
+
+    def test_top_level_failure_records_and_notifies_then_reraises(self):
+        with patch.object(snapshot_mover, '_move_pass',
+                          side_effect=RuntimeError('unexpected explosion')), \
+             patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            with self.assertRaises(RuntimeError):
+                snapshot_mover.main()
+        mock_notify.assert_called_once()
+        conn = sqlite3.connect(self.db_file)
+        row = conn.execute(
+            "SELECT operation, target, immediate, notified "
+            "FROM mover_errors WHERE operation = 'top_level'"
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 'top_level')
+        self.assertEqual(row[1], '')
+        self.assertEqual(row[2], 1)   # immediate
+        self.assertEqual(row[3], 1)   # notified
+
+    def test_top_level_db_fallback_uses_direct_notification(self):
+        # If the DB-recording path itself fails, _notify_user is still
+        # invoked directly with a generic crash message.
+        original_connect = sqlite3.connect
+
+        def _failing_connect(path, *args, **kwargs):
+            # Allow setUp's connection to succeed; fail any *new* one made
+            # inside main().
+            raise sqlite3.OperationalError('cannot open database')
+
+        # Allow os.makedirs to succeed.  Wrap `os.path.exists` so that the
+        # DB path appears to exist (forcing main() to reach the connect).
+        with patch.object(snapshot_mover, 'sqlite3') as mock_sqlite, \
+             patch.object(snapshot_mover.os.path, 'exists', return_value=True), \
+             patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            mock_sqlite.connect.side_effect = sqlite3.OperationalError('boom')
+            mock_sqlite.Error = sqlite3.Error
+            mock_sqlite.OperationalError = sqlite3.OperationalError
+            mock_sqlite.DatabaseError = sqlite3.DatabaseError
+            with self.assertRaises(sqlite3.OperationalError):
+                snapshot_mover.main()
+        mock_notify.assert_called_once()
+        title, body = mock_notify.call_args[0]
+        self.assertIn('crashed', title.lower())
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 class TestCli(unittest.TestCase):
@@ -893,7 +1447,7 @@ class TestCli(unittest.TestCase):
         self._saved = {
             name: getattr(snapshot_mover, name)
             for name in ('DOWNLOADS_SNAPSHOTS_DIR', 'ICLOUD_SNAPSHOTS_DIR',
-                         'DB_FILE', 'MIN_AGE_SECONDS')
+                         'DB_FILE', 'MIN_AGE_SECONDS', 'MOVER_ERROR_THRESHOLD')
         }
         self._saved_level = snapshot_mover.logger.level
 
@@ -915,6 +1469,7 @@ class TestCli(unittest.TestCase):
         ns = snapshot_mover._parse_args([
             '--dry-run', '--verbose',
             '--min-age-seconds', '120',
+            '--error-threshold', '5',
             '--source', '/tmp/src',
             '--dest', '/tmp/dst',
             '--db', '/tmp/test.db',
@@ -922,6 +1477,7 @@ class TestCli(unittest.TestCase):
         self.assertTrue(ns.dry_run)
         self.assertTrue(ns.verbose)
         self.assertEqual(ns.min_age_seconds, 120)
+        self.assertEqual(ns.error_threshold, 5)
         self.assertEqual(ns.source, '/tmp/src')
         self.assertEqual(ns.dest, '/tmp/dst')
         self.assertEqual(ns.db, '/tmp/test.db')
@@ -932,12 +1488,14 @@ class TestCli(unittest.TestCase):
             '--dest', '/tmp/dst',
             '--db', '/tmp/test.db',
             '--min-age-seconds', '5',
+            '--error-threshold', '7',
         ])
         snapshot_mover._apply_args(ns)
         self.assertEqual(snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR, '/tmp/src')
         self.assertEqual(snapshot_mover.ICLOUD_SNAPSHOTS_DIR,    '/tmp/dst')
         self.assertEqual(snapshot_mover.DB_FILE,                 '/tmp/test.db')
         self.assertEqual(snapshot_mover.MIN_AGE_SECONDS,         5)
+        self.assertEqual(snapshot_mover.MOVER_ERROR_THRESHOLD,   7)
 
     def test_apply_args_verbose_sets_debug_log_level(self):
         ns = snapshot_mover._parse_args(['--verbose'])
@@ -989,6 +1547,175 @@ class TestCli(unittest.TestCase):
 
             self.assertTrue(os.path.exists(file_path))
             self.assertEqual(os.listdir(dest_dir), [])
+
+
+# ---------------------------------------------------------------------------
+# Error-table CLI flags: --show-errors, --clear-errors, --clear-error N
+# ---------------------------------------------------------------------------
+class TestErrorCli(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_file = os.path.join(self.tmp.name, 'visits.db')
+        # Save and restore DB_FILE since CLI calls mutate it.
+        self._saved_db = snapshot_mover.DB_FILE
+        self.addCleanup(lambda: setattr(snapshot_mover, 'DB_FILE', self._saved_db))
+
+    def _seed_errors(self, *triples):
+        """Insert (op, target, exc) triples in order, using _record_error."""
+        snapshot_mover.DB_FILE = self.db_file
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._ensure_mover_errors_table(conn)
+        for op, target, exc in triples:
+            snapshot_mover._record_error(conn, op, target, exc)
+        conn.close()
+
+    # --- mutual exclusivity ---
+
+    def test_show_and_clear_errors_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            snapshot_mover._parse_args(['--show-errors', '--clear-errors'])
+
+    def test_show_errors_and_clear_error_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            snapshot_mover._parse_args(['--show-errors', '--clear-error', '1'])
+
+    # --- --show-errors ---
+
+    def test_show_errors_with_empty_table_prints_no_errors_message(self):
+        snapshot_mover.DB_FILE = self.db_file
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_mover.cli(['--db', self.db_file, '--show-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('No pending mover errors', captured.getvalue())
+
+    def test_show_errors_lists_rows_with_index_and_metadata(self):
+        self._seed_errors(
+            ('move', '/path/file', OSError('boom')),
+            ('seal', '/dir/2024-01-15', OSError('bork')),
+        )
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_mover.cli(['--db', self.db_file, '--show-errors'])
+        out = captured.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn('Pending mover errors (2)', out)
+        self.assertIn('[1]', out)
+        self.assertIn('[2]', out)
+        self.assertIn('move:', out)
+        self.assertIn('seal:', out)
+        self.assertIn('/path/file', out)
+        self.assertIn('/dir/2024-01-15', out)
+
+    def test_show_errors_skips_move_and_seal_pass(self):
+        # Even with sources present that would normally be moved, --show-errors
+        # must not run the move pass.  Use a temp Downloads dir with one file
+        # and a non-existent dest to make any move attempt visible.
+        snapshot_mover.DB_FILE = self.db_file
+        src = os.path.join(self.tmp.name, 'downloads')
+        os.makedirs(src)
+        Path(src, '2024-01-15T10-00-00Z-x.mhtml').write_bytes(b'data')
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_mover.cli([
+                '--db', self.db_file,
+                '--source', src,
+                '--dest', os.path.join(self.tmp.name, 'icloud'),
+                '--show-errors',
+            ])
+        # Source still there — no move pass ran.
+        self.assertTrue(os.path.exists(
+            os.path.join(src, '2024-01-15T10-00-00Z-x.mhtml')))
+
+    # --- --clear-errors ---
+
+    def test_clear_errors_with_empty_table_reports_zero(self):
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_mover.cli(['--db', self.db_file, '--clear-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared 0 error', captured.getvalue())
+
+    def test_clear_errors_removes_all_rows(self):
+        self._seed_errors(
+            ('move', '/a', OSError('x')),
+            ('move', '/b', OSError('y')),
+            ('seal', '/d', OSError('z')),
+        )
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_mover.cli(['--db', self.db_file, '--clear-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared 3 error', captured.getvalue())
+        # Table is empty.
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute("SELECT COUNT(*) FROM mover_errors").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    def test_clear_errors_singular_phrasing_when_one_row(self):
+        self._seed_errors(('move', '/only', OSError('x')))
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_mover.cli(['--db', self.db_file, '--clear-errors'])
+        self.assertIn('Cleared 1 error row.', captured.getvalue())
+
+    # --- --clear-error N ---
+
+    def test_clear_error_n_deletes_only_that_row(self):
+        self._seed_errors(
+            ('move', '/a', OSError('x')),
+            ('move', '/b', OSError('y')),
+        )
+        # Order is (first_seen ASC, key ASC); both inserted with the same
+        # second-precision timestamp, so they tie on first_seen and the
+        # secondary 'key' sort decides: 'move:/a' < 'move:/b'.
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_mover.cli([
+                '--db', self.db_file, '--clear-error', '1'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared error [1]', captured.getvalue())
+        self.assertIn('/a', captured.getvalue())
+        # Only /b remains.
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT target FROM mover_errors").fetchall()
+        conn.close()
+        self.assertEqual([r[0] for r in rows], ['/b'])
+
+    def test_clear_error_out_of_range_returns_nonzero(self):
+        self._seed_errors(('move', '/only', OSError('x')))
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_mover.cli([
+                '--db', self.db_file, '--clear-error', '99'])
+        self.assertEqual(rc, 1)
+        self.assertIn('No error at index 99', captured_err.getvalue())
+        # The lone row is untouched.
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute("SELECT COUNT(*) FROM mover_errors").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    def test_clear_error_zero_index_returns_nonzero(self):
+        self._seed_errors(('move', '/only', OSError('x')))
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_mover.cli([
+                '--db', self.db_file, '--clear-error', '0'])
+        self.assertEqual(rc, 1)
+        self.assertIn('No error at index 0', captured_err.getvalue())
+
+    def test_clear_error_with_empty_table_returns_nonzero(self):
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_mover.cli([
+                '--db', self.db_file, '--clear-error', '1'])
+        self.assertEqual(rc, 1)
+        self.assertIn('No pending mover errors', captured_err.getvalue())
 
 
 if __name__ == '__main__':  # pragma: no cover

@@ -101,11 +101,13 @@ CLI flags override env vars, which override defaults.
 
 import argparse
 import datetime
+import errno
 import logging
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 
@@ -120,6 +122,20 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     os.path.join(HOME, 'Documents', 'browser-visit-logger', 'snapshots'),
 )
 MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '60'))
+
+# Number of consecutive same-(op, target) failures before a "persistent"
+# error escalates to a user notification.  Catastrophic categories ignore
+# this and notify on the first occurrence.
+MOVER_ERROR_THRESHOLD = int(os.environ.get('BVL_MOVER_ERROR_THRESHOLD', '3'))
+
+# Marker file written when we can't pop a macOS notification (non-macOS,
+# headless run, osascript unavailable).  The user can spot it with `ls ~`.
+_ATTENTION_FILE = os.path.join(HOME, 'browser-visits-mover-needs-attention')
+
+# OSError errno values that warrant an immediate notification regardless of
+# operation.  These are signs the underlying disk / filesystem is in a state
+# the mover can't recover from on its own.
+_IMMEDIATE_OSERROR_ERRNOS = frozenset({errno.ENOSPC, errno.EROFS, errno.EDQUOT})
 
 EVENTS_TABLES = ('read_events', 'skimmed_events')
 
@@ -159,6 +175,196 @@ def _ensure_snapshots_table(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Schema for the `mover_errors` table — tracks unresolved mover failures
+# so the user can be notified about persistent / catastrophic ones.
+#
+# One row per (operation, target) that is currently broken.  The mover
+# upserts on each failure (incrementing `attempts`) and deletes on the
+# first subsequent success.  `_escalate_errors` notifies the user when
+# a row crosses the threshold (or immediately, for catastrophic ones)
+# and flips `notified=1` so we don't re-notify every tick.
+# ---------------------------------------------------------------------------
+
+def _ensure_mover_errors_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mover_errors (
+            key        TEXT PRIMARY KEY,           -- '<op>:<target>'
+            operation  TEXT NOT NULL,              -- 'move'|'seal'|'rewrite_manifest'|'top_level'
+            target     TEXT NOT NULL,              -- file path / date dir / '' for top-level
+            message    TEXT NOT NULL,              -- str(exc), sanitised
+            first_seen TEXT NOT NULL,              -- ISO timestamp (UTC)
+            last_seen  TEXT NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 1,
+            notified   INTEGER NOT NULL DEFAULT 0,
+            immediate  INTEGER NOT NULL DEFAULT 0  -- 1 = notify on first sight, 0 = wait for threshold
+        )
+    """)
+    conn.commit()
+
+
+def _now_iso() -> str:
+    """Current UTC time as an ISO 8601 string.  Indirected for test mocking."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat()
+
+
+def _record_error(conn, op, target, exc):
+    """UPSERT a mover_errors row for this failure.
+
+    On insert: attempts=1, first_seen=last_seen=now, notified=0.
+    On update: attempts incremented, last_seen and message refreshed,
+    first_seen and notified preserved (so a single notification per
+    streak of failures).
+
+    Propagates sqlite3.Error if the DB is broken; callers in per-op
+    except blocks should wrap with _try_record_error.
+    """
+    key = f'{op}:{target}'
+    now = _now_iso()
+    message = _tsv_sanitise(str(exc))[:500]
+    immediate = 1 if _is_immediate(op, exc) else 0
+    # On conflict: bump attempts, refresh last_seen + message, and only
+    # *promote* immediate (0 → 1) — never demote an already-immediate row.
+    conn.execute(
+        "INSERT INTO mover_errors "
+        "  (key, operation, target, message, first_seen, last_seen, "
+        "   attempts, immediate) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, ?) "
+        "ON CONFLICT(key) DO UPDATE SET "
+        "  attempts = attempts + 1, "
+        "  last_seen = excluded.last_seen, "
+        "  message = excluded.message, "
+        "  immediate = MAX(immediate, excluded.immediate)",
+        (key, op, target, message, now, now, immediate),
+    )
+    conn.commit()
+
+
+def _try_record_error(conn, op, target, exc):
+    """Best-effort wrapper around _record_error for use inside per-op except
+    blocks: log on failure, never raise (the caller has its own work to do)."""
+    try:
+        _record_error(conn, op, target, exc)
+    except sqlite3.Error as inner:
+        logger.error(
+            'Could not record %s error for %s: %s (original: %s)',
+            op, target or '<top_level>', inner, exc,
+        )
+
+
+def _clear_error(conn, op, target):
+    """DELETE the mover_errors row matching (op, target).
+
+    Idempotent: a no-op if no row exists.  Safe to call after every
+    successful operation without checking first.  Propagates sqlite3.Error.
+    """
+    conn.execute(
+        "DELETE FROM mover_errors WHERE key = ?", (f'{op}:{target}',))
+    conn.commit()
+
+
+def _try_clear_error(conn, op, target):
+    """Best-effort wrapper around _clear_error: log on failure, never raise."""
+    try:
+        _clear_error(conn, op, target)
+    except sqlite3.Error as inner:
+        logger.error(
+            'Could not clear %s error for %s: %s', op, target, inner)
+
+
+def _is_immediate(op, exc):
+    """Return True iff this error should trigger a user notification on the
+    first occurrence (rather than after MOVER_ERROR_THRESHOLD attempts)."""
+    if op == 'top_level':
+        return True
+    if isinstance(exc, OSError) and exc.errno in _IMMEDIATE_OSERROR_ERRNOS:
+        return True
+    # sqlite3.DatabaseError minus its OperationalError subclass (which
+    # covers transient locks / busy timeouts) — what's left is integrity
+    # / corruption: not safe to keep retrying without user action.
+    if (isinstance(exc, sqlite3.DatabaseError)
+            and not isinstance(exc, sqlite3.OperationalError)):
+        return True
+    return False
+
+
+def _escalate_errors(conn):
+    """Walk currently-unresolved error rows and notify the user about ones
+    that warrant it.  Best-effort — logs and returns on any failure.
+
+    A row is escalated when notified=0 AND (immediate=1 OR attempts >=
+    MOVER_ERROR_THRESHOLD).  After notifying, notified is flipped to 1 so
+    the same row isn't surfaced repeatedly — even if it keeps failing.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT key, operation, target, message, attempts, "
+            "       first_seen, immediate "
+            "FROM mover_errors "
+            "WHERE notified = 0 AND (immediate = 1 OR attempts >= ?) "
+            "ORDER BY first_seen ASC, key ASC",
+            (MOVER_ERROR_THRESHOLD,),
+        ).fetchall()
+    except sqlite3.Error as inner:
+        logger.error('Could not query mover_errors during escalation: %s', inner)
+        return
+
+    for key, op, target, message, attempts, first_seen, _immediate in rows:
+        title = 'Browser Visit Logger: mover error'
+        if op == 'top_level':
+            body = f'Mover crashed: {message}'
+        else:
+            body = (f'{op} failed {attempts}× since {first_seen}: '
+                    f'{target or "(no target)"} — {message}')
+        _notify_user(title, body)
+        try:
+            conn.execute(
+                "UPDATE mover_errors SET notified = 1 WHERE key = ?", (key,))
+            conn.commit()
+        except sqlite3.Error as inner:
+            logger.error(
+                'Could not mark %s error notified: %s', op, inner)
+
+
+def _notify_user(title, message):
+    """Surface an unresolvable mover error to the user.
+
+    macOS: pop a Notification Center banner via osascript.
+    Other / headless / osascript missing: touch a marker file at
+    ~/browser-visits-mover-needs-attention so the user can spot it.
+
+    Best-effort: catches everything, never propagates.
+    """
+    body = message[:240]   # macOS notifications truncate around 256 chars
+    if sys.platform == 'darwin':
+        try:
+            script = (
+                f'display notification {_applescript_quote(body)} '
+                f'with title {_applescript_quote(title)}'
+            )
+            subprocess.run(
+                ['osascript', '-e', script],
+                check=False, timeout=5,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception as exc:    # noqa: BLE001 — truly best-effort
+            logger.error('osascript notification failed: %s', exc)
+    # Fallback: touch the attention file.
+    try:
+        with open(_ATTENTION_FILE, 'a', encoding='utf-8') as f:
+            f.write(f'{_now_iso()}\t{title}\t{body}\n')
+    except OSError as exc:
+        logger.error('Could not write attention file %s: %s',
+                     _ATTENTION_FILE, exc)
+
+
+def _applescript_quote(s):
+    """Escape a string for safe interpolation into AppleScript."""
+    return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -251,12 +457,15 @@ def _move_one(
         # (g) Remove the original.
         os.unlink(source)
         logger.info('Moved %s -> %s (read-only)', source, dest)
-        # (h) If this was a straggler, rebuild the manifest so it includes
+        # (h) Move succeeded — clear any prior 'move' error for this source.
+        _try_clear_error(conn, 'move', source)
+        # (i) If this was a straggler, rebuild the manifest so it includes
         #     the just-moved file.  Sealed flag stays 1.
         if is_straggler:
             _rewrite_manifest_for_straggler(conn, date_subdir)
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to move %s: %s', source, exc)
+        _try_record_error(conn, 'move', source, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -348,8 +557,11 @@ def _seal_directory(
                 (date_key,),
             )
             conn.commit()
+        # Seal succeeded — clear any prior 'seal' error for this directory.
+        _try_clear_error(conn, 'seal', date_subdir)
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to seal %s: %s', date_subdir, exc)
+        _try_record_error(conn, 'seal', date_subdir, exc)
 
 
 def _write_manifest_file(
@@ -395,11 +607,13 @@ def _rewrite_manifest_for_straggler(
             'Rewrote %s after straggler arrival (%d entries)',
             manifest_path, count,
         )
+        _try_clear_error(conn, 'rewrite_manifest', date_subdir)
     except (OSError, sqlite3.Error) as exc:
         logger.error(
             'Failed to rewrite %s after straggler arrival: %s',
             manifest_path, exc,
         )
+        _try_record_error(conn, 'rewrite_manifest', date_subdir, exc)
 
 
 def _build_manifest_rows(
@@ -460,20 +674,47 @@ def _lookup_event(
 # ---------------------------------------------------------------------------
 
 def main(dry_run: bool = False) -> None:
-    """Run a single mover pass against the current module-level constants."""
-    os.makedirs(ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+    """Run a single mover pass against the current module-level constants.
 
-    if not os.path.exists(DB_FILE):
-        logger.info('No DB at %s; nothing to do', DB_FILE)
-        return
-
-    conn = sqlite3.connect(DB_FILE)
+    Wraps the body in a top-level catch so that any unexpected exception is
+    recorded as an `op='top_level'` row (immediate-category, so the user is
+    notified on the first occurrence) and surfaced via _escalate_errors,
+    *then* re-raised so launchd captures the traceback in the log.
+    """
+    conn = None
     try:
+        os.makedirs(ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        if not os.path.exists(DB_FILE):
+            logger.info('No DB at %s; nothing to do', DB_FILE)
+            return
+        conn = sqlite3.connect(DB_FILE)
         _ensure_snapshots_table(conn)
+        _ensure_mover_errors_table(conn)
         _move_pass(conn, dry_run=dry_run)
         _seal_pass(conn, dry_run=dry_run)
+        _escalate_errors(conn)
+    except Exception as exc:
+        # Top-level: best-effort record + escalate, then fall back to a
+        # direct notification if the DB path is broken, then re-raise.
+        try:
+            if conn is None:
+                conn = sqlite3.connect(DB_FILE)
+            _ensure_mover_errors_table(conn)
+            _record_error(conn, 'top_level', '', exc)
+            _escalate_errors(conn)
+        except Exception as inner:                  # noqa: BLE001
+            logger.error(
+                'Could not record top-level failure to DB (%s); '
+                'falling back to direct notification', inner,
+            )
+            _notify_user(
+                'Browser Visit Logger: mover crashed',
+                f'Top-level failure: {exc}',
+            )
+        raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +734,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument('--min-age-seconds', type=int, metavar='N',
                    help=f'override the file-age threshold '
                         f'(default {MIN_AGE_SECONDS}s)')
+    p.add_argument('--error-threshold', type=int, metavar='N',
+                   help=f'override the persistent-error notification threshold '
+                        f'(default {MOVER_ERROR_THRESHOLD})')
     p.add_argument('--source', metavar='DIR',
                    help=f'override the source (Downloads) directory '
                         f'(default {DOWNLOADS_SNAPSHOTS_DIR})')
@@ -502,12 +746,23 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument('--db', metavar='FILE',
                    help=f'override the SQLite database path '
                         f'(default {DB_FILE})')
+    # Error-table inspection / acknowledgement.  Mutually exclusive with
+    # each other; specifying any of them skips the move/seal pass.
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--show-errors', action='store_true',
+                   help='print the pending mover_errors table rows and exit')
+    g.add_argument('--clear-errors', action='store_true',
+                   help='delete every row from mover_errors and exit')
+    g.add_argument('--clear-error', type=int, metavar='N',
+                   help='delete the Nth row (1-indexed, matching '
+                        '--show-errors order) from mover_errors and exit')
     return p.parse_args(argv)
 
 
 def _apply_args(args: argparse.Namespace) -> None:
     """Apply parsed CLI args to module-level constants and the logger."""
-    global DOWNLOADS_SNAPSHOTS_DIR, ICLOUD_SNAPSHOTS_DIR, DB_FILE, MIN_AGE_SECONDS
+    global DOWNLOADS_SNAPSHOTS_DIR, ICLOUD_SNAPSHOTS_DIR, DB_FILE
+    global MIN_AGE_SECONDS, MOVER_ERROR_THRESHOLD
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     if args.source is not None:
@@ -518,14 +773,102 @@ def _apply_args(args: argparse.Namespace) -> None:
         DB_FILE = args.db
     if args.min_age_seconds is not None:
         MIN_AGE_SECONDS = args.min_age_seconds
+    if args.error_threshold is not None:
+        MOVER_ERROR_THRESHOLD = args.error_threshold
 
 
-def cli(argv=None) -> None:
-    """Parse argv, apply overrides, run one mover pass."""
+def cli(argv=None) -> int:
+    """Parse argv, apply overrides, run one mover pass (or one error CLI op).
+
+    Returns the process exit code (0 on success, non-zero on user-visible
+    error CLI failures such as out-of-range --clear-error).
+    """
     args = _parse_args(argv)
     _apply_args(args)
+    if args.show_errors:
+        return _cli_show_errors()
+    if args.clear_errors:
+        return _cli_clear_errors()
+    if args.clear_error is not None:
+        return _cli_clear_error(args.clear_error)
     main(dry_run=args.dry_run)
+    return 0
+
+
+def _open_errors_conn():
+    """Open the DB and ensure the mover_errors table exists.  The error CLI
+    flags create the DB if missing — handy for users who haven't yet
+    triggered any mover activity."""
+    conn = sqlite3.connect(DB_FILE)
+    _ensure_mover_errors_table(conn)
+    return conn
+
+
+def _fetch_pending_errors(conn):
+    """SELECT all rows ordered for stable indexing."""
+    return conn.execute(
+        "SELECT key, operation, target, message, attempts, "
+        "       first_seen, last_seen, notified "
+        "FROM mover_errors "
+        "ORDER BY first_seen ASC, key ASC"
+    ).fetchall()
+
+
+def _cli_show_errors() -> int:
+    conn = _open_errors_conn()
+    try:
+        rows = _fetch_pending_errors(conn)
+    finally:
+        conn.close()
+    if not rows:
+        print('No pending mover errors.')
+        return 0
+    print(f'Pending mover errors ({len(rows)}):')
+    print()
+    for i, (_key, op, target, message, attempts, first_seen,
+            last_seen, notified) in enumerate(rows, start=1):
+        target_repr = target or '(no target)'
+        print(f'  [{i}] {op}: {target_repr}')
+        print(f'      attempts: {attempts} '
+              f'(since {first_seen}, last {last_seen})')
+        print(f'      error:    {message}')
+        print(f'      notified: {"yes" if notified else "no"}')
+        print()
+    return 0
+
+
+def _cli_clear_errors() -> int:
+    conn = _open_errors_conn()
+    try:
+        cursor = conn.execute("DELETE FROM mover_errors")
+        conn.commit()
+        n = cursor.rowcount
+    finally:
+        conn.close()
+    print(f'Cleared {n} error row{"" if n == 1 else "s"}.')
+    return 0
+
+
+def _cli_clear_error(n: int) -> int:
+    conn = _open_errors_conn()
+    try:
+        rows = _fetch_pending_errors(conn)
+        if not rows:
+            print('No pending mover errors to clear.', file=sys.stderr)
+            return 1
+        if n < 1 or n > len(rows):
+            print(f'No error at index {n} (table has {len(rows)} row'
+                  f'{"" if len(rows) == 1 else "s"}).',
+                  file=sys.stderr)
+            return 1
+        key, op, target = rows[n - 1][0], rows[n - 1][1], rows[n - 1][2]
+        conn.execute("DELETE FROM mover_errors WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f'Cleared error [{n}]: {op}: {target or "(no target)"}')
+    return 0
 
 
 if __name__ == '__main__':  # pragma: no cover
-    cli()
+    sys.exit(cli())
