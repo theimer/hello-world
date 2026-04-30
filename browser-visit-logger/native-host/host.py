@@ -64,6 +64,29 @@ import struct
 import sys
 from logging.handlers import RotatingFileHandler
 
+
+def _snapshot_filename(iso_timestamp: str, original_basename: str) -> str:
+    """Build the permanent datetime-prefixed snapshot filename.
+
+    Converts the ISO 8601 timestamp (as produced by Chrome's Date.toISOString())
+    to a filesystem-safe prefix and prepends it to the original basename:
+
+        '2026-04-30T14:35:22.123Z', 'abc.mhtml'  →  '2026-04-30T14-35-22Z-abc.mhtml'
+
+    The prefix encodes the UTC date and time to the nearest second, with colons
+    replaced by dashes.  This is the file's name for its entire lifetime — host.py
+    assigns it when the snapshot event is first recorded and the mover never
+    changes it again, only the directory the file lives in.
+    """
+    try:
+        date_part, time_rest = iso_timestamp.split('T', 1)
+        time_part = time_rest[:8].replace(':', '-')   # 'HH:MM:SS' → 'HH-MM-SS'
+        dt_prefix = f'{date_part}T{time_part}Z'
+    except (ValueError, IndexError):
+        # Unexpected format — sanitise and use as-is (shouldn't happen in production)
+        dt_prefix = iso_timestamp[:19].replace(':', '-').replace('.', '-')
+    return f'{dt_prefix}-{original_basename}'
+
 # ---------------------------------------------------------------------------
 # Paths — default to the user's home directory; overrideable via env vars
 # (env var overrides are used by the test suite to isolate test output)
@@ -343,6 +366,25 @@ def main() -> None:
     if tag and tag not in VALID_TAGS:
         write_message({'status': 'error', 'message': f'invalid tag: {tag}'})
         return
+
+    # For read/skimmed tags: rename the snapshot file to its permanent
+    # datetime-prefixed name before recording it in the DB.  Chrome writes
+    # '<hash>.mhtml'; we rename to '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.mhtml'.
+    # The file keeps this name forever — the mover later changes only the
+    # directory it lives in.
+    if tag in ('read', 'skimmed') and filename:
+        orig_basename = os.path.basename(filename)
+        new_basename  = _snapshot_filename(timestamp, orig_basename)
+        old_path = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, orig_basename)
+        new_path = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, new_basename)
+        try:
+            os.rename(old_path, new_path)
+            filename = new_basename
+            logger.debug('Renamed snapshot %s → %s', orig_basename, new_basename)
+        except OSError as exc:
+            logger.warning('Could not rename snapshot %s → %s: %s',
+                           old_path, new_path, exc)
+            filename = orig_basename
 
     errors = []
 

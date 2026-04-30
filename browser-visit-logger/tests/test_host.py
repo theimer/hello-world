@@ -187,6 +187,38 @@ class TestAppendLog(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _snapshot_filename helper
+# ---------------------------------------------------------------------------
+
+class TestSnapshotFilename(unittest.TestCase):
+
+    def test_converts_iso_timestamp_to_filename_prefix(self):
+        result = host._snapshot_filename('2026-04-30T14:35:22.123Z', 'abc.mhtml')
+        self.assertEqual(result, '2026-04-30T14-35-22Z-abc.mhtml')
+
+    def test_midnight_timestamp(self):
+        result = host._snapshot_filename('2026-01-01T00:00:00.000Z', 'hash.mhtml')
+        self.assertEqual(result, '2026-01-01T00-00-00Z-hash.mhtml')
+
+    def test_end_of_day_timestamp(self):
+        result = host._snapshot_filename('2026-12-31T23:59:59.999Z', 'x.pdf')
+        self.assertEqual(result, '2026-12-31T23-59-59Z-x.pdf')
+
+    def test_original_basename_is_preserved(self):
+        result = host._snapshot_filename('2026-04-30T10:00:00.000Z', 'complex-hash_val.mhtml')
+        self.assertTrue(result.endswith('-complex-hash_val.mhtml'))
+
+    def test_date_portion_is_first_10_chars(self):
+        result = host._snapshot_filename('2026-04-30T14:35:22.000Z', 'a.mhtml')
+        self.assertEqual(result[:10], '2026-04-30')
+
+    def test_unexpected_format_does_not_raise(self):
+        # Shouldn't happen in production but must not crash.
+        result = host._snapshot_filename('not-an-iso-timestamp', 'a.mhtml')
+        self.assertIn('a.mhtml', result)
+
+
+# ---------------------------------------------------------------------------
 # Database (ensure_db / insert_visit)
 # ---------------------------------------------------------------------------
 
@@ -945,6 +977,71 @@ class TestMain(unittest.TestCase):
             )
         # The DB write succeeded, so the response should still be ok
         self.assertEqual(resp['status'], 'ok')
+
+    # --- snapshot rename ---
+
+    def test_read_tag_renames_snapshot_to_datetime_prefixed_name(self):
+        # Creates the source file in a temp Downloads dir, sends a 'read' tag
+        # message, and verifies the file was renamed and the DB has the new name.
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, 'downloads')
+            os.makedirs(src_dir)
+            Path(src_dir, 'abc123.mhtml').write_bytes(b'snap')
+
+            self._call_main(
+                {'timestamp': '2026-04-30T14:35:22.000Z',
+                 'url': 'https://example.com', 'title': 'T',
+                 'tag': 'read',
+                 'filename': 'browser-visit-snapshots/abc123.mhtml'},
+                tmp,
+                extra_patches=[patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', src_dir)],
+            )
+
+            expected = '2026-04-30T14-35-22Z-abc123.mhtml'
+            self.assertFalse(os.path.exists(os.path.join(src_dir, 'abc123.mhtml')))
+            self.assertTrue(os.path.exists(os.path.join(src_dir, expected)))
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            fname = conn.execute('SELECT filename FROM read_events').fetchone()[0]
+            conn.close()
+            self.assertEqual(fname, expected)
+
+    def test_skimmed_tag_renames_snapshot_to_datetime_prefixed_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, 'downloads')
+            os.makedirs(src_dir)
+            Path(src_dir, 'def456.mhtml').write_bytes(b'snap')
+
+            self._call_main(
+                {'timestamp': '2026-04-30T09:00:00.000Z',
+                 'url': 'https://example.com', 'title': 'T',
+                 'tag': 'skimmed',
+                 'filename': 'browser-visit-snapshots/def456.mhtml'},
+                tmp,
+                extra_patches=[patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', src_dir)],
+            )
+
+            expected = '2026-04-30T09-00-00Z-def456.mhtml'
+            self.assertFalse(os.path.exists(os.path.join(src_dir, 'def456.mhtml')))
+            self.assertTrue(os.path.exists(os.path.join(src_dir, expected)))
+
+    def test_read_tag_rename_failure_stores_original_basename(self):
+        # When the source file doesn't exist, os.rename raises OSError.
+        # host.py must fall back to the original basename without propagating
+        # the error (a warning is logged but the DB write still succeeds).
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('os.rename', side_effect=OSError('no such file')):
+                resp = self._call_main(
+                    {'timestamp': '2026-04-30T14:35:22.000Z',
+                     'url': 'https://example.com', 'title': 'T',
+                     'tag': 'read',
+                     'filename': 'browser-visit-snapshots/abc123.mhtml'},
+                    tmp,
+                )
+            self.assertEqual(resp['status'], 'ok')
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            fname = conn.execute('SELECT filename FROM read_events').fetchone()[0]
+            conn.close()
+            self.assertEqual(fname, 'abc123.mhtml')   # fallback: original basename
 
     def test_result_log_failure_on_error_path_still_returns_error_response(self):
         """append_result_log failure on the DB-error path doesn't swallow the error response."""

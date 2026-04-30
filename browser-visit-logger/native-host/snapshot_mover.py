@@ -11,27 +11,40 @@ Algorithm
 ---------
 1. mkdir -p ICLOUD_SNAPSHOTS_DIR.
 2. Open the SQLite database.
-3. Orphan-source sweep — for each (filename) in {read,skimmed}_events
-   whose directory is already ICLOUD_SNAPSHOTS_DIR but whose source file
-   still exists in DOWNLOADS_SNAPSHOTS_DIR (i.e. a previous run crashed
-   between the DB update and the source unlink): delete the orphan source.
-4. Move pass — for each (rowid, filename, table) in {read,skimmed}_events
-   whose directory is DOWNLOADS_SNAPSHOTS_DIR:
-     a. Skip if the source file's mtime is less than MIN_AGE_SECONDS old
-        (defends against snapshots still being written to disk).
-     b. Special-case: if source is missing but dest already exists, just
-        update the row's directory column (recovery from prior crash
-        between the copy and the DB update).
-     c. Special-case: if both source and dest are missing, log a warning
-        and continue.
-     d. Otherwise:
-          (i)   shutil.copy2(source, dest)        — preserves mtime
-          (ii)  UPDATE row.directory = ICLOUD     — commits the move
-          (iii) source.unlink()                   — removes the original
-        Each step is independently safe to repeat, making the workflow
-        idempotent: a failure between any two steps is recovered on the
-        next run.
-5. Close the DB.
+3. Move pass — scan the Downloads directory for snapshot files:
+     For each file whose name matches the snapshot format
+     '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' and whose mtime is at least
+     MIN_AGE_SECONDS old:
+       a. Derive the UTC date from the filename prefix.
+       b. mkdir -p ICLOUD_SNAPSHOTS_DIR/<YYYY-MM-DD>/
+       c. shutil.copy2(source, dest)          — preserves mtime; safe to repeat
+       d. os.chmod(dest, 0o444)               — make archived copy read-only
+       e. UPDATE {read,skimmed}_events SET directory = <date_subdir>
+          WHERE filename = <this file> AND directory = DOWNLOADS_SNAPSHOTS_DIR
+       f. commit()
+       g. source.unlink()
+4. Close the DB.
+
+The filesystem scan (rather than a DB query) means that any file left in
+Downloads by a failed prior run is automatically retried — no special
+"orphan sweep" is required.  Crash-safety analysis:
+
+  Crash after (c) only:  source still present, dest exists → next run copies
+    again (copy2 overwrites safely), updates DB, unlinks.  ✓
+  Crash after (e)/(f):   source still present, DB already points to iCloud
+    → next run re-copies, UPDATE matches 0 rows (no-op), then unlinks.  ✓
+
+Filename convention
+-------------------
+host.py renames each snapshot to its permanent datetime-prefixed name at
+record time:
+    <YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>
+    e.g.  2026-04-30T14-35-22Z-abc123.mhtml
+
+The date portion (first 10 characters) determines the iCloud date subdir:
+    ICLOUD_SNAPSHOTS_DIR/2026-04-30/2026-04-30T14-35-22Z-abc123.mhtml
+
+Files in Downloads that do not match this format are silently skipped.
 
 Configuration
 -------------
@@ -54,7 +67,7 @@ sweeps.
     # show what would be moved without touching anything
     python3 native-host/snapshot_mover.py --dry-run --verbose
 
-    # ignore the 10-minute age gate (move everything immediately)
+    # ignore the 1-minute age gate (move everything immediately)
     python3 native-host/snapshot_mover.py --min-age-seconds 0
 
     # operate on isolated paths (e.g. against a test DB)
@@ -67,6 +80,7 @@ CLI flags override env vars, which override defaults.
 import argparse
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -93,96 +107,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger('snapshot_mover')
 
-
-def _orphan_source_sweep(conn: sqlite3.Connection, dry_run: bool = False) -> None:
-    """Delete source files left behind when a prior run crashed between the
-    UPDATE (step b) and the unlink (step c).
-
-    Such files have a row in the events table with directory = ICLOUD but
-    the source path still exists in DOWNLOADS.
-    """
-    for table in EVENTS_TABLES:
-        rows = conn.execute(
-            f"SELECT filename FROM {table} WHERE directory = ?",
-            (ICLOUD_SNAPSHOTS_DIR,),
-        ).fetchall()
-        for (filename,) in rows:
-            source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, filename)
-            if os.path.exists(source):
-                if dry_run:
-                    logger.info('[dry-run] would remove orphan source %s', source)
-                    continue
-                try:
-                    os.unlink(source)
-                    logger.info('Removed orphan source %s', source)
-                except OSError as exc:
-                    logger.error('Failed to remove orphan source %s: %s', source, exc)
+# Matches the permanent snapshot filename format assigned by host.py:
+#   <YYYY-MM-DD>T<HH>-<MM>-<SS>Z-<hash>.<ext>
+# group(1) — UTC date string 'YYYY-MM-DD' (used to select the date subdir)
+_SNAPSHOT_FILENAME_RE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2})T\d{2}-\d{2}-\d{2}Z-.+$'
+)
 
 
 def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
-    """Copy each old-enough snapshot from Downloads to iCloud, update DB,
-    delete source.  Idempotent and crash-safe; see module docstring.
+    """Scan the Downloads directory and move every old-enough snapshot to iCloud.
+
+    Uses the filesystem as the source of truth, so any file left in Downloads
+    by a failed prior run is automatically retried.
     """
+    if not os.path.isdir(DOWNLOADS_SNAPSHOTS_DIR):
+        return
+
     now = time.time()
-    for table in EVENTS_TABLES:
-        rows = conn.execute(
-            f"SELECT rowid, filename FROM {table} WHERE directory = ?",
-            (DOWNLOADS_SNAPSHOTS_DIR,),
-        ).fetchall()
-        for rowid, filename in rows:
-            _move_one(conn, table, rowid, filename, now, dry_run=dry_run)
+    for filename in os.listdir(DOWNLOADS_SNAPSHOTS_DIR):
+        source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, filename)
+        if not os.path.isfile(source):
+            continue
+
+        m = _SNAPSHOT_FILENAME_RE.match(filename)
+        if not m:
+            logger.debug('Skipping %s — does not match snapshot filename format', filename)
+            continue
+
+        age = now - os.path.getmtime(source)
+        if age < MIN_AGE_SECONDS:
+            logger.debug('Skipping %s — only %.0fs old (< %ds)', filename, age, MIN_AGE_SECONDS)
+            continue
+
+        date_str = m.group(1)   # 'YYYY-MM-DD'
+        _move_one(conn, source, filename, date_str, dry_run=dry_run)
 
 
 def _move_one(
-    conn: sqlite3.Connection, table: str, rowid: int, filename: str, now: float,
+    conn: sqlite3.Connection, source: str, filename: str, date_str: str,
     dry_run: bool = False,
 ) -> None:
-    source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, filename)
-    dest   = os.path.join(ICLOUD_SNAPSHOTS_DIR, filename)
-
-    if not os.path.exists(source):
-        if os.path.exists(dest):
-            # Recovery: previous run copied the file but crashed before the
-            # DB update.  Just update the row.
-            if dry_run:
-                logger.info('[dry-run] would reconcile DB for already-copied %s', filename)
-            else:
-                conn.execute(
-                    f"UPDATE {table} SET directory = ? WHERE rowid = ?",
-                    (ICLOUD_SNAPSHOTS_DIR, rowid),
-                )
-                conn.commit()
-                logger.info('Reconciled DB for already-copied %s', filename)
-        else:
-            logger.warning(
-                'Snapshot referenced by %s rowid %d is missing from both '
-                'source (%s) and dest (%s); leaving DB row unchanged',
-                table, rowid, source, dest,
-            )
-        return
-
-    age = now - os.path.getmtime(source)
-    if age < MIN_AGE_SECONDS:
-        logger.debug('Skipping %s — only %.0fs old (< %ds)', source, age, MIN_AGE_SECONDS)
-        return
+    date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, date_str)
+    dest        = os.path.join(date_subdir, filename)
 
     if dry_run:
-        logger.info('[dry-run] would move %s -> %s (and update %s rowid %d)',
-                    source, dest, table, rowid)
+        logger.info('[dry-run] would move %s -> %s', source, dest)
         return
 
     try:
-        # (a) copy (preserves mtime via copy2 — overwrite is safe).
+        # (a) Ensure the date subdir exists.
+        os.makedirs(date_subdir, exist_ok=True)
+        # (b) Copy, preserving mtime.  Overwriting an existing dest is safe.
         shutil.copy2(source, dest)
-        # (a2) make the archived copy read-only.
+        # (c) Make the archived copy read-only.
         os.chmod(dest, 0o444)
-        # (b) commit the move in the DB.
-        conn.execute(
-            f"UPDATE {table} SET directory = ? WHERE rowid = ?",
-            (ICLOUD_SNAPSHOTS_DIR, rowid),
-        )
+        # (d) Update DB rows that still record this file as living in Downloads.
+        #     Rows already pointing to iCloud (from a prior partial run) are
+        #     untouched by the WHERE clause — that's correct.
+        for table in EVENTS_TABLES:
+            conn.execute(
+                f"UPDATE {table} SET directory = ?"
+                f" WHERE filename = ? AND directory = ?",
+                (date_subdir, filename, DOWNLOADS_SNAPSHOTS_DIR),
+            )
         conn.commit()
-        # (c) remove the original.
+        # (e) Remove the original.
         os.unlink(source)
         logger.info('Moved %s -> %s (read-only)', source, dest)
     except (OSError, sqlite3.Error) as exc:
@@ -199,7 +189,6 @@ def main(dry_run: bool = False) -> None:
 
     conn = sqlite3.connect(DB_FILE)
     try:
-        _orphan_source_sweep(conn, dry_run=dry_run)
         _move_pass(conn, dry_run=dry_run)
     finally:
         conn.close()

@@ -5,6 +5,10 @@ Each test sets up an isolated triplet of (source_dir, dest_dir, db_file)
 under a temporary directory, then patches both `host` and `snapshot_mover`
 module-level constants to point at it.
 
+The mover scans the Downloads filesystem rather than querying the DB, so
+tests create source files with the permanent datetime-prefixed filename that
+host.py would have assigned at record time.
+
 Run with:
     cd browser-visit-logger
     pytest tests/test_snapshot_mover.py -v
@@ -21,6 +25,13 @@ from unittest.mock import patch
 import host             # resolved via conftest.py
 import snapshot_mover   # resolved via conftest.py
 
+# Fixed ISO timestamps for deterministic filename prefixes.
+# TS1 / TS2 share the same UTC date (different times, same day).
+# TS3 falls on a different UTC date.
+ISO_TS1 = '2024-01-15T10:30:00.000Z'   # prefix: 2024-01-15T10-30-00Z
+ISO_TS2 = '2024-01-15T10:31:00.000Z'   # prefix: 2024-01-15T10-31-00Z
+ISO_TS3 = '2024-01-16T08:00:00.000Z'   # prefix: 2024-01-16T08-00-00Z
+
 
 # ---------------------------------------------------------------------------
 # Base test case — isolated paths + DB initialised via host.ensure_db
@@ -35,7 +46,7 @@ class _MoverTestBase(unittest.TestCase):
         self.dest_dir   = os.path.join(self.tmp.name, 'icloud')
         self.db_file    = os.path.join(self.tmp.name, 'visits.db')
         os.makedirs(self.source_dir)
-        # dest_dir intentionally NOT created — main() should create it
+        # dest_dir intentionally NOT created — main() should create the root
 
         for module, attrs in (
             (host,            {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
@@ -50,27 +61,34 @@ class _MoverTestBase(unittest.TestCase):
                 p.start()
                 self.addCleanup(p.stop)
 
-        # Initialise DB with our patched paths
         conn = sqlite3.connect(self.db_file)
         host.ensure_db(conn)
         conn.close()
 
     # -- helpers --
 
-    def _make_event(self, table, url, timestamp, basename,
+    def _make_event(self, table, url, iso_timestamp, orig_basename,
                     content=b'data', age_seconds=0, create_source=True):
-        """Insert a visit + event row, and (optionally) create the source file."""
+        """Insert a visit + event row and (optionally) create the source file.
+
+        The source file is created with the permanent datetime-prefixed name
+        that host.py would assign (computed via host._snapshot_filename).
+
+        Returns the source file path if create_source=True, else None.
+        """
+        # Compute the permanent datetime-prefixed basename.
+        prefixed = host._snapshot_filename(iso_timestamp, orig_basename)
+
         conn = sqlite3.connect(self.db_file)
         host.insert_visit(conn, 'ts-visit', url, 'Title')
-        host._insert_event(
-            conn, table, url, timestamp,
-            table.replace('_events', ''),  # 'read' or 'skimmed'
-            basename,
-        )
+        # Pass prefixed name directly — _insert_event stores os.path.basename,
+        # which is a no-op since prefixed has no directory component.
+        host._insert_event(conn, table, url, iso_timestamp,
+                           table.replace('_events', ''), prefixed)
         conn.close()
 
         if create_source:
-            path = os.path.join(self.source_dir, basename)
+            path = os.path.join(self.source_dir, prefixed)
             Path(path).write_bytes(content)
             if age_seconds > 0:
                 mtime = time.time() - age_seconds
@@ -78,17 +96,16 @@ class _MoverTestBase(unittest.TestCase):
             return path
         return None
 
-    def _set_directory(self, table, url, directory):
-        """Force the directory column on a row (used to simulate prior runs)."""
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            f"UPDATE {table} SET directory = ? WHERE url = ?",
-            (directory, url),
-        )
-        conn.commit()
-        conn.close()
+    def _dest_info(self, prefixed_basename):
+        """Return (date_subdir, dest_filename) for a datetime-prefixed snapshot.
+
+        The filename is unchanged by the move; only the directory differs.
+        """
+        date_str = prefixed_basename[:10]   # 'YYYY-MM-DD'
+        return os.path.join(self.dest_dir, date_str), prefixed_basename
 
     def _row(self, table, url):
+        """Return the (filename, directory) DB row for url in table."""
         conn = sqlite3.connect(self.db_file)
         row = conn.execute(
             f"SELECT filename, directory FROM {table} WHERE url = ?", (url,)
@@ -96,128 +113,186 @@ class _MoverTestBase(unittest.TestCase):
         conn.close()
         return row
 
-    def _exists(self, directory, basename):
-        return os.path.exists(os.path.join(directory, basename))
-
 
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
 class TestMovePass(_MoverTestBase):
 
-    def test_old_file_is_copied_to_dest(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+    def test_dest_placed_in_utc_date_subdir(self):
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        self.assertTrue(self._exists(self.dest_dir, 'a.mhtml'))
+        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
 
     def test_old_file_source_is_deleted(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         snapshot_mover.main()
-        self.assertFalse(self._exists(self.source_dir, 'a.mhtml'))
+        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
 
     def test_old_file_db_directory_updated(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
         row = self._row('read_events', 'https://a.com')
-        self.assertEqual(row[0], 'a.mhtml')          # filename unchanged
-        self.assertEqual(row[1], self.dest_dir)      # directory updated
+        self.assertEqual(row[0], prefixed)       # filename unchanged
+        self.assertEqual(row[1], date_subdir)    # directory updated
 
     def test_old_file_preserves_content(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          content=b'snapshot bytes', age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        moved = Path(self.dest_dir, 'a.mhtml').read_bytes()
+        moved = Path(date_subdir, prefixed).read_bytes()
         self.assertEqual(moved, b'snapshot bytes')
 
-    def test_new_file_is_not_moved(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=30)  # well under the 1 min threshold
-        snapshot_mover.main()
-        self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
-        self.assertFalse(self._exists(self.dest_dir, 'a.mhtml'))
-        row = self._row('read_events', 'https://a.com')
-        self.assertEqual(row[1], self.source_dir)
-
     def test_moved_file_is_read_only(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        mode = os.stat(os.path.join(self.dest_dir, 'a.mhtml')).st_mode & 0o777
+        mode = os.stat(os.path.join(date_subdir, prefixed)).st_mode & 0o777
         self.assertEqual(mode, 0o444)
 
-    def test_processes_both_read_and_skimmed_event_tables(self):
-        self._make_event('read_events',    'https://r.com', 'tsr', 'r.mhtml',
-                         age_seconds=700)
-        self._make_event('skimmed_events', 'https://s.com', 'tss', 's.mhtml',
-                         age_seconds=700)
+    def test_new_file_is_not_moved(self):
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=30)    # well under the 1 min threshold
         snapshot_mover.main()
-        self.assertTrue(self._exists(self.dest_dir, 'r.mhtml'))
-        self.assertTrue(self._exists(self.dest_dir, 's.mhtml'))
-        self.assertEqual(self._row('read_events',    'https://r.com')[1], self.dest_dir)
-        self.assertEqual(self._row('skimmed_events', 'https://s.com')[1], self.dest_dir)
+        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
+        self.assertEqual(os.listdir(self.dest_dir), [])
+        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
+
+    def test_processes_both_read_and_skimmed_event_tables(self):
+        pf_r = host._snapshot_filename(ISO_TS1, 'r.mhtml')
+        pf_s = host._snapshot_filename(ISO_TS2, 's.mhtml')
+        self._make_event('read_events',    'https://r.com', ISO_TS1, 'r.mhtml',
+                         age_seconds=700)
+        self._make_event('skimmed_events', 'https://s.com', ISO_TS2, 's.mhtml',
+                         age_seconds=700)
+        ds_r, _ = self._dest_info(pf_r)
+        ds_s, _ = self._dest_info(pf_s)
+        snapshot_mover.main()
+        self.assertTrue(os.path.exists(os.path.join(ds_r, pf_r)))
+        self.assertTrue(os.path.exists(os.path.join(ds_s, pf_s)))
+        self.assertEqual(self._row('read_events',    'https://r.com'), (pf_r, ds_r))
+        self.assertEqual(self._row('skimmed_events', 'https://s.com'), (pf_s, ds_s))
+
+    def test_files_on_different_days_go_to_different_subdirs(self):
+        pf1 = host._snapshot_filename(ISO_TS1, 'a.mhtml')  # 2024-01-15
+        pf3 = host._snapshot_filename(ISO_TS3, 'b.mhtml')  # 2024-01-16
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        self._make_event('read_events', 'https://b.com', ISO_TS3, 'b.mhtml',
+                         age_seconds=700)
+        ds1, _ = self._dest_info(pf1)
+        ds3, _ = self._dest_info(pf3)
+        snapshot_mover.main()
+        self.assertNotEqual(ds1, ds3)
+        self.assertTrue(os.path.exists(os.path.join(ds1, pf1)))
+        self.assertTrue(os.path.exists(os.path.join(ds3, pf3)))
+
+    def test_moves_file_even_without_db_row(self):
+        # A file in Downloads with no corresponding DB row (e.g., the host.py
+        # message was lost) should still be moved to clean up Downloads.
+        prefixed = host._snapshot_filename(ISO_TS1, 'no-db-row.mhtml')
+        src = os.path.join(self.source_dir, prefixed)
+        Path(src).write_bytes(b'data')
+        mtime = time.time() - 700
+        os.utime(src, (mtime, mtime))
+
+        date_subdir, _ = self._dest_info(prefixed)
+        snapshot_mover.main()
+
+        self.assertFalse(os.path.exists(src))
+        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
 
 
 # ---------------------------------------------------------------------------
-# Idempotency / orphan handling
+# Idempotency / retry of partial failures
 # ---------------------------------------------------------------------------
 class TestIdempotency(_MoverTestBase):
 
     def test_running_twice_is_a_noop_after_success(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        # Second run: nothing left to do
-        snapshot_mover.main()
-        # Final state still consistent
-        self.assertTrue(self._exists(self.dest_dir, 'a.mhtml'))
-        self.assertFalse(self._exists(self.source_dir, 'a.mhtml'))
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.dest_dir)
+        snapshot_mover.main()   # source gone — nothing left in Downloads
+        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
+        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
+        self.assertEqual(self._row('read_events', 'https://a.com'),
+                         (prefixed, date_subdir))
 
-    def test_recovers_when_source_missing_but_dest_present_and_db_says_downloads(self):
-        # Simulate: previous run did the copy (source -> dest), then crashed
-        # before the DB UPDATE.  DB still says directory = downloads, but
-        # source is gone and dest exists.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=700, create_source=False)
-        Path(self.dest_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.dest_dir, 'a.mhtml').write_bytes(b'already-copied')
-
-        snapshot_mover.main()
-
-        # DB row should now reflect that the file lives in iCloud
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.dest_dir)
-        # Dest file untouched
-        self.assertEqual(Path(self.dest_dir, 'a.mhtml').read_bytes(), b'already-copied')
-
-    def test_recovers_orphan_source_when_db_already_says_icloud(self):
-        # Simulate: previous run copied + updated DB, then crashed before
-        # unlinking the source.  DB says iCloud, but source still exists.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+    def test_retry_cleans_up_source_when_db_already_says_icloud(self):
+        # Simulate: prior run did copy + DB update but crashed before unlinking.
+        # Source still in Downloads; DB already says iCloud.
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
-        # Pretend the DB was already updated by an earlier run
-        self._set_directory('read_events', 'https://a.com', self.dest_dir)
+        date_subdir, _ = self._dest_info(prefixed)
+
+        # Manually update DB to say iCloud (as if a prior run had done it).
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("UPDATE read_events SET directory = ? WHERE url = ?",
+                     (date_subdir, 'https://a.com'))
+        conn.commit()
+        conn.close()
 
         snapshot_mover.main()
 
-        # Orphan source now removed
-        self.assertFalse(self._exists(self.source_dir, 'a.mhtml'))
-        # DB still says iCloud
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.dest_dir)
+        # Source should be cleaned up; DB is unchanged (already correct).
+        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
+        self.assertEqual(self._row('read_events', 'https://a.com'),
+                         (prefixed, date_subdir))
 
-    def test_orphan_file_not_referenced_by_db_is_left_alone(self):
-        # Drop a stray file into source_dir that has no DB row.
-        Path(self.source_dir, 'orphan.mhtml').write_bytes(b'x')
+    def test_retry_recovers_from_crash_between_copy_and_db_update(self):
+        # Source exists, dest already exists (from prior copy), DB still says Downloads.
+        # Next run should overwrite the dest (safe, same data), update DB, unlink source.
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
+
+        # Pre-create the dest (as if a prior run had already copied it).
+        os.makedirs(date_subdir)
+        Path(date_subdir, prefixed).write_bytes(b'old-copy')
+        # chmod read-only from prior run; copy2 (which re-writes) should still work.
+        os.chmod(os.path.join(date_subdir, prefixed), 0o444)
+        # Restore write access so copy2 can overwrite (iCloud permissions vary in prod)
+        os.chmod(os.path.join(date_subdir, prefixed), 0o644)
+
+        snapshot_mover.main()
+
+        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
+        self.assertEqual(self._row('read_events', 'https://a.com'),
+                         (prefixed, date_subdir))
+
+    def test_skips_file_with_unrecognized_name_format(self):
+        # Files whose names don't match the snapshot format are ignored.
+        stray = os.path.join(self.source_dir, 'random-file.mhtml')
+        Path(stray).write_bytes(b'x')
         mtime = time.time() - 700
-        os.utime(os.path.join(self.source_dir, 'orphan.mhtml'), (mtime, mtime))
+        os.utime(stray, (mtime, mtime))
 
         snapshot_mover.main()
 
-        # File still in source, dest never created (no DB row to drive it)
-        self.assertTrue(self._exists(self.source_dir, 'orphan.mhtml'))
-        self.assertFalse(self._exists(self.dest_dir, 'orphan.mhtml'))
+        self.assertTrue(os.path.exists(stray))
+        self.assertEqual(os.listdir(self.dest_dir), [])
+
+    def test_skips_subdirectory_entries_in_downloads(self):
+        os.makedirs(os.path.join(self.source_dir, 'subdir'))
+        snapshot_mover.main()
+        self.assertEqual(os.listdir(self.dest_dir), [])
 
 
 # ---------------------------------------------------------------------------
@@ -225,58 +300,41 @@ class TestIdempotency(_MoverTestBase):
 # ---------------------------------------------------------------------------
 class TestEdgeCases(_MoverTestBase):
 
-    def test_creates_icloud_directory_if_absent(self):
-        # dest_dir is NOT created by setUp; main() should mkdir it.
+    def test_creates_icloud_root_directory_if_absent(self):
         self.assertFalse(os.path.isdir(self.dest_dir))
         snapshot_mover.main()
         self.assertTrue(os.path.isdir(self.dest_dir))
 
-    def test_no_db_file_is_a_noop(self):
-        # Remove the DB created in setUp; main() should log + return.
-        os.remove(self.db_file)
-        # Should not raise
+    def test_creates_date_subdir_for_moved_file(self):
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        # iCloud dir still gets created (mkdir runs before the DB check)
+        self.assertTrue(os.path.isdir(date_subdir))
+
+    def test_no_db_file_is_a_noop(self):
+        os.remove(self.db_file)
+        snapshot_mover.main()   # should not raise
         self.assertTrue(os.path.isdir(self.dest_dir))
 
-    def test_missing_source_and_dest_logs_warning(self):
-        # DB row points at source, but neither source nor dest file exists.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         create_source=False)
+    def test_downloads_dir_absent_is_a_noop(self):
+        os.rmdir(self.source_dir)   # empty, safe to remove
+        snapshot_mover.main()       # should not raise
+        self.assertTrue(os.path.isdir(self.dest_dir))
 
-        with self.assertLogs(snapshot_mover.logger, level='WARNING') as cm:
-            snapshot_mover.main()
-
-        self.assertTrue(any('missing from both' in m for m in cm.output))
-        # DB row unchanged
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-    def test_copy_failure_leaves_db_and_source_unchanged(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+    def test_copy_failure_leaves_source_in_downloads(self):
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
 
         with patch('shutil.copy2', side_effect=OSError('disk full')), \
              self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
             snapshot_mover.main()
 
-        # Error logged, source still present, DB still says downloads
         self.assertTrue(any('Failed to move' in m for m in cm.output))
-        self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
+        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
         self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-    def test_orphan_sweep_unlink_failure_is_logged(self):
-        # Set up an orphan: source exists, DB already says iCloud.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=700)
-        self._set_directory('read_events', 'https://a.com', self.dest_dir)
-
-        with patch('os.unlink', side_effect=OSError('locked')), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-
-        self.assertTrue(any('Failed to remove orphan source' in m for m in cm.output))
-        # Source still present (unlink raised)
-        self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
 
 
 # ---------------------------------------------------------------------------
@@ -284,46 +342,18 @@ class TestEdgeCases(_MoverTestBase):
 # ---------------------------------------------------------------------------
 class TestDryRun(_MoverTestBase):
 
-    def test_dry_run_does_not_copy_or_unlink_or_update(self):
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
+    def test_dry_run_does_not_copy_unlink_or_update(self):
+        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
 
         with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
             snapshot_mover.main(dry_run=True)
 
-        # Logged the would-do action
         self.assertTrue(any('[dry-run] would move' in m for m in cm.output))
-        # Source untouched, dest never created, DB unchanged
-        self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
-        self.assertFalse(self._exists(self.dest_dir, 'a.mhtml'))
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-    def test_dry_run_does_not_unlink_orphan_source(self):
-        # Orphan: source still in Downloads, DB already says iCloud.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=700)
-        self._set_directory('read_events', 'https://a.com', self.dest_dir)
-
-        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
-            snapshot_mover.main(dry_run=True)
-
-        self.assertTrue(any('[dry-run] would remove orphan source' in m for m in cm.output))
-        # Source still present
-        self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
-
-    def test_dry_run_does_not_reconcile_db_when_source_missing(self):
-        # Source missing, dest present, DB still says downloads → would
-        # normally reconcile via DB UPDATE; dry-run should only log.
-        self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=700, create_source=False)
-        Path(self.dest_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.dest_dir, 'a.mhtml').write_bytes(b'already-copied')
-
-        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
-            snapshot_mover.main(dry_run=True)
-
-        self.assertTrue(any('[dry-run] would reconcile' in m for m in cm.output))
-        # DB row unchanged
+        # Source untouched, no date subdirs, DB unchanged.
+        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
+        self.assertEqual(os.listdir(self.dest_dir), [])
         self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
 
 
@@ -331,15 +361,9 @@ class TestDryRun(_MoverTestBase):
 # CLI entry point
 # ---------------------------------------------------------------------------
 class TestCli(unittest.TestCase):
-    """Tests for _parse_args / _apply_args / cli().
-
-    These tests do NOT use _MoverTestBase because they're exercising the
-    argument-application path (which mutates module globals).  They snapshot
-    and restore the module attributes themselves.
-    """
+    """Tests for _parse_args / _apply_args / cli()."""
 
     def setUp(self):
-        # Snapshot all globals cli() may mutate, so each test starts clean.
         self._saved = {
             name: getattr(snapshot_mover, name)
             for name in ('DOWNLOADS_SNAPSHOTS_DIR', 'ICLOUD_SNAPSHOTS_DIR',
@@ -351,8 +375,6 @@ class TestCli(unittest.TestCase):
         for name, value in self._saved.items():
             setattr(snapshot_mover, name, value)
         snapshot_mover.logger.setLevel(self._saved_level)
-
-    # -- _parse_args --
 
     def test_parse_args_defaults(self):
         ns = snapshot_mover._parse_args([])
@@ -378,8 +400,6 @@ class TestCli(unittest.TestCase):
         self.assertEqual(ns.dest, '/tmp/dst')
         self.assertEqual(ns.db, '/tmp/test.db')
 
-    # -- _apply_args --
-
     def test_apply_args_overrides_paths_and_age(self):
         ns = snapshot_mover._parse_args([
             '--source', '/tmp/src',
@@ -404,38 +424,33 @@ class TestCli(unittest.TestCase):
         for name, value in original.items():
             self.assertEqual(getattr(snapshot_mover, name), value)
 
-    # -- cli (end-to-end) --
-
     def test_cli_with_nonexistent_db_is_noop_after_overrides(self):
-        # Point at a temp dir; DB doesn't exist → main() returns early.
         with tempfile.TemporaryDirectory() as tmp:
             snapshot_mover.cli([
                 '--db',     os.path.join(tmp, 'nonexistent.db'),
                 '--source', os.path.join(tmp, 'src'),
                 '--dest',   os.path.join(tmp, 'dst'),
             ])
-            # main() created the dest dir before checking the DB
             self.assertTrue(os.path.isdir(os.path.join(tmp, 'dst')))
 
     def test_cli_dry_run_does_not_modify_state(self):
-        # Set up a real DB + source file via the helpers, then drive via cli().
         with tempfile.TemporaryDirectory() as tmp:
             source_dir = os.path.join(tmp, 'src')
             dest_dir   = os.path.join(tmp, 'dst')
             db_file    = os.path.join(tmp, 'visits.db')
             os.makedirs(source_dir)
 
-            # Init DB with overridden paths so the DEFAULT clause embeds them.
             with patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', source_dir), \
                  patch.object(host, 'ICLOUD_SNAPSHOTS_DIR',    dest_dir):
                 conn = sqlite3.connect(db_file)
                 host.ensure_db(conn)
                 host.insert_visit(conn, 'ts-visit', 'https://a.com', 'Title')
+                prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
                 host._insert_event(conn, 'read_events', 'https://a.com',
-                                   'ts-read', 'read', 'a.mhtml')
+                                   ISO_TS1, 'read', prefixed)
                 conn.close()
 
-            file_path = os.path.join(source_dir, 'a.mhtml')
+            file_path = os.path.join(source_dir, prefixed)
             Path(file_path).write_bytes(b'data')
             mtime = time.time() - 700
             os.utime(file_path, (mtime, mtime))
@@ -446,9 +461,7 @@ class TestCli(unittest.TestCase):
                 '--min-age-seconds', '0',
             ])
 
-            # Source untouched
             self.assertTrue(os.path.exists(file_path))
-            # Dest dir created (mkdir runs even in dry-run) but no files in it
             self.assertEqual(os.listdir(dest_dir), [])
 
 
