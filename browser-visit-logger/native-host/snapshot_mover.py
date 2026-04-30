@@ -2,7 +2,8 @@
 """
 snapshot_mover.py — Periodically archive snapshot files from the local
 Downloads folder to the iCloud-synced Documents folder, updating the
-SQLite database to point at the new location.
+SQLite database to point at the new location, and sealing each daily
+archive directory once its UTC date has fully passed.
 
 Designed to be run by a launchd LaunchAgent every N seconds (default 1 h);
 each invocation does one pass and exits.
@@ -23,7 +24,18 @@ Algorithm
           WHERE filename = <this file> AND directory = DOWNLOADS_SNAPSHOTS_DIR
        f. commit()
        g. source.unlink()
-4. Close the DB.
+4. Seal pass — for each ICLOUD_SNAPSHOTS_DIR/<YYYY-MM-DD>/ subdir whose date
+   is strictly before today (UTC) and which doesn't already contain a
+   MANIFEST.tsv file:
+       a. List every snapshot file in the directory.
+       b. For each file, look up its row in read_events / skimmed_events
+          (joined with visits for the page title).
+       c. Write a tab-delimited MANIFEST.tsv with one header row and one
+          data row per file (filename, tag, timestamp, url, title).
+          Files with no DB row appear with empty metadata fields.
+       d. chmod the manifest to 0o444 (read-only).  The presence of the
+          manifest marks the directory sealed; subsequent runs skip it.
+5. Close the DB.
 
 The filesystem scan (rather than a DB query) means that any file left in
 Downloads by a failed prior run is automatically retried — no special
@@ -78,6 +90,7 @@ CLI flags override env vars, which override defaults.
 """
 
 import argparse
+import datetime
 import logging
 import os
 import re
@@ -99,6 +112,17 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
 MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '60'))
 
 EVENTS_TABLES = ('read_events', 'skimmed_events')
+
+# Name of the per-directory manifest file written by the seal pass.
+# Its presence marks the directory sealed; the seal pass skips dirs that
+# already contain it.
+MANIFEST_FILENAME = 'MANIFEST.tsv'
+
+# Header columns of the manifest (must stay in sync with _build_manifest_rows).
+_MANIFEST_HEADER = ('filename', 'tag', 'timestamp', 'url', 'title')
+
+# Matches the daily snapshot subdir name (UTC date, ISO format).
+_DATE_DIR_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -179,6 +203,134 @@ def _move_one(
         logger.error('Failed to move %s: %s', source, exc)
 
 
+# ---------------------------------------------------------------------------
+# Seal pass — write a read-only MANIFEST.tsv into each finished daily dir
+# ---------------------------------------------------------------------------
+
+def _today_utc() -> datetime.date:
+    """Return today's UTC date.  Indirected so tests can patch it."""
+    return datetime.datetime.now(datetime.timezone.utc).date()
+
+
+def _tsv_sanitise(s: str) -> str:
+    """Strip tab/newline/CR characters so the field is safe for TSV output."""
+    return (s or '').replace('\t', ' ').replace('\n', ' ').replace('\r', '')
+
+
+def _seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
+    """Seal every daily snapshot directory whose UTC date is strictly before
+    today and which doesn't already contain a MANIFEST.tsv.
+
+    A "sealed" directory is one with a tab-delimited manifest summarising its
+    contents.  The presence of the manifest is itself the sealed marker, so
+    the pass is idempotent: re-runs over a sealed directory are a no-op.
+    """
+    if not os.path.isdir(ICLOUD_SNAPSHOTS_DIR):
+        return
+
+    today = _today_utc()
+    for entry in sorted(os.listdir(ICLOUD_SNAPSHOTS_DIR)):
+        date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, entry)
+        if not os.path.isdir(date_subdir):
+            continue
+        if not _DATE_DIR_RE.match(entry):
+            continue
+        try:
+            dir_date = datetime.date.fromisoformat(entry)
+        except ValueError:
+            # Regex matched but not a real calendar date (e.g. '9999-99-99').
+            continue
+        if dir_date >= today:
+            # Today or future — more files might still arrive; don't seal yet.
+            continue
+        if os.path.exists(os.path.join(date_subdir, MANIFEST_FILENAME)):
+            continue
+        _seal_directory(conn, date_subdir, dry_run=dry_run)
+
+
+def _seal_directory(
+    conn: sqlite3.Connection, date_subdir: str, dry_run: bool = False,
+) -> None:
+    """Write a read-only MANIFEST.tsv listing every snapshot file in the directory.
+
+    Used by both the automatic seal pass and the manual snapshot_sealer.py CLI.
+    Errors writing or chmod'ing the manifest are logged but don't propagate.
+    """
+    manifest_path = os.path.join(date_subdir, MANIFEST_FILENAME)
+
+    if dry_run:
+        logger.info('[dry-run] would seal %s', date_subdir)
+        return
+
+    try:
+        rows = _build_manifest_rows(conn, date_subdir)
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            f.write('\t'.join(_MANIFEST_HEADER) + '\n')
+            for row in rows:
+                f.write('\t'.join(row) + '\n')
+        os.chmod(manifest_path, 0o444)
+        logger.info('Sealed %s (%d entries)', date_subdir, len(rows))
+    except (OSError, sqlite3.Error) as exc:
+        logger.error('Failed to seal %s: %s', date_subdir, exc)
+
+
+def _build_manifest_rows(
+    conn: sqlite3.Connection, date_subdir: str,
+):
+    """Return one tuple per snapshot file in the directory, sorted by filename.
+
+    The standard datetime-prefixed filenames sort chronologically, so the
+    manifest naturally lists events in the order they happened.  Files with
+    no matching DB row appear with empty metadata fields.
+    """
+    files = sorted(
+        f for f in os.listdir(date_subdir)
+        if f != MANIFEST_FILENAME
+        and os.path.isfile(os.path.join(date_subdir, f))
+    )
+    rows = []
+    for filename in files:
+        info = _lookup_event(conn, filename, date_subdir)
+        if info is None:
+            rows.append((_tsv_sanitise(filename), '', '', '', ''))
+        else:
+            rows.append((
+                _tsv_sanitise(filename),
+                info['tag'],
+                _tsv_sanitise(info['timestamp']),
+                _tsv_sanitise(info['url']),
+                _tsv_sanitise(info['title']),
+            ))
+    return rows
+
+
+def _lookup_event(
+    conn: sqlite3.Connection, filename: str, directory: str,
+):
+    """Find the read_events / skimmed_events row for filename in directory.
+
+    Returns a dict with tag, url, timestamp, title (joined from visits for the
+    page title), or None if no matching row is found in either table.
+
+    table names are trusted internal constants; safe to interpolate into SQL.
+    """
+    for table, tag in (('read_events', 'read'), ('skimmed_events', 'skimmed')):
+        row = conn.execute(
+            f"SELECT e.url, e.timestamp, COALESCE(v.title, '')"
+            f"  FROM {table} e LEFT JOIN visits v ON v.url = e.url"
+            f" WHERE e.filename = ? AND e.directory = ?",
+            (filename, directory),
+        ).fetchone()
+        if row is not None:
+            return {'tag': tag, 'url': row[0],
+                    'timestamp': row[1], 'title': row[2]}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main(dry_run: bool = False) -> None:
     """Run a single mover pass against the current module-level constants."""
     os.makedirs(ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
@@ -190,6 +342,7 @@ def main(dry_run: bool = False) -> None:
     conn = sqlite3.connect(DB_FILE)
     try:
         _move_pass(conn, dry_run=dry_run)
+        _seal_pass(conn, dry_run=dry_run)
     finally:
         conn.close()
 

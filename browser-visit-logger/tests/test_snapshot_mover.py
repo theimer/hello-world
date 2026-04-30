@@ -13,6 +13,7 @@ Run with:
     cd browser-visit-logger
     pytest tests/test_snapshot_mover.py -v
 """
+import datetime
 import logging
 import os
 import sqlite3
@@ -367,6 +368,260 @@ class TestDryRun(_MoverTestBase):
         self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
         self.assertEqual(os.listdir(self.dest_dir), [])
         self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
+
+
+# ---------------------------------------------------------------------------
+# Seal pass — write read-only MANIFEST.tsv into finished daily directories
+# ---------------------------------------------------------------------------
+class TestSealPass(_MoverTestBase):
+    """Tests for the automatic seal pass invoked by main()."""
+
+    # All tests in this class pin "today" to a fixed UTC date so that the
+    # date-comparison logic is deterministic.  Sealable dirs are dated before
+    # this; "today or future" dirs are dated on or after this.
+    TODAY = datetime.date(2024, 1, 20)
+
+    def setUp(self):
+        super().setUp()
+        p = patch.object(snapshot_mover, '_today_utc', return_value=self.TODAY)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # -- helpers --
+
+    def _seed_dir(self, date_str, files=()):
+        """Create dest_dir/<date_str>/ with the given files.
+
+        files is an iterable of (filename, table, url, ts, title) tuples.
+        Pass table=None to leave a file with no DB row.  Returns the absolute
+        path of the seeded date subdir.
+        """
+        date_subdir = os.path.join(self.dest_dir, date_str)
+        os.makedirs(date_subdir, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            for filename, table, url, ts, title in files:
+                Path(date_subdir, filename).write_bytes(b'data')
+                if table is None:
+                    continue
+                host.insert_visit(conn, ts, url, title)
+                conn.execute(
+                    f"INSERT INTO {table} (url, timestamp, filename, directory) "
+                    f"VALUES (?, ?, ?, ?)",
+                    (url, ts, filename, date_subdir),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+        return date_subdir
+
+    def _read_manifest(self, date_str):
+        return Path(self.dest_dir, date_str,
+                    snapshot_mover.MANIFEST_FILENAME).read_text(encoding='utf-8')
+
+    # -- tests --
+
+    def test_creates_manifest_for_past_date_subdir(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        self.assertTrue(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_does_not_seal_today(self):
+        date_subdir = self._seed_dir('2024-01-20')
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_does_not_seal_future_date(self):
+        date_subdir = self._seed_dir('2024-02-01')
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_manifest_is_read_only(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        mode = os.stat(manifest).st_mode & 0o777
+        self.assertEqual(mode, 0o444)
+
+    def test_manifest_starts_with_header_row(self):
+        self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        first_line = self._read_manifest('2024-01-15').split('\n', 1)[0]
+        self.assertEqual(first_line, 'filename\ttag\ttimestamp\turl\ttitle')
+
+    def test_manifest_lists_every_snapshot_file(self):
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+            ('2024-01-15T11-00-00Z-b.mhtml', 'skimmed_events',
+             'https://b.com', '2024-01-15T11:00:00Z', 'B'),
+        ])
+        snapshot_mover.main()
+        lines = self._read_manifest('2024-01-15').splitlines()
+        # Header + 2 data rows
+        self.assertEqual(len(lines), 3)
+
+    def test_manifest_rows_in_filename_order(self):
+        # Filenames sort chronologically thanks to the datetime prefix —
+        # the manifest order should follow.
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T11-00-00Z-late.mhtml',  'read_events',
+             'https://late.com',  '2024-01-15T11:00:00Z', 'L'),
+            ('2024-01-15T09-00-00Z-early.mhtml', 'read_events',
+             'https://early.com', '2024-01-15T09:00:00Z', 'E'),
+        ])
+        snapshot_mover.main()
+        lines = self._read_manifest('2024-01-15').splitlines()
+        self.assertIn('early.mhtml', lines[1])
+        self.assertIn('late.mhtml',  lines[2])
+
+    def test_manifest_includes_url_and_title_from_visits(self):
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://example.com', '2024-01-15T10:00:00Z', 'Example Page'),
+        ])
+        snapshot_mover.main()
+        manifest = self._read_manifest('2024-01-15')
+        self.assertIn('https://example.com', manifest)
+        self.assertIn('Example Page', manifest)
+
+    def test_manifest_distinguishes_read_and_skimmed_tags(self):
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-r.mhtml', 'read_events',
+             'https://r.com', '2024-01-15T10:00:00Z', 'R'),
+            ('2024-01-15T11-00-00Z-s.mhtml', 'skimmed_events',
+             'https://s.com', '2024-01-15T11:00:00Z', 'S'),
+        ])
+        snapshot_mover.main()
+        manifest = self._read_manifest('2024-01-15')
+        for line in manifest.splitlines()[1:]:
+            fields = line.split('\t')
+            if 'r.mhtml' in fields[0]:
+                self.assertEqual(fields[1], 'read')
+            elif 's.mhtml' in fields[0]:
+                self.assertEqual(fields[1], 'skimmed')
+
+    def test_manifest_handles_file_without_db_row(self):
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-orphan.mhtml', None, None, None, None),
+        ])
+        snapshot_mover.main()
+        lines = self._read_manifest('2024-01-15').splitlines()
+        self.assertEqual(len(lines), 2)  # header + 1 row
+        # All metadata fields blank after the filename
+        self.assertEqual(lines[1].split('\t'),
+                         ['2024-01-15T10-00-00Z-orphan.mhtml', '', '', '', ''])
+
+    def test_seal_skipped_when_manifest_already_exists(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        Path(manifest).write_text('preexisting\n', encoding='utf-8')
+        snapshot_mover.main()
+        # Untouched
+        self.assertEqual(Path(manifest).read_text(encoding='utf-8'),
+                         'preexisting\n')
+
+    def test_seal_processes_multiple_past_directories(self):
+        d1 = self._seed_dir('2024-01-10')
+        d2 = self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        for d in (d1, d2):
+            self.assertTrue(os.path.exists(
+                os.path.join(d, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_seal_ignores_non_directory_entries_at_icloud_root(self):
+        # A stray file at the iCloud root must not crash the seal pass.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        Path(self.dest_dir, 'stray-file.txt').write_text('x', encoding='utf-8')
+        snapshot_mover.main()  # must not raise
+
+    def test_seal_ignores_subdirs_with_non_date_names(self):
+        bogus = os.path.join(self.dest_dir, 'not-a-date')
+        os.makedirs(bogus)
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(bogus, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_seal_ignores_date_lookalike_dirs_that_arent_real_dates(self):
+        # Regex matches but datetime.date.fromisoformat rejects '9999-99-99'.
+        bogus = os.path.join(self.dest_dir, '9999-99-99')
+        os.makedirs(bogus)
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(bogus, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_dry_run_does_not_write_manifest(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
+            snapshot_mover.main(dry_run=True)
+        self.assertTrue(any('[dry-run] would seal' in m for m in cm.output))
+        self.assertFalse(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_manifest_sanitises_tabs_and_newlines_in_title(self):
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'Has\ttab and\nnewline'),
+        ])
+        snapshot_mover.main()
+        manifest = self._read_manifest('2024-01-15')
+        # Three replaced characters: \t and \n become spaces, not preserved.
+        self.assertNotIn('\ttab', manifest)
+        self.assertNotIn('and\n', manifest.replace('newline\n', ''))
+        self.assertIn('Has tab and newline', manifest)
+
+    def test_manifest_for_empty_directory_has_only_header(self):
+        # No snapshot files in the dir — manifest contains just the header row.
+        self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        self.assertEqual(self._read_manifest('2024-01-15'),
+                         'filename\ttag\ttimestamp\turl\ttitle\n')
+
+    def test_manifest_excludes_itself_from_listing(self):
+        # Seed a dir, run once → manifest written.  Seed *another* dir on a
+        # different past date and rerun: the first dir's manifest must not
+        # appear as a row in the second dir's manifest (different dirs anyway,
+        # but this test verifies MANIFEST.tsv is excluded from a dir's own
+        # file list).  Simulate by pre-creating MANIFEST.tsv-named non-snapshot
+        # would be wrong; instead, verify the manifest doesn't list itself by
+        # checking no row's filename is MANIFEST.tsv.
+        self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ])
+        snapshot_mover.main()
+        manifest = self._read_manifest('2024-01-15')
+        self.assertNotIn('MANIFEST.tsv', manifest)
+
+    def test_seal_handles_oserror_writing_manifest(self):
+        # If writing the manifest fails, log an error but don't propagate.
+        self._seed_dir('2024-01-15')
+        with patch('builtins.open', side_effect=OSError('disk full')), \
+             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover.main()
+        self.assertTrue(any('Failed to seal' in m for m in cm.output))
+
+    def test_seal_pass_noop_when_icloud_dir_absent(self):
+        # If main() is bypassed and _seal_pass is called directly with no
+        # iCloud dir, it must not raise.  (main() always makedirs first; this
+        # test exercises the early-return guard inside _seal_pass itself.
+        # _MoverTestBase doesn't pre-create dest_dir, so it's already absent.)
+        self.assertFalse(os.path.isdir(self.dest_dir))
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._seal_pass(conn)   # must not raise
+        finally:
+            conn.close()
+
+
+class TestTodayUtc(unittest.TestCase):
+    """Cover the real _today_utc() (TestSealPass mocks it everywhere else)."""
+
+    def test_returns_a_date_object(self):
+        self.assertIsInstance(snapshot_mover._today_utc(), datetime.date)
 
 
 # ---------------------------------------------------------------------------
