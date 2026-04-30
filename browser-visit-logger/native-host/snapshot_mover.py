@@ -38,7 +38,7 @@ Configuration
 DB_FILE                  — BVL_DB_FILE, default ~/browser-visits.db
 DOWNLOADS_SNAPSHOTS_DIR  — BVL_DOWNLOADS_SNAPSHOTS_DIR, default ~/Downloads/browser-visit-snapshots
 ICLOUD_SNAPSHOTS_DIR     — BVL_ICLOUD_SNAPSHOTS_DIR,    default ~/Documents/browser-visit-logger/snapshots
-MIN_AGE_SECONDS          — BVL_MOVER_MIN_AGE_SECONDS,   default 600 (10 min)
+MIN_AGE_SECONDS          — BVL_MOVER_MIN_AGE_SECONDS,   default 60 (1 min)
 
 Logging is to stderr; the launchd plist routes stderr to a log file.
 
@@ -82,7 +82,7 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     'BVL_ICLOUD_SNAPSHOTS_DIR',
     os.path.join(HOME, 'Documents', 'browser-visit-logger', 'snapshots'),
 )
-MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '600'))
+MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '60'))
 
 EVENTS_TABLES = ('read_events', 'skimmed_events')
 

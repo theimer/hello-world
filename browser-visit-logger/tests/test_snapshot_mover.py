@@ -134,7 +134,7 @@ class TestMovePass(_MoverTestBase):
 
     def test_new_file_is_not_moved(self):
         self._make_event('read_events', 'https://a.com', 'ts1', 'a.mhtml',
-                         age_seconds=60)  # well under 10 min threshold
+                         age_seconds=30)  # well under the 1 min threshold
         snapshot_mover.main()
         self.assertTrue(self._exists(self.source_dir, 'a.mhtml'))
         self.assertFalse(self._exists(self.dest_dir, 'a.mhtml'))
