@@ -515,7 +515,7 @@ describe('tag-and-snapshot message handler', () => {
     await flushPromises();
     expect(mockDownloadsDownload).toHaveBeenCalledWith(
       expect.objectContaining({
-        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+        filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.mhtml`,
         saveAs: false,
       }),
       expect.any(Function),
@@ -581,7 +581,7 @@ describe('tag-and-snapshot message handler', () => {
       await flushPromises();
       expect(mockDownloadsDownload).toHaveBeenCalledWith(
         expect.objectContaining({
-          filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.pdf`,
+          filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.pdf`,
           saveAs: false,
         }),
         expect.any(Function),
@@ -630,7 +630,7 @@ describe('tag-and-snapshot message handler', () => {
       'com.browser.visit.logger',
       {
         tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title,
-        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+        filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.mhtml`,
       },
       expect.any(Function),
     );
@@ -649,7 +649,7 @@ describe('tag-and-snapshot message handler', () => {
       'com.browser.visit.logger',
       {
         tag: 'skimmed', url: skimMsg.url, timestamp: skimMsg.timestamp, title: skimMsg.title,
-        filename: `browser-visit-snapshots/${MOCK_HEX_HASH}.mhtml`,
+        filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.mhtml`,
       },
       expect.any(Function),
     );

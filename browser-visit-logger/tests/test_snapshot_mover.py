@@ -33,6 +33,18 @@ ISO_TS2 = '2024-01-15T10:31:00.000Z'   # prefix: 2024-01-15T10-31-00Z
 ISO_TS3 = '2024-01-16T08:00:00.000Z'   # prefix: 2024-01-16T08-00-00Z
 
 
+def _snap(iso_ts: str, orig_basename: str) -> str:
+    """Build the datetime-prefixed snapshot filename (mirrors background.js logic).
+
+    The prefix is derived from the ISO 8601 timestamp: colons replaced with
+    dashes, milliseconds stripped.  The result is the file's permanent name
+    for its entire lifetime.
+    """
+    date_part, time_rest = iso_ts.split('T', 1)
+    time_part = time_rest[:8].replace(':', '-')
+    return f'{date_part}T{time_part}Z-{orig_basename}'
+
+
 # ---------------------------------------------------------------------------
 # Base test case — isolated paths + DB initialised via host.ensure_db
 # ---------------------------------------------------------------------------
@@ -72,12 +84,12 @@ class _MoverTestBase(unittest.TestCase):
         """Insert a visit + event row and (optionally) create the source file.
 
         The source file is created with the permanent datetime-prefixed name
-        that host.py would assign (computed via host._snapshot_filename).
+        that background.js assigns at download time (computed via _snap).
 
         Returns the source file path if create_source=True, else None.
         """
         # Compute the permanent datetime-prefixed basename.
-        prefixed = host._snapshot_filename(iso_timestamp, orig_basename)
+        prefixed = _snap(iso_timestamp, orig_basename)
 
         conn = sqlite3.connect(self.db_file)
         host.insert_visit(conn, 'ts-visit', url, 'Title')
@@ -120,7 +132,7 @@ class _MoverTestBase(unittest.TestCase):
 class TestMovePass(_MoverTestBase):
 
     def test_dest_placed_in_utc_date_subdir(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -128,14 +140,14 @@ class TestMovePass(_MoverTestBase):
         self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
 
     def test_old_file_source_is_deleted(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         snapshot_mover.main()
         self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
 
     def test_old_file_db_directory_updated(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -145,7 +157,7 @@ class TestMovePass(_MoverTestBase):
         self.assertEqual(row[1], date_subdir)    # directory updated
 
     def test_old_file_preserves_content(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          content=b'snapshot bytes', age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -154,7 +166,7 @@ class TestMovePass(_MoverTestBase):
         self.assertEqual(moved, b'snapshot bytes')
 
     def test_moved_file_is_read_only(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -163,7 +175,7 @@ class TestMovePass(_MoverTestBase):
         self.assertEqual(mode, 0o444)
 
     def test_new_file_is_not_moved(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=30)    # well under the 1 min threshold
         snapshot_mover.main()
@@ -172,8 +184,8 @@ class TestMovePass(_MoverTestBase):
         self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
 
     def test_processes_both_read_and_skimmed_event_tables(self):
-        pf_r = host._snapshot_filename(ISO_TS1, 'r.mhtml')
-        pf_s = host._snapshot_filename(ISO_TS2, 's.mhtml')
+        pf_r = _snap(ISO_TS1, 'r.mhtml')
+        pf_s = _snap(ISO_TS2, 's.mhtml')
         self._make_event('read_events',    'https://r.com', ISO_TS1, 'r.mhtml',
                          age_seconds=700)
         self._make_event('skimmed_events', 'https://s.com', ISO_TS2, 's.mhtml',
@@ -187,8 +199,8 @@ class TestMovePass(_MoverTestBase):
         self.assertEqual(self._row('skimmed_events', 'https://s.com'), (pf_s, ds_s))
 
     def test_files_on_different_days_go_to_different_subdirs(self):
-        pf1 = host._snapshot_filename(ISO_TS1, 'a.mhtml')  # 2024-01-15
-        pf3 = host._snapshot_filename(ISO_TS3, 'b.mhtml')  # 2024-01-16
+        pf1 = _snap(ISO_TS1, 'a.mhtml')  # 2024-01-15
+        pf3 = _snap(ISO_TS3, 'b.mhtml')  # 2024-01-16
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         self._make_event('read_events', 'https://b.com', ISO_TS3, 'b.mhtml',
@@ -203,7 +215,7 @@ class TestMovePass(_MoverTestBase):
     def test_moves_file_even_without_db_row(self):
         # A file in Downloads with no corresponding DB row (e.g., the host.py
         # message was lost) should still be moved to clean up Downloads.
-        prefixed = host._snapshot_filename(ISO_TS1, 'no-db-row.mhtml')
+        prefixed = _snap(ISO_TS1, 'no-db-row.mhtml')
         src = os.path.join(self.source_dir, prefixed)
         Path(src).write_bytes(b'data')
         mtime = time.time() - 700
@@ -222,7 +234,7 @@ class TestMovePass(_MoverTestBase):
 class TestIdempotency(_MoverTestBase):
 
     def test_running_twice_is_a_noop_after_success(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -236,7 +248,7 @@ class TestIdempotency(_MoverTestBase):
     def test_retry_cleans_up_source_when_db_already_says_icloud(self):
         # Simulate: prior run did copy + DB update but crashed before unlinking.
         # Source still in Downloads; DB already says iCloud.
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -258,7 +270,7 @@ class TestIdempotency(_MoverTestBase):
     def test_retry_recovers_from_crash_between_copy_and_db_update(self):
         # Source exists, dest already exists (from prior copy), DB still says Downloads.
         # Next run should overwrite the dest (safe, same data), update DB, unlink source.
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -306,7 +318,7 @@ class TestEdgeCases(_MoverTestBase):
         self.assertTrue(os.path.isdir(self.dest_dir))
 
     def test_creates_date_subdir_for_moved_file(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
@@ -324,7 +336,7 @@ class TestEdgeCases(_MoverTestBase):
         self.assertTrue(os.path.isdir(self.dest_dir))
 
     def test_copy_failure_leaves_source_in_downloads(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
 
@@ -343,7 +355,7 @@ class TestEdgeCases(_MoverTestBase):
 class TestDryRun(_MoverTestBase):
 
     def test_dry_run_does_not_copy_unlink_or_update(self):
-        prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+        prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
 
@@ -445,7 +457,7 @@ class TestCli(unittest.TestCase):
                 conn = sqlite3.connect(db_file)
                 host.ensure_db(conn)
                 host.insert_visit(conn, 'ts-visit', 'https://a.com', 'Title')
-                prefixed = host._snapshot_filename(ISO_TS1, 'a.mhtml')
+                prefixed = _snap(ISO_TS1, 'a.mhtml')
                 host._insert_event(conn, 'read_events', 'https://a.com',
                                    ISO_TS1, 'read', prefixed)
                 conn.close()

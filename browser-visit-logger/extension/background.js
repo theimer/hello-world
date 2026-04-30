@@ -94,6 +94,16 @@ function isPdfUrl(url) {
   return /\.pdf([?#]|$)/i.test(url);
 }
 
+/**
+ * Convert an ISO 8601 timestamp (e.g. '2026-04-30T14:35:22.123Z') to a
+ * filesystem-safe datetime prefix: '2026-04-30T14-35-22Z'.
+ * Colons are replaced with dashes; milliseconds and trailing Z are dropped.
+ */
+function snapshotDatetimePrefix(isoTimestamp) {
+  const [datePart, timeRest] = isoTimestamp.split('T');
+  return `${datePart}T${timeRest.slice(0, 8).replace(/:/g, '-')}Z`;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type !== 'tag-and-snapshot') return false;
 
@@ -134,7 +144,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   Promise.all([hashPromise, contentPromise])
     .then(([hexHash, downloadUrl]) => {
-      const filename = `browser-visit-snapshots/${hexHash}.${ext}`;
+      const filename = `browser-visit-snapshots/${snapshotDatetimePrefix(timestamp)}-${hexHash}.${ext}`;
 
       chrome.downloads.download({ url: downloadUrl, filename, saveAs: false }, (downloadId) => {
         if (chrome.runtime.lastError || downloadId === undefined) {

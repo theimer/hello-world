@@ -257,8 +257,14 @@ describe('showVisitInfo', () => {
     expect(labels).not.toContain('~ Skimmed');
   });
 
-  test('does not render a row for a null timestamp', async () => {
-    nativeReturns({ status: 'ok', record: RECORD });
+  test('does not render a row for a null timestamp within an event', async () => {
+    // If an event's timestamp is null, formatTs returns null and the row is filtered out.
+    // This covers the `.filter((r) => r.value !== null)` branch for individual event rows.
+    const nullTsRecord = {
+      ...RECORD,
+      skimmed: [{ timestamp: null, filename: 'x.mhtml', directory: SNAP_DIR }],
+    };
+    nativeReturns({ status: 'ok', record: nullTsRecord });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
     expect(labels).not.toContain('~ Skimmed');
