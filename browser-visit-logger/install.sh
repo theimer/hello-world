@@ -29,6 +29,9 @@ MANIFEST_TEMPLATE="$EXTENSION_DIR/manifest.json.template"
 MANIFEST_JSON="$EXTENSION_DIR/manifest.json"
 HOST_MANIFEST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.json"
 HOST_PY="$NATIVE_DIR/host.py"
+MOVER_PY="$NATIVE_DIR/snapshot_mover.py"
+MOVER_PLIST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.snapshot_mover.plist.template"
+MOVER_PLIST_LABEL="com.browser.visit.logger.snapshot_mover"
 KEY_PEM="$NATIVE_DIR/generated_key.pem"
 HOST_NAME="com.browser.visit.logger"
 
@@ -181,6 +184,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 5b: Install snapshot mover LaunchAgent (macOS only)
+# ---------------------------------------------------------------------------
+MOVER_INSTALLED=0
+if [[ "$OS" == "Darwin" ]]; then
+  chmod +x "$MOVER_PY"
+  MOVER_PY_ABS="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$MOVER_PY")"
+
+  LAUNCHAGENTS_DIR="$HOME/Library/LaunchAgents"
+  MOVER_PLIST="$LAUNCHAGENTS_DIR/$MOVER_PLIST_LABEL.plist"
+  mkdir -p "$LAUNCHAGENTS_DIR"
+
+  # Substitute placeholders in the plist template.
+  python3 - "$MOVER_PLIST_TEMPLATE" "$MOVER_PLIST" "$MOVER_PY_ABS" "$HOME" <<'PYEOF'
+import sys
+template_path, out_path, mover_path, home = sys.argv[1:5]
+with open(template_path) as f:
+    text = f.read()
+text = text.replace('{{MOVER_PATH}}', mover_path).replace('{{HOME}}', home)
+with open(out_path, 'w') as f:
+    f.write(text)
+PYEOF
+  info "Wrote LaunchAgent plist to $MOVER_PLIST"
+
+  # (Re-)load the LaunchAgent.  bootout returns non-zero if not currently
+  # loaded; that's fine, hence the leading `||true`.
+  USER_DOMAIN="gui/$(id -u)"
+  launchctl bootout "$USER_DOMAIN/$MOVER_PLIST_LABEL" 2>/dev/null || true
+  if launchctl bootstrap "$USER_DOMAIN" "$MOVER_PLIST" 2>/dev/null; then
+    info "LaunchAgent loaded — mover runs every hour by default."
+    MOVER_INSTALLED=1
+  else
+    info "WARNING: failed to bootstrap LaunchAgent; you may need to log out/in or run 'launchctl bootstrap $USER_DOMAIN $MOVER_PLIST' manually."
+  fi
+else
+  info "Snapshot mover LaunchAgent is macOS-only; skipping on $OS."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 6: Print next-step instructions
 # ---------------------------------------------------------------------------
 cat <<EOF
@@ -192,6 +233,7 @@ cat <<EOF
 Extension ID : $EXTENSION_ID
 Extension dir: $EXTENSION_DIR
 Native host  : $HOST_PY_ABS
+Snapshot mover: $([[ "$OS" == "Darwin" ]] && echo "$MOVER_PLIST_LABEL (LaunchAgent, every 3600s)" || echo "macOS-only, not installed")
 
 Next steps:
   1. Open Chrome and go to: chrome://extensions
@@ -204,6 +246,14 @@ Next steps:
   5. Navigate to any web page. Then check:
        tail ~/browser-visits.log
        sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY id DESC LIMIT 10;"
+
+To change the snapshot mover interval (default 3600s):
+  • Edit the StartInterval value in:
+       ~/Library/LaunchAgents/$MOVER_PLIST_LABEL.plist
+  • Reload it:
+       launchctl bootout gui/\$(id -u)/$MOVER_PLIST_LABEL
+       launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$MOVER_PLIST_LABEL.plist
+  • Mover output is logged to ~/browser-visits-mover.log
 
 If Chrome shows a different extension ID, re-run this script to regenerate.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

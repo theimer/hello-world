@@ -21,8 +21,12 @@ Tag action (from popup.js / background.js):
     → INSERT OR IGNORE the visit row first (so tagging always works even if the
       auto-log hasn't fired yet), then update of_interest, read, or skimmed;
       append 4-field TSV line.
-      For "read" and "skimmed": Chrome saves a snapshot and sends its filename;
-      this host stores both the timestamp and the filename in the events table.
+      For "read" and "skimmed": Chrome saves a snapshot and sends its filename
+      (Chrome's relative path under ~/Downloads). This host normalizes the
+      filename to its basename and records both the basename and the parent
+      directory (initially the Downloads snapshots dir). A separate periodic
+      mover (snapshot_mover.py) later copies the file to the iCloud directory
+      and updates the directory column in place.
 
 Schema
 ------
@@ -38,14 +42,16 @@ Schema
     read_events (
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
-        filename  TEXT NOT NULL DEFAULT '',  -- snapshot filename, e.g. browser-visit-snapshots/<hash>.mhtml
+        filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
+        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
         PRIMARY KEY (url, timestamp)
     )
 
     skimmed_events (
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
-        filename  TEXT NOT NULL DEFAULT '',  -- snapshot filename, e.g. browser-visit-snapshots/<hash>.mhtml
+        filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
+        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
         PRIMARY KEY (url, timestamp)
     )
 """
@@ -66,6 +72,17 @@ HOME     = os.path.expanduser('~')
 LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
 DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
 HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
+
+# Snapshot storage locations.  Chrome writes snapshots to the Downloads dir;
+# the periodic mover later copies them to the iCloud-synced Documents dir.
+DOWNLOADS_SNAPSHOTS_DIR = os.environ.get(
+    'BVL_DOWNLOADS_SNAPSHOTS_DIR',
+    os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'),
+)
+ICLOUD_SNAPSHOTS_DIR = os.environ.get(
+    'BVL_ICLOUD_SNAPSHOTS_DIR',
+    os.path.join(HOME, 'Documents', 'browser-visit-logger', 'snapshots'),
+)
 
 # ---------------------------------------------------------------------------
 # Host process logging (errors/debug — never written to stderr)
@@ -130,15 +147,22 @@ def ensure_db(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
-    """Create an events table (url, timestamp, filename PRIMARY KEY) if it does not yet exist.
+    """Create an events table (url, timestamp PRIMARY KEY, filename, directory).
 
     table is a trusted internal constant, never user-supplied.
+
+    The DEFAULT for directory embeds DOWNLOADS_SNAPSHOTS_DIR at table-creation
+    time so that ad-hoc INSERTs (e.g. via sqlite3 CLI) get a sensible value;
+    _insert_event always specifies the directory explicitly.  Single-quotes in
+    the path are escaped to prevent SQL syntax errors on unusual home paths.
     """
+    default_dir_lit = "'" + DOWNLOADS_SNAPSHOTS_DIR.replace("'", "''") + "'"
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             url       TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             filename  TEXT NOT NULL DEFAULT '',
+            directory TEXT NOT NULL DEFAULT {default_dir_lit},
             PRIMARY KEY (url, timestamp)
         )
     """)
@@ -151,6 +175,11 @@ def _insert_event(
     """Insert a timestamped event for url into table if the URL exists in visits,
     and increment the corresponding counter column in visits by 1.
 
+    The filename is normalized to its basename before being stored (background.js
+    sends Chrome's relative path under Downloads, e.g. 'browser-visit-snapshots/
+    <hash>.mhtml'; the parent directory is captured separately in the directory
+    column so the basename alone is sufficient).
+
     Returns True if the URL exists (event inserted or duplicate ignored),
     False if no visits record exists for the URL.
 
@@ -158,9 +187,11 @@ def _insert_event(
     """
     exists = conn.execute("SELECT 1 FROM visits WHERE url = ?", (url,)).fetchone()
     if exists:
+        basename = os.path.basename(filename)
         conn.execute(
-            f"INSERT OR IGNORE INTO {table} (url, timestamp, filename) VALUES (?, ?, ?)",
-            (url, timestamp, filename),
+            f"INSERT OR IGNORE INTO {table} (url, timestamp, filename, directory) "
+            f"VALUES (?, ?, ?, ?)",
+            (url, timestamp, basename, DOWNLOADS_SNAPSHOTS_DIR),
         )
         conn.execute(
             f"UPDATE visits SET {visits_col} = {visits_col} + 1 WHERE url = ?",
@@ -171,14 +202,16 @@ def _insert_event(
 
 
 def _fetch_events(conn: sqlite3.Connection, table: str, url: str) -> list:
-    """Return all events for url from table as dicts {timestamp, filename}, sorted ascending.
+    """Return all events for url from table as dicts {timestamp, filename, directory},
+    sorted ascending by timestamp.
 
     table is a trusted internal constant, never user-supplied.
     """
     return [
-        {'timestamp': r[0], 'filename': r[1]}
+        {'timestamp': r[0], 'filename': r[1], 'directory': r[2]}
         for r in conn.execute(
-            f"SELECT timestamp, filename FROM {table} WHERE url = ? ORDER BY timestamp ASC",
+            f"SELECT timestamp, filename, directory FROM {table} "
+            f"WHERE url = ? ORDER BY timestamp ASC",
             (url,),
         ).fetchall()
     ]
@@ -215,8 +248,10 @@ def tag_visit(
 ) -> bool:
     """Set the of_interest, read, or skimmed timestamp on the visit record for url.
 
-    For 'read' and 'skimmed' tags, filename is the snapshot filename stored in the
-    events table (e.g. 'browser-visit-snapshots/<hash>.mhtml').
+    For 'read' and 'skimmed' tags, filename is the snapshot filename as Chrome
+    reports it (relative path under ~/Downloads, e.g.
+    'browser-visit-snapshots/<hash>.mhtml').  _insert_event normalizes it to
+    its basename before storage.
 
     Returns True if a row was found and updated, False if no record exists for url.
     """

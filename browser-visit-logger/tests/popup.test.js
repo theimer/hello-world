@@ -157,10 +157,11 @@ describe('formatTs', () => {
 // showVisitInfo
 // ---------------------------------------------------------------------------
 describe('showVisitInfo', () => {
+  const SNAP_DIR = '/Users/x/Downloads/browser-visit-snapshots';
   const RECORD = {
     timestamp: '2026-04-23T02:10:31.451Z',
     of_interest: true,
-    read:    [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/abc.mhtml' }],
+    read:    [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'abc.mhtml', directory: SNAP_DIR }],
     skimmed: [],
   };
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
@@ -198,8 +199,8 @@ describe('showVisitInfo', () => {
     const multiReadRecord = {
       ...RECORD,
       read: [
-        { timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/abc.mhtml' },
-        { timestamp: '2026-04-24T09:15:00.000Z', filename: 'browser-visit-snapshots/def.mhtml' },
+        { timestamp: '2026-04-23T02:27:10.366Z', filename: 'abc.mhtml', directory: SNAP_DIR },
+        { timestamp: '2026-04-24T09:15:00.000Z', filename: 'def.mhtml', directory: SNAP_DIR },
       ],
     };
     nativeReturns({ status: 'ok', record: multiReadRecord });
@@ -229,8 +230,8 @@ describe('showVisitInfo', () => {
     const multiSkimRecord = {
       ...RECORD,
       skimmed: [
-        { timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/s1.mhtml' },
-        { timestamp: '2026-04-24T09:15:00.000Z', filename: 'browser-visit-snapshots/s2.mhtml' },
+        { timestamp: '2026-04-23T02:27:10.366Z', filename: 's1.mhtml', directory: SNAP_DIR },
+        { timestamp: '2026-04-24T09:15:00.000Z', filename: 's2.mhtml', directory: SNAP_DIR },
       ],
     };
     nativeReturns({ status: 'ok', record: multiSkimRecord });
@@ -285,7 +286,7 @@ describe('showVisitInfo', () => {
   });
 
   test('renders the "~ Skimmed" row when skimmed array has one entry', async () => {
-    nativeReturns({ status: 'ok', record: { ...RECORD, skimmed: [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'browser-visit-snapshots/sk.mhtml' }] } });
+    nativeReturns({ status: 'ok', record: { ...RECORD, skimmed: [{ timestamp: '2026-04-23T02:27:10.366Z', filename: 'sk.mhtml', directory: SNAP_DIR }] } });
     await loadPopup();
     const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
     expect(labels).toContain('~ Skimmed');

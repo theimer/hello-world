@@ -233,6 +233,33 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('filename', self._event_cols(conn, 'skimmed_events'))
         conn.close()
 
+    def test_ensure_db_creates_directory_column_in_read_events(self):
+        conn = self._conn()
+        self.assertIn('directory', self._event_cols(conn, 'read_events'))
+        conn.close()
+
+    def test_ensure_db_creates_directory_column_in_skimmed_events(self):
+        conn = self._conn()
+        self.assertIn('directory', self._event_cols(conn, 'skimmed_events'))
+        conn.close()
+
+    def test_directory_column_defaults_to_downloads_dir(self):
+        # An ad-hoc INSERT (without specifying directory) should pick up the
+        # column's DEFAULT, which embeds DOWNLOADS_SNAPSHOTS_DIR at table
+        # creation time.
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        conn.execute(
+            "INSERT INTO read_events (url, timestamp, filename) VALUES (?, ?, ?)",
+            ('https://example.com', 'ts-read', 'abc.mhtml'),
+        )
+        conn.commit()
+        directory = conn.execute(
+            "SELECT directory FROM read_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
+
     def test_ensure_db_creates_timestamp_index(self):
         conn = self._conn()
         indexes = {r[0] for r in conn.execute(
@@ -363,7 +390,9 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
-    def test_tag_visit_read_stores_filename(self):
+    def test_tag_visit_read_stores_basename_filename(self):
+        # tag_visit should normalize Chrome's relative path to just the basename;
+        # the parent directory lives in the directory column.
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'read', '2026-01-01T12:00:00Z',
@@ -372,7 +401,18 @@ class TestTagVisit(unittest.TestCase):
             "SELECT filename FROM read_events WHERE url = ?", ('https://example.com',)
         ).fetchone()
         conn.close()
-        self.assertEqual(row[0], 'browser-visit-snapshots/abc123.mhtml')
+        self.assertEqual(row[0], 'abc123.mhtml')
+
+    def test_tag_visit_read_records_default_directory(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'read', '2026-01-01T12:00:00Z',
+                       filename='browser-visit-snapshots/abc.mhtml')
+        directory = conn.execute(
+            "SELECT directory FROM read_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
 
     def test_tag_visit_read_increments_visits_read_counter(self):
         conn = self._conn()
@@ -423,7 +463,7 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(row[0], '2026-01-01T12:00:00Z')
 
-    def test_tag_visit_skimmed_stores_filename(self):
+    def test_tag_visit_skimmed_stores_basename_filename(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z',
@@ -432,7 +472,18 @@ class TestTagVisit(unittest.TestCase):
             "SELECT filename FROM skimmed_events WHERE url = ?", ('https://example.com',)
         ).fetchone()
         conn.close()
-        self.assertEqual(row[0], 'browser-visit-snapshots/def456.mhtml')
+        self.assertEqual(row[0], 'def456.mhtml')
+
+    def test_tag_visit_skimmed_records_default_directory(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z',
+                       filename='browser-visit-snapshots/def.mhtml')
+        directory = conn.execute(
+            "SELECT directory FROM skimmed_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
 
     def test_tag_visit_skimmed_increments_visits_skimmed_counter(self):
         conn = self._conn()
@@ -480,6 +531,18 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertFalse(found)
         self.assertEqual(count, 0)
+
+    def test_tag_visit_read_returns_false_when_visit_does_not_exist(self):
+        # Exercises the False branch of `if exists:` in _insert_event: with no
+        # matching visit row, no event row should be inserted and tag_visit
+        # returns False.
+        conn = self._conn()
+        found = host.tag_visit(conn, 'https://nope.com', 'read', 'ts-read',
+                               filename='browser-visit-snapshots/foo.mhtml')
+        event_count = conn.execute('SELECT COUNT(*) FROM read_events').fetchone()[0]
+        conn.close()
+        self.assertFalse(found)
+        self.assertEqual(event_count, 0)
 
     def test_tag_visit_existing_visit_returns_true(self):
         conn = self._conn()
@@ -555,8 +618,11 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
         self.assertTrue(result['of_interest'])       # boolean True (stored as 1)
-        self.assertEqual(result['read'],
-                         [{'timestamp': 'ts-read', 'filename': 'browser-visit-snapshots/abc.mhtml'}])
+        self.assertEqual(result['read'], [
+            {'timestamp': 'ts-read',
+             'filename': 'abc.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+        ])
         self.assertEqual(result['skimmed'], [])       # not skimmed — empty list
 
     def test_query_visit_returns_all_read_events_in_order(self):
@@ -569,8 +635,10 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
         self.assertEqual(result['read'], [
-            {'timestamp': '2026-01-01T10:00:00Z', 'filename': 'browser-visit-snapshots/f1.mhtml'},
-            {'timestamp': '2026-01-02T10:00:00Z', 'filename': 'browser-visit-snapshots/f2.mhtml'},
+            {'timestamp': '2026-01-01T10:00:00Z', 'filename': 'f1.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+            {'timestamp': '2026-01-02T10:00:00Z', 'filename': 'f2.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
         ])
 
     def test_query_visit_returns_all_skimmed_events_in_order(self):
@@ -583,27 +651,47 @@ class TestQueryVisit(unittest.TestCase):
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
         self.assertEqual(result['skimmed'], [
-            {'timestamp': '2026-01-01T10:00:00Z', 'filename': 'browser-visit-snapshots/s1.mhtml'},
-            {'timestamp': '2026-01-02T10:00:00Z', 'filename': 'browser-visit-snapshots/s2.mhtml'},
+            {'timestamp': '2026-01-01T10:00:00Z', 'filename': 's1.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+            {'timestamp': '2026-01-02T10:00:00Z', 'filename': 's2.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
         ])
 
-    def test_query_visit_includes_filename_in_read_events(self):
+    def test_query_visit_includes_basename_filename_in_read_events(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'read', 'ts-read',
                        filename='browser-visit-snapshots/myfile.mhtml')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertEqual(result['read'][0]['filename'], 'browser-visit-snapshots/myfile.mhtml')
+        self.assertEqual(result['read'][0]['filename'], 'myfile.mhtml')
 
-    def test_query_visit_includes_filename_in_skimmed_events(self):
+    def test_query_visit_includes_basename_filename_in_skimmed_events(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
         host.tag_visit(conn, 'https://example.com', 'skimmed', 'ts-skim',
                        filename='browser-visit-snapshots/myfile.pdf')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertEqual(result['skimmed'][0]['filename'], 'browser-visit-snapshots/myfile.pdf')
+        self.assertEqual(result['skimmed'][0]['filename'], 'myfile.pdf')
+
+    def test_query_visit_includes_directory_in_read_events(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'read', 'ts-read',
+                       filename='browser-visit-snapshots/myfile.mhtml')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertEqual(result['read'][0]['directory'], host.DOWNLOADS_SNAPSHOTS_DIR)
+
+    def test_query_visit_includes_directory_in_skimmed_events(self):
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', 'ts-skim',
+                       filename='browser-visit-snapshots/myfile.pdf')
+        result = host.query_visit(conn, 'https://example.com')
+        conn.close()
+        self.assertEqual(result['skimmed'][0]['directory'], host.DOWNLOADS_SNAPSHOTS_DIR)
 
     def test_does_not_return_record_for_different_url(self):
         conn = self._conn()
@@ -1273,7 +1361,7 @@ class TestIntegration(unittest.TestCase):
             self.assertEqual(resp['record']['read'],    [])      # never read → empty list
             self.assertEqual(resp['record']['skimmed'], [])      # never skimmed → empty list
 
-    def test_tag_message_stores_filename_in_read_events(self):
+    def test_tag_message_stores_basename_filename_in_read_events(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
@@ -1283,12 +1371,13 @@ class TestIntegration(unittest.TestCase):
                  'tag': 'read', 'filename': 'browser-visit-snapshots/abc.mhtml'}, tmp)
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             row = conn.execute(
-                'SELECT filename FROM read_events WHERE url = ?', (url,)
+                'SELECT filename, directory FROM read_events WHERE url = ?', (url,)
             ).fetchone()
             conn.close()
-        self.assertEqual(row[0], 'browser-visit-snapshots/abc.mhtml')
+        self.assertEqual(row[0], 'abc.mhtml')
+        self.assertEqual(row[1], host.DOWNLOADS_SNAPSHOTS_DIR)
 
-    def test_tag_message_stores_filename_in_skimmed_events(self):
+    def test_tag_message_stores_basename_filename_in_skimmed_events(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
@@ -1298,12 +1387,13 @@ class TestIntegration(unittest.TestCase):
                  'tag': 'skimmed', 'filename': 'browser-visit-snapshots/def.pdf'}, tmp)
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
             row = conn.execute(
-                'SELECT filename FROM skimmed_events WHERE url = ?', (url,)
+                'SELECT filename, directory FROM skimmed_events WHERE url = ?', (url,)
             ).fetchone()
             conn.close()
-        self.assertEqual(row[0], 'browser-visit-snapshots/def.pdf')
+        self.assertEqual(row[0], 'def.pdf')
+        self.assertEqual(row[1], host.DOWNLOADS_SNAPSHOTS_DIR)
 
-    def test_query_returns_filename_in_read_event(self):
+    def test_query_returns_filename_and_directory_in_read_event(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
@@ -1313,7 +1403,8 @@ class TestIntegration(unittest.TestCase):
                  'tag': 'read', 'filename': 'browser-visit-snapshots/snap.mhtml'}, tmp)
             resp = self._invoke({'action': 'query', 'url': url}, tmp)
         self.assertEqual(resp['record']['read'], [
-            {'timestamp': 'ts-read', 'filename': 'browser-visit-snapshots/snap.mhtml'},
+            {'timestamp': 'ts-read', 'filename': 'snap.mhtml',
+             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
         ])
 
     def test_query_does_not_write_log(self):
