@@ -32,6 +32,7 @@ delete the manifest first.
 """
 
 import argparse
+import datetime
 import logging
 import os
 import sqlite3
@@ -73,6 +74,23 @@ def _resolve_target(directory_arg: str) -> str:
     return os.path.join(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, directory_arg)
 
 
+def _extract_date_key(target: str) -> 'str | None':
+    """Return target's basename if it's a valid YYYY-MM-DD date, else None.
+
+    The snapshots table is keyed by date, so only date-named directories
+    yield a row.  Manually sealing a non-date-named directory still writes
+    the manifest but leaves the table untouched.
+    """
+    base = os.path.basename(os.path.normpath(target))
+    if not snapshot_mover._DATE_DIR_RE.match(base):
+        return None
+    try:
+        datetime.date.fromisoformat(base)
+    except ValueError:
+        return None
+    return base
+
+
 def cli(argv=None) -> int:
     """Parse argv, apply overrides, seal one directory.  Returns an exit code."""
     args = _parse_args(argv)
@@ -102,7 +120,12 @@ def cli(argv=None) -> int:
 
     conn = sqlite3.connect(snapshot_mover.DB_FILE)
     try:
-        snapshot_mover._seal_directory(conn, target, dry_run=args.dry_run)
+        snapshot_mover._ensure_snapshots_table(conn)
+        snapshot_mover._seal_directory(
+            conn, target,
+            dry_run=args.dry_run,
+            date_key=_extract_date_key(target),
+        )
     finally:
         conn.close()
     return 0

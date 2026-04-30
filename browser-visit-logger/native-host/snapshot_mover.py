@@ -12,7 +12,9 @@ Algorithm
 ---------
 1. mkdir -p ICLOUD_SNAPSHOTS_DIR.
 2. Open the SQLite database.
-3. Move pass — scan the Downloads directory for snapshot files:
+3. Ensure the `snapshots` table exists (one row per daily directory the
+   mover has ever created; stores its sealed flag).
+4. Move pass — scan the Downloads directory for snapshot files:
      For each file whose name matches the snapshot format
      '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' and whose mtime is at least
      MIN_AGE_SECONDS old:
@@ -22,20 +24,28 @@ Algorithm
        d. os.chmod(dest, 0o444)               — make archived copy read-only
        e. UPDATE {read,skimmed}_events SET directory = <date_subdir>
           WHERE filename = <this file> AND directory = DOWNLOADS_SNAPSHOTS_DIR
-       f. commit()
-       g. source.unlink()
-4. Seal pass — for each ICLOUD_SNAPSHOTS_DIR/<YYYY-MM-DD>/ subdir whose date
-   is strictly before today (UTC) and which doesn't already contain a
-   MANIFEST.tsv file:
-       a. List every snapshot file in the directory.
-       b. For each file, look up its row in read_events / skimmed_events
-          (joined with visits for the page title).
-       c. Write a tab-delimited MANIFEST.tsv with one header row and one
-          data row per file (filename, tag, timestamp, url, title).
-          Files with no DB row appear with empty metadata fields.
-       d. chmod the manifest to 0o444 (read-only).  The presence of the
-          manifest marks the directory sealed; subsequent runs skip it.
-5. Close the DB.
+       f. INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (<date>, 0)
+       g. commit()
+       h. source.unlink()
+       i. Straggler handling — if the snapshots row for <date> was already
+          sealed=1 before step (f), the file is a straggler arriving after
+          the day was sealed.  Remove the existing read-only manifest and
+          rewrite it so it now includes the just-moved file.  The sealed
+          flag stays 1.
+5. Seal pass — DB-driven (no filesystem rescan):
+     SELECT date FROM snapshots WHERE sealed = 0 AND date < today_utc.
+     For each row:
+       a. Verify ICLOUD_SNAPSHOTS_DIR/<date>/ exists; warn and skip if not.
+       b. If MANIFEST.tsv already exists (recovery from a partial prior
+          seal that crashed between the file write and the DB update),
+          leave the file alone.
+          Otherwise: list every file in the directory, look up its row in
+          read_events / skimmed_events (joined with visits for the page
+          title), write a tab-delimited MANIFEST.tsv (header + one data
+          row per file: filename, tag, timestamp, url, title), and chmod
+          it 0o444.  Files with no DB row appear with empty metadata.
+       c. UPDATE snapshots SET sealed = 1 WHERE date = <date>.
+6. Close the DB.
 
 The filesystem scan (rather than a DB query) means that any file left in
 Downloads by a failed prior run is automatically retried — no special
@@ -114,8 +124,9 @@ MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '60'))
 EVENTS_TABLES = ('read_events', 'skimmed_events')
 
 # Name of the per-directory manifest file written by the seal pass.
-# Its presence marks the directory sealed; the seal pass skips dirs that
-# already contain it.
+# Its presence on disk marks the directory sealed; combined with the
+# `snapshots` table it provides redundancy that lets a partial-seal
+# crash recover on the next run.
 MANIFEST_FILENAME = 'MANIFEST.tsv'
 
 # Header columns of the manifest (must stay in sync with _build_manifest_rows).
@@ -123,6 +134,31 @@ _MANIFEST_HEADER = ('filename', 'tag', 'timestamp', 'url', 'title')
 
 # Matches the daily snapshot subdir name (UTC date, ISO format).
 _DATE_DIR_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+# ---------------------------------------------------------------------------
+# Schema for the `snapshots` table — owned by the mover/sealer, not host.py.
+#
+# One row per daily snapshot directory the mover has ever created.  The
+# move pass inserts a row (sealed=0) whenever a file lands in a new daily
+# dir; the seal pass (and the manual sealer) flip sealed=1 once the
+# directory's MANIFEST.tsv has been written.  The seal pass uses this
+# table to avoid rescanning the iCloud filesystem on every sweep.
+# ---------------------------------------------------------------------------
+
+def _ensure_snapshots_table(conn: sqlite3.Connection) -> None:
+    """Create the snapshots table if it doesn't already exist.
+
+    Called by main() and by snapshot_sealer.cli() so the table is present
+    even on the very first invocation against an existing DB.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            date   TEXT PRIMARY KEY,         -- 'YYYY-MM-DD' (UTC)
+            sealed INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
 
 logging.basicConfig(
     stream=sys.stderr,
@@ -195,10 +231,30 @@ def _move_one(
                 f" WHERE filename = ? AND directory = ?",
                 (date_subdir, filename, DOWNLOADS_SNAPSHOTS_DIR),
             )
+        # (e) Detect a "straggler": a file whose date maps to a directory
+        #     whose snapshots row already says sealed=1.  We need to know
+        #     this *before* the INSERT OR IGNORE below, since that statement
+        #     no-ops on an existing row and so can't tell us the prior state.
+        prev = conn.execute(
+            "SELECT sealed FROM snapshots WHERE date = ?", (date_str,),
+        ).fetchone()
+        is_straggler = prev is not None and prev[0] == 1
+        # (f) Track the (possibly new) daily directory in the snapshots table.
+        #     INSERT OR IGNORE preserves any existing row — including a row
+        #     that's already sealed=1, so a straggler doesn't reopen a sealed
+        #     day; the manifest is rewritten in step (i) instead.
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
+            (date_str,),
+        )
         conn.commit()
-        # (e) Remove the original.
+        # (g) Remove the original.
         os.unlink(source)
         logger.info('Moved %s -> %s (read-only)', source, dest)
+        # (h) If this was a straggler, rebuild the manifest so it includes
+        #     the just-moved file.  Sealed flag stays 1.
+        if is_straggler:
+            _rewrite_manifest_for_straggler(conn, date_subdir)
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to move %s: %s', source, exc)
 
@@ -218,43 +274,52 @@ def _tsv_sanitise(s: str) -> str:
 
 
 def _seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
-    """Seal every daily snapshot directory whose UTC date is strictly before
-    today and which doesn't already contain a MANIFEST.tsv.
+    """Seal every snapshots-table row whose date is strictly before today (UTC)
+    and whose `sealed` flag is still 0.
 
-    A "sealed" directory is one with a tab-delimited manifest summarising its
-    contents.  The presence of the manifest is itself the sealed marker, so
-    the pass is idempotent: re-runs over a sealed directory are a no-op.
+    Driven entirely by the database — no filesystem rescan.  The mover's
+    move pass keeps the table in sync with the on-disk daily directories
+    by inserting a row each time it creates one.
     """
-    if not os.path.isdir(ICLOUD_SNAPSHOTS_DIR):
-        return
-
     today = _today_utc()
-    for entry in sorted(os.listdir(ICLOUD_SNAPSHOTS_DIR)):
-        date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, entry)
+    rows = conn.execute(
+        "SELECT date FROM snapshots WHERE sealed = 0 AND date < ? ORDER BY date",
+        (today.isoformat(),),
+    ).fetchall()
+    for (date_str,) in rows:
+        date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, date_str)
         if not os.path.isdir(date_subdir):
+            # The DB says this day exists but the directory is gone (e.g. user
+            # manually deleted it).  Skip with a warning rather than failing.
+            logger.warning(
+                'snapshots row %s has no on-disk directory at %s; skipping',
+                date_str, date_subdir,
+            )
             continue
-        if not _DATE_DIR_RE.match(entry):
-            continue
-        try:
-            dir_date = datetime.date.fromisoformat(entry)
-        except ValueError:
-            # Regex matched but not a real calendar date (e.g. '9999-99-99').
-            continue
-        if dir_date >= today:
-            # Today or future — more files might still arrive; don't seal yet.
-            continue
-        if os.path.exists(os.path.join(date_subdir, MANIFEST_FILENAME)):
-            continue
-        _seal_directory(conn, date_subdir, dry_run=dry_run)
+        _seal_directory(conn, date_subdir, dry_run=dry_run, date_key=date_str)
 
 
 def _seal_directory(
-    conn: sqlite3.Connection, date_subdir: str, dry_run: bool = False,
+    conn: sqlite3.Connection,
+    date_subdir: str,
+    dry_run: bool = False,
+    date_key: 'str | None' = None,
 ) -> None:
-    """Write a read-only MANIFEST.tsv listing every snapshot file in the directory.
+    """Write a read-only MANIFEST.tsv listing every snapshot file in the dir,
+    then mark the directory's snapshots-table row as sealed.
 
-    Used by both the automatic seal pass and the manual snapshot_sealer.py CLI.
-    Errors writing or chmod'ing the manifest are logged but don't propagate.
+    date_key, when given, is the YYYY-MM-DD primary key of the snapshots row
+    to flip to sealed=1.  The auto seal pass always passes it; the manual
+    sealer passes it only when the directory's basename is itself a valid
+    date (so non-date directories get a manifest but no DB row).
+
+    Crash-safety: if the manifest already exists but the DB row is still
+    sealed=0 (a prior run that crashed between the file write and the DB
+    update), don't rewrite the manifest — the file is already correct and
+    is now read-only.  Just flip the flag.
+
+    Errors writing/chmod'ing the manifest, or updating the DB, are logged
+    but do not propagate.
     """
     manifest_path = os.path.join(date_subdir, MANIFEST_FILENAME)
 
@@ -263,15 +328,78 @@ def _seal_directory(
         return
 
     try:
-        rows = _build_manifest_rows(conn, date_subdir)
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            f.write('\t'.join(_MANIFEST_HEADER) + '\n')
-            for row in rows:
-                f.write('\t'.join(row) + '\n')
-        os.chmod(manifest_path, 0o444)
-        logger.info('Sealed %s (%d entries)', date_subdir, len(rows))
+        if os.path.exists(manifest_path):
+            # Recovery branch: a prior run wrote the manifest but didn't update
+            # the DB.  The manifest is read-only and shouldn't be rewritten —
+            # treat its presence as authoritative and just sync the DB.
+            logger.info('Manifest already exists at %s; marking sealed',
+                        date_subdir)
+        else:
+            count = _write_manifest_file(conn, date_subdir)
+            logger.info('Sealed %s (%d entries)', date_subdir, count)
+        if date_key is not None:
+            # Upsert: the auto seal pass always finds an existing row (the
+            # mover inserted it).  The manual sealer may not — e.g. if the
+            # user is sealing a directory imported from elsewhere — so we
+            # tolerate the no-row case by inserting first.
+            conn.execute(
+                "INSERT INTO snapshots (date, sealed) VALUES (?, 1) "
+                "ON CONFLICT(date) DO UPDATE SET sealed = 1",
+                (date_key,),
+            )
+            conn.commit()
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to seal %s: %s', date_subdir, exc)
+
+
+def _write_manifest_file(
+    conn: sqlite3.Connection, date_subdir: str,
+) -> int:
+    """Build, write, and chmod 0o444 the manifest in date_subdir.
+
+    Returns the number of data rows written (excluding the header).  Removes
+    any existing manifest first so we can write over a previously read-only
+    file (`open(..., 'w')` can't truncate a 0o444 file).  Caller is
+    responsible for catching OSError / sqlite3.Error.
+    """
+    manifest_path = os.path.join(date_subdir, MANIFEST_FILENAME)
+    if os.path.exists(manifest_path):
+        os.unlink(manifest_path)
+    rows = _build_manifest_rows(conn, date_subdir)
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        f.write('\t'.join(_MANIFEST_HEADER) + '\n')
+        for row in rows:
+            f.write('\t'.join(row) + '\n')
+    os.chmod(manifest_path, 0o444)
+    return len(rows)
+
+
+def _rewrite_manifest_for_straggler(
+    conn: sqlite3.Connection, date_subdir: str,
+) -> None:
+    """Rewrite the manifest after a straggler file was moved into a directory
+    whose snapshots row was already sealed=1.
+
+    Called by _move_one after a successful move + DB commit.  The directory's
+    sealed flag stays 1 — the dir is still sealed, just with a refreshed
+    manifest that includes the new file.
+
+    Errors are logged but never propagate: the file move and DB update have
+    already committed; a stale manifest is recoverable manually with
+    snapshot_sealer.py.
+    """
+    manifest_path = os.path.join(date_subdir, MANIFEST_FILENAME)
+    try:
+        count = _write_manifest_file(conn, date_subdir)
+        logger.info(
+            'Rewrote %s after straggler arrival (%d entries)',
+            manifest_path, count,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.error(
+            'Failed to rewrite %s after straggler arrival: %s',
+            manifest_path, exc,
+        )
 
 
 def _build_manifest_rows(
@@ -341,6 +469,7 @@ def main(dry_run: bool = False) -> None:
 
     conn = sqlite3.connect(DB_FILE)
     try:
+        _ensure_snapshots_table(conn)
         _move_pass(conn, dry_run=dry_run)
         _seal_pass(conn, dry_run=dry_run)
     finally:

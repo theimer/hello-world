@@ -74,7 +74,18 @@ read_events / skimmed_events (
     directory TEXT NOT NULL DEFAULT '<Downloads dir>',
     PRIMARY KEY (url, timestamp)
 )
+
+snapshots (
+    date   TEXT PRIMARY KEY,                   -- 'YYYY-MM-DD' (UTC)
+    sealed INTEGER NOT NULL DEFAULT 0          -- 0 = unsealed, 1 = sealed
+)
 ```
+
+The `visits` / `*_events` tables are owned by `host.py`; the `snapshots`
+table is owned by the mover and sealer. The mover INSERTs a row
+(`sealed=0`) the first time it places a file in a new daily directory;
+the seal pass and the manual sealer flip `sealed=1`. The seal pass
+queries this table to find work — no filesystem rescan needed.
 
 ---
 
@@ -205,13 +216,22 @@ Flags:
 1. **Move pass** — for every file in `~/Downloads/browser-visit-snapshots/`
    matching the snapshot filename format and at least `MIN_AGE_SECONDS`
    old: copy it to `<dest>/<YYYY-MM-DD>/`, chmod read-only, update the
-   `directory` column in the DB, then unlink the source. Crash-safe and
-   idempotent — interrupted runs are recovered on the next tick.
-2. **Seal pass** — for every `<dest>/<YYYY-MM-DD>/` whose date is
-   strictly before today (UTC) and which doesn't already have a
-   `MANIFEST.tsv`: write a tab-delimited manifest enumerating its
-   contents, chmod it `0o444`. Once written, the manifest's existence
-   marks the directory sealed; later runs skip it.
+   `directory` column in `read_events`/`skimmed_events`, and
+   `INSERT OR IGNORE` a `(date, sealed=0)` row into the `snapshots`
+   table; then unlink the source. **Straggler handling:** if the
+   destination day's `snapshots` row was already `sealed=1`, the
+   existing read-only `MANIFEST.tsv` is removed and rewritten to
+   include the just-moved file (sealed flag stays 1, manifest stays
+   `0o444`). Crash-safe and idempotent — interrupted runs are
+   recovered on the next tick.
+2. **Seal pass** — DB-driven, no filesystem rescan. Queries
+   `snapshots WHERE sealed = 0 AND date < today_utc`. For each row:
+   verifies the on-disk directory exists (warns and skips if not),
+   writes a tab-delimited `MANIFEST.tsv` enumerating the directory's
+   contents, chmods it `0o444`, then flips `sealed = 1`. If the
+   manifest already exists (recovery from a partial prior seal that
+   crashed before the DB update), the file is left untouched and only
+   the DB flag is flipped.
 
 ### `native-host/snapshot_sealer.py`
 
@@ -245,6 +265,11 @@ Flags:
 
 Refuses to overwrite an existing manifest (exit code 1). To re-seal,
 delete the manifest first.
+
+If the directory's basename is a valid `YYYY-MM-DD` date, the sealer
+also upserts a `(date, sealed=1)` row into the `snapshots` table — so
+the auto seal pass won't re-process it. Non-date-named directories
+get a manifest but no table row.
 
 **Manifest format** — `MANIFEST.tsv`, one header row + one row per file:
 

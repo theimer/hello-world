@@ -34,8 +34,10 @@ class _SealerTestBase(unittest.TestCase):
         os.makedirs(self.dest_dir)
 
         # Initialize DB schema so sealing has somewhere to look up rows.
+        # The snapshots table is owned by snapshot_mover, not host.
         conn = sqlite3.connect(self.db_file)
         host.ensure_db(conn)
+        snapshot_mover._ensure_snapshots_table(conn)
         conn.close()
 
         # Save and later restore snapshot_mover module-level state that the
@@ -202,6 +204,94 @@ class TestResolveTarget(unittest.TestCase):
         # Once any path separator appears, treat as a path and don't reroot.
         self.assertEqual(snapshot_sealer._resolve_target('rel/2024-01-15'),
                          'rel/2024-01-15')
+
+
+# ---------------------------------------------------------------------------
+# _extract_date_key — used to decide whether to update the snapshots table
+# ---------------------------------------------------------------------------
+class TestExtractDateKey(unittest.TestCase):
+
+    def test_returns_basename_for_valid_date_directory(self):
+        self.assertEqual(snapshot_sealer._extract_date_key('/x/y/2024-01-15'),
+                         '2024-01-15')
+
+    def test_returns_basename_when_path_has_trailing_slash(self):
+        # os.path.normpath strips trailing separators before basename().
+        self.assertEqual(snapshot_sealer._extract_date_key('/x/y/2024-01-15/'),
+                         '2024-01-15')
+
+    def test_returns_none_for_non_date_basename(self):
+        self.assertIsNone(snapshot_sealer._extract_date_key('/x/y/notes'))
+
+    def test_returns_none_for_date_lookalike_that_isnt_a_real_date(self):
+        # Regex matches but the date is invalid.
+        self.assertIsNone(snapshot_sealer._extract_date_key('/x/y/9999-99-99'))
+
+
+# ---------------------------------------------------------------------------
+# Sealer's snapshots-table interaction
+# ---------------------------------------------------------------------------
+class TestSealerSnapshotsTable(_SealerTestBase):
+
+    def _snapshots_row(self, date_str):
+        conn = sqlite3.connect(self.db_file)
+        try:
+            return conn.execute(
+                "SELECT date, sealed FROM snapshots WHERE date = ?",
+                (date_str,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_sealing_a_date_directory_marks_table_row_sealed(self):
+        # Pre-seed an unsealed row (as the mover would have done) and verify
+        # the sealer flips it to sealed=1.
+        self._make_dir('2024-01-15')
+        conn = sqlite3.connect(self.db_file)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", ('2024-01-15',))
+        conn.commit()
+        conn.close()
+        rc = snapshot_sealer.cli([
+            '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15',
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
+
+    def test_sealing_inserts_new_row_when_table_has_none(self):
+        # Manual sealer is run on a date directory that the mover never
+        # tracked (e.g. imported from elsewhere) — the upsert in
+        # _seal_directory should create the row with sealed=1.
+        self._make_dir('2024-01-15')
+        rc = snapshot_sealer.cli([
+            '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15',
+        ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
+
+    def test_dry_run_does_not_touch_snapshots_table(self):
+        self._make_dir('2024-01-15')
+        snapshot_sealer.cli([
+            '--db', self.db_file, '--dest', self.dest_dir,
+            '--dry-run', '2024-01-15',
+        ])
+        self.assertIsNone(self._snapshots_row('2024-01-15'))
+
+    def test_non_date_directory_is_sealed_but_not_recorded_in_table(self):
+        # Manual sealer accepts any directory; only YYYY-MM-DD basenames
+        # warrant a snapshots-table row.
+        target = os.path.join(self.tmp.name, 'misc-dir')
+        os.makedirs(target)
+        rc = snapshot_sealer.cli(['--db', self.db_file, target])
+        self.assertEqual(rc, 0)
+        # Manifest written
+        self.assertTrue(os.path.exists(
+            os.path.join(target, snapshot_mover.MANIFEST_FILENAME)))
+        # No row inserted (basename isn't a date)
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
 
 if __name__ == '__main__':  # pragma: no cover

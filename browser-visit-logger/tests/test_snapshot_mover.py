@@ -76,6 +76,7 @@ class _MoverTestBase(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_file)
         host.ensure_db(conn)
+        snapshot_mover._ensure_snapshots_table(conn)
         conn.close()
 
     # -- helpers --
@@ -227,6 +228,169 @@ class TestMovePass(_MoverTestBase):
 
         self.assertFalse(os.path.exists(src))
         self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
+
+    def test_move_pass_inserts_snapshots_row_for_new_date(self):
+        # Moving a file into a new daily directory should also INSERT OR IGNORE
+        # a row into the snapshots table so the seal pass can find it later.
+        # Drive _move_pass directly (rather than main()) so the seal pass
+        # doesn't immediately flip sealed=0 to 1 in the same call.
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+            row = conn.execute(
+                "SELECT date, sealed FROM snapshots WHERE date = ?",
+                (ISO_TS1[:10],),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (ISO_TS1[:10], 0))
+
+    def test_move_pass_does_not_duplicate_snapshots_row(self):
+        # Two files for the same UTC date should yield exactly one snapshots
+        # row (PRIMARY KEY + INSERT OR IGNORE).
+        self._make_event('read_events',    'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        self._make_event('skimmed_events', 'https://b.com', ISO_TS2, 'b.mhtml',
+                         age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+            count = conn.execute(
+                "SELECT COUNT(*) FROM snapshots WHERE date = ?", (ISO_TS1[:10],)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_straggler_rewrites_manifest_to_include_new_file(self):
+        # Pre-condition: a sealed daily dir on disk + DB, with one prior file
+        # and a manifest listing only that file.
+        date_str = ISO_TS1[:10]
+        date_subdir = os.path.join(self.dest_dir, date_str)
+        os.makedirs(date_subdir)
+        pre_existing = _snap(ISO_TS1, 'old.mhtml')
+        Path(date_subdir, pre_existing).write_bytes(b'old')
+        os.chmod(os.path.join(date_subdir, pre_existing), 0o444)
+
+        conn = sqlite3.connect(self.db_file)
+        host.insert_visit(conn, 'ts-visit', 'https://old.com', 'Old Page')
+        conn.execute(
+            "INSERT INTO read_events (url, timestamp, filename, directory) "
+            "VALUES (?, ?, ?, ?)",
+            ('https://old.com', ISO_TS1, pre_existing, date_subdir),
+        )
+        manifest_path = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        Path(manifest_path).write_text(
+            'filename\ttag\ttimestamp\turl\ttitle\n'
+            f'{pre_existing}\tread\t{ISO_TS1}\thttps://old.com\tOld Page\n',
+            encoding='utf-8',
+        )
+        os.chmod(manifest_path, 0o444)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)", (date_str,))
+        conn.commit()
+        conn.close()
+
+        # A straggler shows up in Downloads with a date prefix matching the
+        # already-sealed day.
+        self._make_event('read_events', 'https://new.com', ISO_TS1, 'new.mhtml',
+                         age_seconds=700)
+
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+        finally:
+            conn.close()
+
+        new_filename = _snap(ISO_TS1, 'new.mhtml')
+        # Both files are present in the date dir.
+        self.assertTrue(os.path.exists(os.path.join(date_subdir, pre_existing)))
+        self.assertTrue(os.path.exists(os.path.join(date_subdir, new_filename)))
+        # Manifest now lists the new file in addition to the old one.
+        manifest = Path(manifest_path).read_text(encoding='utf-8')
+        self.assertIn(pre_existing, manifest)
+        self.assertIn(new_filename, manifest)
+        # Manifest stayed read-only after the rewrite.
+        self.assertEqual(os.stat(manifest_path).st_mode & 0o777, 0o444)
+        # Sealed flag is still 1 — the day stays sealed, just with a fresh
+        # manifest reflecting the new file.
+        conn = sqlite3.connect(self.db_file)
+        sealed = conn.execute(
+            "SELECT sealed FROM snapshots WHERE date = ?", (date_str,)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(sealed, 1)
+
+    def test_non_straggler_move_does_not_write_manifest(self):
+        # When the snapshots row is sealed=0 (or absent), the move pass
+        # must not pre-emptively create a manifest — that's the seal pass's job.
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+        finally:
+            conn.close()
+        manifest = os.path.join(self.dest_dir, ISO_TS1[:10],
+                                snapshot_mover.MANIFEST_FILENAME)
+        self.assertFalse(os.path.exists(manifest))
+
+    def test_straggler_rewrite_failure_is_logged_and_does_not_undo_move(self):
+        # If rewriting the manifest fails (e.g. disk full), the file move
+        # has already committed and must stay; only an ERROR log is emitted.
+        date_str = ISO_TS1[:10]
+        conn = sqlite3.connect(self.db_file)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)", (date_str,))
+        conn.commit()
+        conn.close()
+
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
+                         age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+
+        with patch.object(snapshot_mover, '_write_manifest_file',
+                          side_effect=OSError('disk full')), \
+             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            conn = sqlite3.connect(self.db_file)
+            try:
+                snapshot_mover._move_pass(conn)
+            finally:
+                conn.close()
+
+        self.assertTrue(any('Failed to rewrite' in m for m in cm.output))
+        moved = os.path.join(self.dest_dir, date_str, _snap(ISO_TS1, 'a.mhtml'))
+        self.assertTrue(os.path.exists(moved))
+
+    def test_move_pass_preserves_sealed_flag_on_late_arrival(self):
+        # If a late file arrives for an already-sealed day, INSERT OR IGNORE
+        # must not flip sealed=1 back to 0.
+        conn = sqlite3.connect(self.db_file)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
+            (ISO_TS1[:10],),
+        )
+        conn.commit()
+        conn.close()
+
+        self._make_event('read_events', 'https://a.com', ISO_TS1, 'late.mhtml',
+                         age_seconds=700)
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            snapshot_mover._move_pass(conn)
+            sealed = conn.execute(
+                "SELECT sealed FROM snapshots WHERE date = ?", (ISO_TS1[:10],)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(sealed, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -389,17 +553,28 @@ class TestSealPass(_MoverTestBase):
 
     # -- helpers --
 
-    def _seed_dir(self, date_str, files=()):
-        """Create dest_dir/<date_str>/ with the given files.
+    def _seed_dir(self, date_str, files=(), seed_snapshots_row=True, sealed=0):
+        """Create dest_dir/<date_str>/ on disk and (by default) insert a
+        matching row into the snapshots table.
 
         files is an iterable of (filename, table, url, ts, title) tuples.
         Pass table=None to leave a file with no DB row.  Returns the absolute
         path of the seeded date subdir.
+
+        seed_snapshots_row=False simulates a directory that exists on disk
+        but isn't tracked by the table (e.g. a directory imported from
+        elsewhere); the auto seal pass should never touch it.
         """
         date_subdir = os.path.join(self.dest_dir, date_str)
         os.makedirs(date_subdir, exist_ok=True)
         conn = sqlite3.connect(self.db_file)
         try:
+            if seed_snapshots_row:
+                conn.execute(
+                    "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, ?)",
+                    (date_str, sealed),
+                )
+                conn.commit()
             for filename, table, url, ts, title in files:
                 Path(date_subdir, filename).write_bytes(b'data')
                 if table is None:
@@ -414,6 +589,17 @@ class TestSealPass(_MoverTestBase):
         finally:
             conn.close()
         return date_subdir
+
+    def _snapshots_row(self, date_str):
+        """Return the (date, sealed) row for date_str, or None."""
+        conn = sqlite3.connect(self.db_file)
+        try:
+            return conn.execute(
+                "SELECT date, sealed FROM snapshots WHERE date = ?",
+                (date_str,),
+            ).fetchone()
+        finally:
+            conn.close()
 
     def _read_manifest(self, date_str):
         return Path(self.dest_dir, date_str,
@@ -515,14 +701,18 @@ class TestSealPass(_MoverTestBase):
         self.assertEqual(lines[1].split('\t'),
                          ['2024-01-15T10-00-00Z-orphan.mhtml', '', '', '', ''])
 
-    def test_seal_skipped_when_manifest_already_exists(self):
+    def test_recovery_preserves_existing_manifest_and_marks_sealed(self):
+        # Crash-recovery branch: a prior run wrote the manifest but didn't
+        # update the DB.  The seal pass must not rewrite the (read-only)
+        # manifest — it should leave the file alone and just flip sealed=1.
         date_subdir = self._seed_dir('2024-01-15')
         manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
         Path(manifest).write_text('preexisting\n', encoding='utf-8')
         snapshot_mover.main()
-        # Untouched
         self.assertEqual(Path(manifest).read_text(encoding='utf-8'),
                          'preexisting\n')
+        # DB row was updated even though the file write was skipped.
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
 
     def test_seal_processes_multiple_past_directories(self):
         d1 = self._seed_dir('2024-01-10')
@@ -531,27 +721,6 @@ class TestSealPass(_MoverTestBase):
         for d in (d1, d2):
             self.assertTrue(os.path.exists(
                 os.path.join(d, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_seal_ignores_non_directory_entries_at_icloud_root(self):
-        # A stray file at the iCloud root must not crash the seal pass.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        Path(self.dest_dir, 'stray-file.txt').write_text('x', encoding='utf-8')
-        snapshot_mover.main()  # must not raise
-
-    def test_seal_ignores_subdirs_with_non_date_names(self):
-        bogus = os.path.join(self.dest_dir, 'not-a-date')
-        os.makedirs(bogus)
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(bogus, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_seal_ignores_date_lookalike_dirs_that_arent_real_dates(self):
-        # Regex matches but datetime.date.fromisoformat rejects '9999-99-99'.
-        bogus = os.path.join(self.dest_dir, '9999-99-99')
-        os.makedirs(bogus)
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(bogus, snapshot_mover.MANIFEST_FILENAME)))
 
     def test_dry_run_does_not_write_manifest(self):
         date_subdir = self._seed_dir('2024-01-15')
@@ -604,17 +773,52 @@ class TestSealPass(_MoverTestBase):
             snapshot_mover.main()
         self.assertTrue(any('Failed to seal' in m for m in cm.output))
 
-    def test_seal_pass_noop_when_icloud_dir_absent(self):
-        # If main() is bypassed and _seal_pass is called directly with no
-        # iCloud dir, it must not raise.  (main() always makedirs first; this
-        # test exercises the early-return guard inside _seal_pass itself.
-        # _MoverTestBase doesn't pre-create dest_dir, so it's already absent.)
-        self.assertFalse(os.path.isdir(self.dest_dir))
+    # ----------------------------------------------------------------------
+    # snapshots-table behaviour
+    # ----------------------------------------------------------------------
+
+    def test_seal_pass_marks_db_row_sealed(self):
+        self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
+
+    def test_seal_pass_skips_already_sealed_rows(self):
+        # An already-sealed row should be left alone — no manifest is created
+        # (no file write attempted) and the DB row stays sealed=1.
+        date_subdir = self._seed_dir('2024-01-15', sealed=1)
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
+
+    def test_seal_pass_does_not_touch_directories_not_in_snapshots_table(self):
+        # A directory that exists on disk but has no snapshots-table row is
+        # never sealed by the auto pass — the table is the source of truth.
+        date_subdir = self._seed_dir('2024-01-15', seed_snapshots_row=False)
+        snapshot_mover.main()
+        self.assertFalse(os.path.exists(
+            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
+
+    def test_seal_pass_warns_when_row_directory_is_missing(self):
+        # Insert a row for a date whose directory doesn't exist on disk.
+        # The pass should log a warning, leave the row alone, and not crash.
+        os.makedirs(self.dest_dir, exist_ok=True)
         conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._seal_pass(conn)   # must not raise
-        finally:
-            conn.close()
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", ('2024-01-15',))
+        conn.commit()
+        conn.close()
+        with self.assertLogs(snapshot_mover.logger, level='WARNING') as cm:
+            snapshot_mover.main()
+        self.assertTrue(any('no on-disk directory' in m for m in cm.output))
+        # Row remains unsealed (we couldn't seal the missing directory).
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
+
+    def test_seal_pass_with_empty_snapshots_table_is_noop(self):
+        # No rows → no work, no errors, no manifest writes.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        snapshot_mover.main()  # must not raise
+        self.assertEqual(os.listdir(self.dest_dir), [])
 
 
 class TestTodayUtc(unittest.TestCase):
@@ -622,6 +826,61 @@ class TestTodayUtc(unittest.TestCase):
 
     def test_returns_a_date_object(self):
         self.assertIsInstance(snapshot_mover._today_utc(), datetime.date)
+
+
+# ---------------------------------------------------------------------------
+# snapshots-table schema
+# ---------------------------------------------------------------------------
+class TestSnapshotsTableSchema(unittest.TestCase):
+
+    def _conn(self):
+        conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_snapshots_table(conn)
+        return conn
+
+    def _cols(self, conn):
+        return {r[1] for r in conn.execute('PRAGMA table_info(snapshots)')}
+
+    def test_creates_snapshots_table(self):
+        conn = self._conn()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        conn.close()
+        self.assertIn('snapshots', tables)
+
+    def test_has_date_column(self):
+        conn = self._conn()
+        self.assertIn('date', self._cols(conn))
+        conn.close()
+
+    def test_has_sealed_column(self):
+        conn = self._conn()
+        self.assertIn('sealed', self._cols(conn))
+        conn.close()
+
+    def test_date_is_primary_key(self):
+        conn = self._conn()
+        pk_cols = {r[1] for r in conn.execute('PRAGMA table_info(snapshots)') if r[5] == 1}
+        conn.close()
+        self.assertEqual(pk_cols, {'date'})
+
+    def test_sealed_defaults_to_zero(self):
+        conn = self._conn()
+        conn.execute("INSERT INTO snapshots (date) VALUES (?)", ('2024-01-15',))
+        conn.commit()
+        sealed = conn.execute(
+            "SELECT sealed FROM snapshots WHERE date = ?", ('2024-01-15',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(sealed, 0)
+
+    def test_is_idempotent(self):
+        conn = sqlite3.connect(':memory:')
+        snapshot_mover._ensure_snapshots_table(conn)
+        snapshot_mover._ensure_snapshots_table(conn)  # must not raise
+        self.assertIn('date', self._cols(conn))
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
