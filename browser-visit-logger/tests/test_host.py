@@ -108,24 +108,31 @@ class TestWriteMessage(unittest.TestCase):
 # Log file (append_log)
 # ---------------------------------------------------------------------------
 
+FIXED_REC_ID = '0' * 32  # placeholder UUID hex; tests assert on field positions
+
+
 class TestAppendLog(unittest.TestCase):
 
-    def _run(self, timestamp, url, title, tag='') -> str:
+    def _run(self, timestamp, url, title, tag='', filename='',
+             record_id=FIXED_REC_ID) -> str:
         """Call append_log with a temp file and return its contents."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'visits.log')
             with patch.object(host, 'LOG_FILE', path):
-                host.append_log(timestamp, url, title, tag)
+                host.append_log(record_id, timestamp, url, title, tag, filename)
             return Path(path).read_text(encoding='utf-8')
 
     def test_tsv_format(self):
         content = self._run('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain')
-        self.assertEqual(content, '2026-01-01T00:00:00Z\thttps://example.com\tExample Domain\n')
+        self.assertEqual(
+            content,
+            f'{FIXED_REC_ID}\t2026-01-01T00:00:00Z\thttps://example.com\tExample Domain\n',
+        )
 
     def test_tab_in_title_replaced(self):
         content = self._run('ts', 'https://a.com', 'Part1\tPart2').rstrip('\n')
         parts = content.split('\t')
-        self.assertEqual(parts[2], 'Part1 Part2')
+        self.assertEqual(parts[3], 'Part1 Part2')
 
     def test_newline_in_title_replaced(self):
         content = self._run('ts', 'https://a.com', 'Line1\nLine2')
@@ -136,7 +143,7 @@ class TestAppendLog(unittest.TestCase):
         # \r is removed entirely (not replaced with a space), collapsing the surrounding text
         content = self._run('ts', 'https://a.com', 'Title\rStuff').rstrip('\n')
         parts = content.split('\t')
-        self.assertEqual(parts[2], 'TitleStuff')
+        self.assertEqual(parts[3], 'TitleStuff')
 
     def test_unicode_preserved(self):
         content = self._run('ts', 'https://a.com', '日本語タイトル')
@@ -146,44 +153,83 @@ class TestAppendLog(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'visits.log')
             with patch.object(host, 'LOG_FILE', path):
-                host.append_log('ts1', 'https://a.com', 'A')
-                host.append_log('ts2', 'https://b.com', 'B')
+                host.append_log(FIXED_REC_ID, 'ts1', 'https://a.com', 'A')
+                host.append_log(FIXED_REC_ID, 'ts2', 'https://b.com', 'B')
             lines = Path(path).read_text().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertIn('https://a.com', lines[0])
         self.assertIn('https://b.com', lines[1])
 
-    def test_tag_produces_four_fields(self):
-        content = self._run('ts', 'https://example.com', 'Example', tag='of_interest')
+    def test_no_tag_produces_four_fields(self):
+        content = self._run('ts', 'https://example.com', 'Example')
         parts = content.rstrip('\n').split('\t')
         self.assertEqual(len(parts), 4)
-        self.assertEqual(parts[3], 'of_interest')
+        self.assertEqual(parts[0], FIXED_REC_ID)
 
-    def test_append_result_log_writes_single_field(self):
+    def test_of_interest_tag_produces_five_fields_no_filename(self):
+        content = self._run('ts', 'https://example.com', 'Example', tag='of_interest')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(len(parts), 5)
+        self.assertEqual(parts[4], 'of_interest')
+
+    def test_read_tag_produces_six_fields_with_filename(self):
+        content = self._run('ts', 'https://example.com', 'Example',
+                            tag='read', filename='abc.mhtml')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(len(parts), 6)
+        self.assertEqual(parts[4], 'read')
+        self.assertEqual(parts[5], 'abc.mhtml')
+
+    def test_skimmed_tag_produces_six_fields_with_filename(self):
+        content = self._run('ts', 'https://example.com', 'Example',
+                            tag='skimmed', filename='def.mhtml')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(len(parts), 6)
+        self.assertEqual(parts[4], 'skimmed')
+        self.assertEqual(parts[5], 'def.mhtml')
+
+    def test_read_tag_with_empty_filename_still_writes_field(self):
+        # When the message arrives without a filename (defensive), the column
+        # is still emitted so field-count parsing in replay stays uniform.
+        content = self._run('ts', 'https://example.com', 'Example', tag='read')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(len(parts), 6)
+        self.assertEqual(parts[5], '')
+
+    def test_filename_sanitised(self):
+        content = self._run('ts', 'https://a.com', 'Example',
+                            tag='read', filename='nasty\tname.mhtml')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(parts[5], 'nasty name.mhtml')
+
+    def test_record_id_sanitised(self):
+        # Defensive: even though uuid4().hex never contains tabs, the helper
+        # sanitises every field so a corrupted caller can't break the format.
+        content = self._run('ts', 'https://a.com', 'Example',
+                            record_id='broken\tid')
+        parts = content.rstrip('\n').split('\t')
+        self.assertEqual(parts[0], 'broken id')
+
+    def test_append_result_log_writes_two_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'visits.log')
             with patch.object(host, 'LOG_FILE', path):
-                host.append_result_log('success')
+                host.append_result_log(FIXED_REC_ID, 'success')
             content = Path(path).read_text(encoding='utf-8')
-        self.assertEqual(content, 'success\n')
+        self.assertEqual(content, f'{FIXED_REC_ID}\tsuccess\n')
 
     def test_append_result_log_sanitises_tabs(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'visits.log')
             with patch.object(host, 'LOG_FILE', path):
-                host.append_result_log('error: foo\tbar')
+                host.append_result_log(FIXED_REC_ID, 'error: foo\tbar')
             content = Path(path).read_text(encoding='utf-8').rstrip('\n')
-        self.assertEqual(content, 'error: foo bar')
-
-    def test_no_tag_produces_three_fields(self):
-        content = self._run('ts', 'https://example.com', 'Example')
-        parts = content.rstrip('\n').split('\t')
-        self.assertEqual(len(parts), 3)
+        self.assertEqual(content, f'{FIXED_REC_ID}\terror: foo bar')
 
     def test_tag_sanitised(self):
         content = self._run('ts', 'https://example.com', 'Example', tag='mem\torable')
         parts = content.rstrip('\n').split('\t')
-        self.assertEqual(parts[3], 'mem orable')
+        self.assertEqual(parts[4], 'mem orable')
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +490,22 @@ class TestTagVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(count, 2)
 
+    def test_tag_visit_read_duplicate_timestamp_does_not_increment_counter(self):
+        # Regression test for the rowcount-gated counter increment: a duplicate
+        # (url, timestamp) pair is dropped by INSERT OR IGNORE, so the visits.read
+        # counter must not advance.  Replay safety hinges on this.
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'read', '2026-01-01T12:00:00Z')
+        host.tag_visit(conn, 'https://example.com', 'read', '2026-01-01T12:00:00Z')
+        count = conn.execute('SELECT read FROM visits').fetchone()[0]
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM read_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(rows, 1)
+
     def test_tag_visit_of_interest_does_not_touch_read_or_skimmed(self):
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
@@ -514,6 +576,21 @@ class TestTagVisit(unittest.TestCase):
         count = conn.execute('SELECT skimmed FROM visits').fetchone()[0]
         conn.close()
         self.assertEqual(count, 2)
+
+    def test_tag_visit_skimmed_duplicate_timestamp_does_not_increment_counter(self):
+        # Mirror of the read-side regression test: duplicate (url, timestamp) is
+        # dropped by INSERT OR IGNORE, so visits.skimmed must not advance.
+        conn = self._conn()
+        host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        host.tag_visit(conn, 'https://example.com', 'skimmed', '2026-01-01T12:00:00Z')
+        count = conn.execute('SELECT skimmed FROM visits').fetchone()[0]
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM skimmed_events WHERE url = ?", ('https://example.com',)
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(rows, 1)
 
     def test_tag_visit_skimmed_does_not_set_of_interest_or_read(self):
         conn = self._conn()
@@ -841,8 +918,13 @@ class TestMain(unittest.TestCase):
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}, tmp)
             lines = Path(tmp, 'visits.log').read_text().splitlines()
         self.assertEqual(len(lines), 2)
+        action_parts = lines[0].split('\t')
+        result_parts = lines[1].split('\t')
+        # Action and result must share the same record_id (UUID hex prefix).
+        self.assertEqual(action_parts[0], result_parts[0])
+        self.assertRegex(action_parts[0], r'^[0-9a-f]{32}$')
         self.assertIn('https://example.com', lines[0])
-        self.assertEqual(lines[1], 'success')
+        self.assertEqual(result_parts[1], 'success')
 
     def test_auto_log_inserts_db_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1002,8 +1084,12 @@ class TestIntegration(unittest.TestCase):
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
-        self.assertEqual(lines[0], '2026-01-01T00:00:00Z\thttps://example.com\tExample Domain')
-        self.assertEqual(lines[1], 'success')
+        action_parts = lines[0].split('\t')
+        result_parts = lines[1].split('\t')
+        self.assertRegex(action_parts[0], r'^[0-9a-f]{32}$')
+        self.assertEqual(action_parts[1:], ['2026-01-01T00:00:00Z',
+                                            'https://example.com', 'Example Domain'])
+        self.assertEqual(result_parts, [action_parts[0], 'success'])
 
     def test_sqlite_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1278,31 +1364,42 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual([e[0] for e in events], ['ts-skim-1', 'ts-skim-2'])
         self.assertEqual(skim_counter, 2)  # counter incremented twice
 
-    def test_tag_message_appends_four_field_log_line(self):
+    def test_tag_message_appends_six_field_log_line(self):
         url = 'https://example.com'
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
                 {'timestamp': 'ts-visit', 'url': url, 'title': 'Example'}, tmp)
             self._invoke(
-                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example', 'tag': 'read'}, tmp)
+                {'timestamp': 'ts-tag', 'url': url, 'title': 'Example',
+                 'tag': 'read', 'filename': 'browser-visit-snapshots/abc.mhtml'},
+                tmp)
             lines = Path(tmp, 'visits.log').read_text().splitlines()
         # lines[0]=visit action, lines[1]=visit result, lines[2]=tag action, lines[3]=tag result
         self.assertEqual(len(lines), 4)
         tag_action = lines[2].split('\t')
-        self.assertEqual(len(tag_action), 4)
-        self.assertEqual(tag_action[3], 'read')
-        self.assertEqual(lines[3], 'success')
+        tag_result = lines[3].split('\t')
+        # 6 fields: record_id, timestamp, url, title, tag, filename
+        self.assertEqual(len(tag_action), 6)
+        self.assertRegex(tag_action[0], r'^[0-9a-f]{32}$')
+        self.assertEqual(tag_action[4], 'read')
+        # filename is logged as Chrome reports it (Downloads-relative); host
+        # normalises to basename only when writing the DB row.
+        self.assertEqual(tag_action[5], 'browser-visit-snapshots/abc.mhtml')
+        self.assertEqual(tag_result, [tag_action[0], 'success'])
 
-    def test_auto_log_appends_three_field_log_line(self):
+    def test_auto_log_appends_four_field_log_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example'},
                 tmp,
             )
             lines = Path(tmp, 'visits.log').read_text().splitlines()
+        action_parts = lines[0].split('\t')
         self.assertEqual(len(lines), 2)
-        self.assertEqual(len(lines[0].split('\t')), 3)  # action: 3 fields
-        self.assertEqual(lines[1], 'success')
+        # 4 fields: record_id, timestamp, url, title
+        self.assertEqual(len(action_parts), 4)
+        self.assertRegex(action_parts[0], r'^[0-9a-f]{32}$')
+        self.assertEqual(lines[1].split('\t'), [action_parts[0], 'success'])
 
     def test_tag_without_prior_visit_succeeds_and_creates_visit(self):
         # Tagging a URL with no prior auto-log entry must now succeed: the host
@@ -1326,7 +1423,23 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(row[0], 'ts')       # timestamp from tag message
         self.assertEqual(row[1], '1')        # of_interest applied
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[1], 'success')
+        self.assertEqual(lines[1].split('\t')[1], 'success')
+
+    def test_two_invocations_use_distinct_record_ids(self):
+        # Each main() call generates its own UUID; concurrent hosts can
+        # interleave safely because the replay tool joins by record_id.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts1', 'url': 'https://a.com', 'title': 'A'}, tmp)
+            self._invoke(
+                {'timestamp': 'ts2', 'url': 'https://b.com', 'title': 'B'}, tmp)
+            lines = Path(tmp, 'visits.log').read_text().splitlines()
+        first_id  = lines[0].split('\t')[0]
+        second_id = lines[2].split('\t')[0]
+        self.assertNotEqual(first_id, second_id)
+        # Each invocation's action and result share their own record_id
+        self.assertEqual(lines[1].split('\t')[0], first_id)
+        self.assertEqual(lines[3].split('\t')[0], second_id)
 
     def test_query_unknown_url_returns_null_record(self):
         with tempfile.TemporaryDirectory() as tmp:

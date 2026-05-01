@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# rebuild_visits_data — convenience wrapper around native-host/visits_rebuilder.py.
+#
+# Rebuilds browser-visits.db by replaying browser-visits.log and
+# rehydrating directory state from the iCloud snapshot archive.  All
+# arguments are forwarded verbatim to the underlying Python script;
+# --help is supported and produces both a brief wrapper note and the
+# script's full --help output.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="$SCRIPT_DIR/native-host/visits_rebuilder.py"
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      cat <<'EOF'
+rebuild_visits_data — wrapper around native-host/visits_rebuilder.py
+
+Rebuilds browser-visits.db from the on-disk log (phase 1: log replay)
+and the iCloud snapshot archive (phase 2: filesystem rehydration).
+By default both phases run and the rebuildable tables are wiped and
+recreated first; use --no-truncate, --log-only, or --rehydrate-only
+to scope the operation.  All arguments are forwarded verbatim to the
+Python script.
+
+The remainder of this help is from the Python script:
+
+EOF
+      exec python3 "$TARGET" --help
+      ;;
+  esac
+done
+
+exec python3 "$TARGET" "$@"

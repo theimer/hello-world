@@ -184,7 +184,7 @@ All scripts live at the repo root or under `native-host/`. They share
 the same `BVL_*` env-var conventions and accept overriding flags so
 they're safe to point at test data.
 
-The four user-facing Python scripts each have an executable Bash
+The five user-facing Python scripts each have an executable Bash
 wrapper at the repo root for convenience — e.g. `./move_snapshot
 --show-errors` instead of `python3 native-host/snapshot_mover.py
 --show-errors`. Each wrapper forwards all arguments verbatim and
@@ -197,6 +197,7 @@ delegating to the Python script's own argparse `--help`.
 | `./seal_snapshot_directory` | `native-host/snapshot_sealer.py` |
 | `./verify_snapshot_directory` | `native-host/snapshot_verifier.py` |
 | `./reset_visits_data` | `reset.py` |
+| `./rebuild_visits_data` | `native-host/visits_rebuilder.py` |
 
 ### `install.sh`
 
@@ -434,6 +435,66 @@ Respects the same `BVL_*` env vars as the host, so custom paths Just
 Work. Safe to run with no targets present — missing files/dirs are
 reported and skipped.
 
+### `native-host/visits_rebuilder.py`
+
+Reconstructs `~/browser-visits.db` from two side-channels that survive
+DB loss: the on-disk log (`~/browser-visits.log`) and the iCloud
+snapshot archive.  Two phases run by default:
+
+1. **Log replay** — every host invocation writes a UUID-prefixed
+   action line followed by a result line; the rebuilder pairs them by
+   UUID and re-applies each *successful* action via the same
+   `host.py` helpers used at write-time.  Error pairs are skipped
+   (the DB write didn't happen).  Orphan / malformed lines are
+   counted and trip a non-zero exit.
+2. **Filesystem rehydration** — iterates every `YYYY-MM-DD`
+   subdirectory under the iCloud root, upserts a `snapshots` row
+   (`sealed = 1` if `MANIFEST.tsv` exists), and updates each event
+   row's `directory` column from Downloads to the date subdir for
+   files that have already been moved.
+
+```bash
+# Rebuild against the configured paths (DROPs and recreates
+# visits / read_events / skimmed_events / snapshots first)
+./rebuild_visits_data
+
+# Skip the wipe; rely on idempotency
+./rebuild_visits_data --no-truncate
+
+# Phase 1 only (e.g. log present, iCloud unreachable)
+./rebuild_visits_data --log-only
+
+# Phase 2 only (log lost, iCloud archive intact)
+./rebuild_visits_data --rehydrate-only
+
+# Operate on isolated paths (useful in tests / experiments)
+./rebuild_visits_data \
+    --log /tmp/visits.log --db /tmp/test.db \
+    --source /tmp/dl --dest /tmp/icloud
+```
+
+Flags:
+
+| Flag | Effect |
+|------|--------|
+| `--truncate` (default) / `--no-truncate` | DROP and recreate the four rebuildable tables before phase 1.  `mover_errors` is left alone in either case. |
+| `--log-only` / `--rehydrate-only` | Skip phase 2 / phase 1 (mutually exclusive). |
+| `--log FILE` | Override `BVL_LOG_FILE` |
+| `--db FILE` | Override `BVL_DB_FILE` |
+| `--source DIR` | Override `BVL_DOWNLOADS_SNAPSHOTS_DIR` |
+| `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
+| `-v`, `--verbose` | DEBUG log level |
+
+`mover_errors` is intentionally not log-recoverable; the rebuild
+leaves it alone.  Filesystem-derived rows (`orphan_file`,
+`invalid_filename`, `missing_directory`, `manifest_invalid`)
+repopulate naturally on the next mover/sealer/verifier pass.
+
+Exit codes: 0 on success, 1 on input errors (missing log/DB path,
+orphan or malformed lines skipped during phase 1), 2 on an
+unexpected exception.  See [docs/rebuild-visits-from-log.md](docs/rebuild-visits-from-log.md)
+for the full design.
+
 ### `point-to-worktree.py`
 
 Developer convenience. Repoints the installed native-host manifest at
@@ -576,6 +637,7 @@ browser-visit-logger/
 │   ├── snapshot_mover.py                   # Periodic archiver (mover + seal)
 │   ├── snapshot_sealer.py                  # Manual sealer CLI
 │   ├── snapshot_verifier.py                # Manifest verifier CLI
+│   ├── visits_rebuilder.py                 # DB rebuilder (log replay + FS rehydrate)
 │   ├── com.browser.visit.logger.json       # Host manifest (template-installed)
 │   ├── com.browser.visit.logger.snapshot_mover.plist.template
 │   └── com.browser.visit.logger.snapshot_verifier.plist.template
@@ -587,6 +649,7 @@ browser-visit-logger/
 ├── seal_snapshot_directory                 # Bash wrapper → snapshot_sealer.py
 ├── verify_snapshot_directory               # Bash wrapper → snapshot_verifier.py
 ├── reset_visits_data                       # Bash wrapper → reset.py
+├── rebuild_visits_data                     # Bash wrapper → visits_rebuilder.py
 ├── package.json                            # JS test deps + jest config
 └── requirements-test.txt                   # Python test deps
 ```

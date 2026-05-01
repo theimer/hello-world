@@ -32,6 +32,7 @@ WRAPPERS = [
     ('seal_snapshot_directory',   'snapshot_sealer.py'),
     ('verify_snapshot_directory', 'snapshot_verifier.py'),
     ('reset_visits_data',         'reset.py'),
+    ('rebuild_visits_data',       'visits_rebuilder.py'),
 ]
 
 
@@ -167,6 +168,26 @@ class TestWrapperForwarding(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0,
                              f'stderr: {result.stderr}')
+
+    def test_rebuild_visits_data_forwards_overrides_against_empty_log(self):
+        # rebuild_visits_data --log <empty file> --db <new path> --source/--dest
+        # against an empty log should reach the rebuilder, exit 0, and print
+        # the per-phase summary lines.
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, 'visits.log')
+            Path(log).touch()
+            db   = os.path.join(tmp, 'visits.db')
+            src  = os.path.join(tmp, 'dl');     os.makedirs(src)
+            dest = os.path.join(tmp, 'icloud'); os.makedirs(dest)
+            result = subprocess.run(
+                [str(REPO_ROOT / 'rebuild_visits_data'),
+                 '--log', log, '--db', db, '--source', src, '--dest', dest],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0,
+                             f'stderr: {result.stderr}')
+            self.assertIn('replay:',    result.stdout)
+            self.assertIn('rehydrate:', result.stdout)
 
 
 if __name__ == '__main__':  # pragma: no cover
