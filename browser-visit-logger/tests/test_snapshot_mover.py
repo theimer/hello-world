@@ -82,6 +82,15 @@ class _MoverTestBase(unittest.TestCase):
         snapshot_mover._ensure_mover_errors_table(conn)
         conn.close()
 
+        # Silence _notify_user so tests that incidentally trigger
+        # escalation don't actually fire osascript on macOS.  Tests that
+        # want to assert on notification calls re-patch in their body —
+        # patch.object's stack semantics hide this outer mock for the
+        # duration of the inner with block.
+        p = patch.object(snapshot_mover, '_notify_user')
+        p.start()
+        self.addCleanup(p.stop)
+
     # -- helpers --
 
     def _make_event(self, table, url, iso_timestamp, orig_basename,
@@ -1083,6 +1092,19 @@ class TestErrorRecording(unittest.TestCase):
     def test_is_immediate_top_level(self):
         self.assertTrue(snapshot_mover._is_immediate('top_level', RuntimeError('x')))
 
+    def test_is_immediate_rewrite_manifest(self):
+        # Single-shot op — natural retry loop won't re-encounter the same
+        # target on the next tick, so it must escalate on first occurrence.
+        self.assertTrue(snapshot_mover._is_immediate(
+            'rewrite_manifest', OSError('boom')))
+
+    def test_is_immediate_invalid_filename(self):
+        # Same single-shot reasoning for the date-subdir case (which is
+        # what classification has to cover for both Downloads and date-dir
+        # variants of this op).
+        self.assertTrue(snapshot_mover._is_immediate(
+            'invalid_filename', ValueError('synthetic')))
+
     def test_is_immediate_disk_full_oserror(self):
         exc = OSError(errno.ENOSPC, 'No space left on device')
         self.assertTrue(snapshot_mover._is_immediate('move', exc))
@@ -1152,6 +1174,17 @@ class TestErrorRecording(unittest.TestCase):
         snapshot_mover._record_error(
             self.conn, 'move', '/p', OSError(errno.ENOSPC, 'disk full'))
         self.assertEqual(self._row('move:/p')[5], 1)
+
+    def test_record_error_marks_rewrite_manifest_as_immediate(self):
+        snapshot_mover._record_error(
+            self.conn, 'rewrite_manifest', '/d', OSError('boom'))
+        self.assertEqual(self._row('rewrite_manifest:/d')[5], 1)
+
+    def test_record_error_marks_invalid_filename_as_immediate(self):
+        snapshot_mover._record_error(
+            self.conn, 'invalid_filename', '/p',
+            ValueError('synthetic'))
+        self.assertEqual(self._row('invalid_filename:/p')[5], 1)
 
     def test_record_error_does_not_demote_immediate(self):
         # Catastrophic first, then transient — immediate must stay 1.
@@ -1231,6 +1264,37 @@ class TestEscalation(unittest.TestCase):
             snapshot_mover._escalate_errors(self.conn)
         mock_notify.assert_not_called()
         self.assertEqual(self._notified('move:/p'), 0)
+
+    def test_notification_body_includes_per_op_fix_hint(self):
+        # Persistent-class error → notification body should append the
+        # `_FIX_HINTS['move']` text so the user knows what to do.
+        for _ in range(3):
+            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        mock_notify.assert_called_once()
+        body = mock_notify.call_args[0][1]
+        self.assertIn('Fix:', body)
+        self.assertIn(snapshot_mover._FIX_HINTS['move'], body)
+
+    def test_notification_body_for_top_level_includes_top_level_hint(self):
+        snapshot_mover._record_error(
+            self.conn, 'top_level', '', RuntimeError('crash'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        body = mock_notify.call_args[0][1]
+        self.assertIn(snapshot_mover._FIX_HINTS['top_level'], body)
+
+    def test_notification_body_for_rewrite_manifest_includes_hint(self):
+        # Single-shot op — escalates immediately on first occurrence, and
+        # the rewrite_manifest hint pointing at snapshot_sealer is what
+        # tells the user how to recover.
+        snapshot_mover._record_error(
+            self.conn, 'rewrite_manifest', '/d', OSError('boom'))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover._escalate_errors(self.conn)
+        body = mock_notify.call_args[0][1]
+        self.assertIn(snapshot_mover._FIX_HINTS['rewrite_manifest'], body)
 
     def test_persistent_at_threshold_notifies_and_marks(self):
         for _ in range(3):
@@ -1523,6 +1587,49 @@ class TestErrorWiring(_MoverTestBase):
         self.assertTrue(any(op == 'rewrite_manifest' and target == date_subdir
                             for op, target in rows))
 
+    def test_invalid_filename_in_downloads_notifies_on_first_occurrence(self):
+        # Stray non-snapshot file in Downloads.  After one main() run, the
+        # row should be marked notified=1 (escalated immediately because
+        # 'invalid_filename' is now classified as immediate).
+        stray = os.path.join(self.source_dir, 'random.bin')
+        Path(stray).write_bytes(b'x')
+        mtime = time.time() - 700
+        os.utime(stray, (mtime, mtime))
+        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover.main()
+        mock_notify.assert_called_once()
+        body = mock_notify.call_args[0][1]
+        self.assertIn(snapshot_mover._FIX_HINTS['invalid_filename'], body)
+        conn = sqlite3.connect(self.db_file)
+        notified = conn.execute(
+            "SELECT notified FROM mover_errors WHERE operation = 'invalid_filename'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(notified, 1)
+
+    def test_straggler_rewrite_failure_notifies_on_first_occurrence(self):
+        # A single straggler whose manifest rewrite fails should escalate
+        # without waiting for further stragglers (which may never arrive).
+        date_str = '2024-01-15'
+        date_subdir = os.path.join(self.dest_dir, date_str)
+        os.makedirs(date_subdir)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
+                     (date_str,))
+        conn.commit()
+        conn.close()
+        self._make_event('read_events', 'https://a.com',
+                         '2024-01-15T10:00:00.000Z', 'a.mhtml',
+                         age_seconds=700)
+        with patch.object(snapshot_mover, '_write_manifest_file',
+                          side_effect=OSError('disk full')), \
+             patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            snapshot_mover.main()
+        mock_notify.assert_called_once()
+        body = mock_notify.call_args[0][1]
+        self.assertIn('rewrite_manifest', body)
+        self.assertIn(snapshot_mover._FIX_HINTS['rewrite_manifest'], body)
+
     def test_top_level_failure_records_and_notifies_then_reraises(self):
         with patch.object(snapshot_mover, '_move_pass',
                           side_effect=RuntimeError('unexpected explosion')), \
@@ -1739,6 +1846,36 @@ class TestErrorCli(unittest.TestCase):
         self.assertIn('seal:', out)
         self.assertIn('/path/file', out)
         self.assertIn('/dir/2024-01-15', out)
+
+    def test_show_errors_includes_fix_hint_per_row(self):
+        # Each row should carry a `fix:` line with the per-op guidance,
+        # so the user gets actionable direction without consulting docs.
+        self._seed_errors(
+            ('move', '/p', OSError('boom')),
+            ('missing_directory', '/d', FileNotFoundError('gone')),
+        )
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_mover.cli(['--db', self.db_file, '--show-errors'])
+        out = captured.getvalue()
+        self.assertIn('fix:', out)
+        self.assertIn(snapshot_mover._FIX_HINTS['move'], out)
+        self.assertIn(snapshot_mover._FIX_HINTS['missing_directory'], out)
+
+    def test_show_errors_omits_fix_line_for_unknown_op(self):
+        # Defensive: if an op without a hint somehow ends up in the table,
+        # the line is simply omitted rather than printing an empty fix.
+        snapshot_mover.DB_FILE = self.db_file
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._ensure_mover_errors_table(conn)
+        snapshot_mover._record_error(
+            conn, 'unknown_op', '/x', RuntimeError('?'))
+        conn.close()
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_mover.cli(['--db', self.db_file, '--show-errors'])
+        out = captured.getvalue()
+        self.assertNotIn('fix:', out)
 
     def test_show_errors_skips_move_and_seal_pass(self):
         # Even with sources present that would normally be moved, --show-errors

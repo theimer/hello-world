@@ -137,6 +137,30 @@ _ATTENTION_FILE = os.path.join(HOME, 'browser-visits-mover-needs-attention')
 # the mover can't recover from on its own.
 _IMMEDIATE_OSERROR_ERRNOS = frozenset({errno.ENOSPC, errno.EROFS, errno.EDQUOT})
 
+# Per-operation actionable guidance, surfaced in both the macOS notification
+# body and `--show-errors` output.  Keeps the error report self-explanatory
+# for users who don't have the README handy.
+_FIX_HINTS = {
+    'move':
+        'Check that the iCloud destination is writable and has free '
+        'space, then wait for the next mover run.',
+    'seal':
+        'Check the iCloud destination, then wait for the next mover '
+        'run — the seal pass retries every tick until it succeeds.',
+    'rewrite_manifest':
+        'Run `snapshot_sealer.py <date>` to rebuild the manifest, then '
+        '`snapshot_mover.py --clear-error N` to clear this row.',
+    'invalid_filename':
+        "Rename the file to match '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' "
+        'or remove it; the row clears on the next mover run.',
+    'missing_directory':
+        "Re-create the directory, OR remove the snapshots row "
+        "(`sqlite3 <db> \"DELETE FROM snapshots WHERE date='<YYYY-MM-DD>'\"`).",
+    'top_level':
+        'Check ~/browser-visits-mover.log for the traceback, then '
+        '`snapshot_mover.py --clear-errors` once the bug is fixed.',
+}
+
 EVENTS_TABLES = ('read_events', 'skimmed_events')
 
 # Name of the per-directory manifest file written by the seal pass.
@@ -307,8 +331,27 @@ def _reconcile_invalid_filename_errors(conn, dir_path, current_strays):
 
 def _is_immediate(op, exc):
     """Return True iff this error should trigger a user notification on the
-    first occurrence (rather than after MOVER_ERROR_THRESHOLD attempts)."""
-    if op == 'top_level':
+    first occurrence (rather than after MOVER_ERROR_THRESHOLD attempts).
+
+    Three immediate categories:
+
+    1. Top-level uncaught exception — by definition unexpected; the user
+       needs to know now.
+    2. Single-shot ops — operations whose natural retry loop won't
+       re-attempt the same target on subsequent ticks, so the threshold-
+       based escalation never fires:
+         - 'rewrite_manifest' runs once per straggler arrival; if no more
+           stragglers come (the common case), attempts stays at 1 forever.
+         - 'invalid_filename' inside a date subdir runs once per
+           successful seal of that dir; after sealed=1 the row is never
+           re-visited.
+       (The Downloads-side 'invalid_filename' rows DO accumulate on each
+       tick that re-encounters the file, but treating both as immediate
+       keeps the classification simple and gets the user notified faster.)
+    3. Catastrophic OSError errnos and DB integrity errors — the
+       underlying disk / DB needs attention before any retry can succeed.
+    """
+    if op in ('top_level', 'rewrite_manifest', 'invalid_filename'):
         return True
     if isinstance(exc, OSError) and exc.errno in _IMMEDIATE_OSERROR_ERRNOS:
         return True
@@ -349,6 +392,9 @@ def _escalate_errors(conn):
         else:
             body = (f'{op} failed {attempts}× since {first_seen}: '
                     f'{target or "(no target)"} — {message}')
+        hint = _FIX_HINTS.get(op)
+        if hint:
+            body = f'{body}  Fix: {hint}'
         _notify_user(title, body)
         try:
             conn.execute(
@@ -897,6 +943,9 @@ def _cli_show_errors() -> int:
         print(f'      attempts: {attempts} '
               f'(since {first_seen}, last {last_seen})')
         print(f'      error:    {message}')
+        hint = _FIX_HINTS.get(op)
+        if hint:
+            print(f'      fix:      {hint}')
         print(f'      notified: {"yes" if notified else "no"}')
         print()
     return 0

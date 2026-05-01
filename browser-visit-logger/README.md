@@ -355,26 +355,35 @@ notification once the row qualifies:
 - **Persistent failure**: the same `(operation, target)` has failed
   `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3, configurable
   via env var or `--error-threshold N`). One notification per streak.
-  Operations:
+  Used for ops whose natural retry loop re-attempts the same target
+  every tick:
   - `move` — `_move_one` failure (copy/chmod/UPDATE/INSERT/unlink).
   - `seal` — `_seal_directory` failure (manifest write/chmod/DB update).
-  - `rewrite_manifest` — straggler-rewrite failure.
+  - `missing_directory` — the `snapshots` table has a row for a date
+    whose on-disk directory has been deleted.  The row auto-clears
+    if the user re-creates the directory.
+- **Immediate failure**: notified on the first occurrence regardless
+  of attempts.  Used for ops whose retry loop won't re-encounter the
+  same target on subsequent ticks (so threshold-based escalation
+  would never fire), and for catastrophic conditions:
+  - `top_level` — uncaught exception in `main()`.
+  - `rewrite_manifest` — straggler-rewrite failure (only triggered by
+    a fresh straggler arriving in the same dir).
   - `invalid_filename` — a file in `~/Downloads/browser-visit-snapshots/`
     or in a daily snapshot directory has a name that doesn't match the
-    canonical `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format. The mover
-    leaves Downloads files in place and excludes the file from the
-    manifest. The row auto-clears when the user removes or renames the
-    file.
-  - `missing_directory` — the `snapshots` table has a row for a date
-    whose on-disk directory has been deleted. The row auto-clears if
-    the user re-creates the directory.
-- **Catastrophic failure**: notified on the first occurrence regardless
-  of attempts. Includes:
-  - Top-level uncaught exception (`operation = 'top_level'`).
+    canonical `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format.  The
+    Downloads file is left in place; date-dir files are excluded from
+    the manifest.  The row auto-clears when the user removes or
+    renames the file.
   - `OSError` with errno in `{ENOSPC, EROFS, EDQUOT}` — disk full,
     read-only filesystem, or quota exceeded.
   - `sqlite3.DatabaseError` other than `OperationalError` — typically
     means the DB file is corrupt.
+
+Both notification banner bodies and `--show-errors` rows include a
+per-op `Fix:` hint pointing at the user action that resolves the
+problem (e.g. "Rename the file to match …", "Run `snapshot_sealer.py
+<date>` to rebuild the manifest …").
 
 A row stays in the table until the underlying problem is resolved.
 Three paths clear it:
