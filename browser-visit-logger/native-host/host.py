@@ -62,6 +62,7 @@ import os
 import sqlite3
 import struct
 import sys
+import uuid
 from logging.handlers import RotatingFileHandler
 
 
@@ -189,15 +190,16 @@ def _insert_event(
     exists = conn.execute("SELECT 1 FROM visits WHERE url = ?", (url,)).fetchone()
     if exists:
         basename = os.path.basename(filename)
-        conn.execute(
+        cursor = conn.execute(
             f"INSERT OR IGNORE INTO {table} (url, timestamp, filename, directory) "
             f"VALUES (?, ?, ?, ?)",
             (url, timestamp, basename, DOWNLOADS_SNAPSHOTS_DIR),
         )
-        conn.execute(
-            f"UPDATE visits SET {visits_col} = {visits_col} + 1 WHERE url = ?",
-            (url,),
-        )
+        if cursor.rowcount > 0:
+            conn.execute(
+                f"UPDATE visits SET {visits_col} = {visits_col} + 1 WHERE url = ?",
+                (url,),
+            )
     conn.commit()
     return exists is not None
 
@@ -273,26 +275,42 @@ def tag_visit(
 # Log file helper
 # ---------------------------------------------------------------------------
 
-def append_log(timestamp: str, url: str, title: str, tag: str = '') -> None:
-    """Append one TSV line (3 fields for auto-log, 4 fields when tag is set)."""
+def append_log(
+    record_id: str, timestamp: str, url: str, title: str,
+    tag: str = '', filename: str = '',
+) -> None:
+    """Append one TSV action line, prefixed with record_id.
+
+    Field layout:
+        <record_id>\\t<timestamp>\\t<url>\\t<title>                          # auto-log
+        <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>                   # of_interest
+        <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>\\t<filename>      # read / skimmed
+
+    record_id correlates this line with its later result line so a replay
+    tool can pair them safely even under concurrent host invocations.
+    filename is included only for read / skimmed tags.
+    """
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
-    fields = [sanitise(timestamp), sanitise(url), sanitise(title)]
+    fields = [sanitise(record_id), sanitise(timestamp), sanitise(url), sanitise(title)]
     if tag:
         fields.append(sanitise(tag))
+        if tag in ('read', 'skimmed'):
+            fields.append(sanitise(filename))
     line = '\t'.join(fields) + '\n'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(line)
 
 
-def append_result_log(result: str) -> None:
-    """Append a single-field result line: 'success' or 'error: <message>'."""
+def append_result_log(record_id: str, result: str) -> None:
+    """Append a result line prefixed with record_id: 'success' or 'error: <message>'."""
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
+    line = sanitise(record_id) + '\t' + sanitise(result) + '\n'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(sanitise(result) + '\n')
+        f.write(line)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -309,6 +327,8 @@ def main() -> None:
         logger.error('Failed to read message: %s', exc)
         write_message({'status': 'error', 'message': str(exc)})
         return
+
+    record_id = uuid.uuid4().hex
 
     url    = (message.get('url') or '').strip()
     action = (message.get('action') or '').strip()
@@ -349,7 +369,7 @@ def main() -> None:
 
     # First write: record the intended action
     try:
-        append_log(timestamp, url, title, tag)
+        append_log(record_id, timestamp, url, title, tag, filename)
     except Exception as exc:
         logger.error('Log file write failed: %s', exc)
         errors.append(f'log: {exc}')
@@ -372,7 +392,7 @@ def main() -> None:
     # Second write: record the result
     log_result = f'error: {"; ".join(errors)}' if errors else 'success'
     try:
-        append_result_log(log_result)
+        append_result_log(record_id, log_result)
     except Exception as exc:
         logger.error('Log file result write failed: %s', exc)
 
