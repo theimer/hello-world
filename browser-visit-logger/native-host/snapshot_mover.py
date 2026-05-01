@@ -275,6 +275,36 @@ def _try_clear_error(conn, op, target):
             'Could not clear %s error for %s: %s', op, target, inner)
 
 
+def _reconcile_invalid_filename_errors(conn, dir_path, current_strays):
+    """Auto-heal 'invalid_filename' rows under dir_path.
+
+    Removes rows whose target lives under dir_path but isn't in the
+    current_strays set — i.e. files the user has since renamed or
+    removed.  Used by both the move pass (Downloads scan) and
+    _build_manifest_rows (date-subdir scan), each scoped to its own
+    directory.
+
+    Best-effort: logs and returns on DB error.
+    """
+    try:
+        prior = conn.execute(
+            "SELECT key, target FROM mover_errors WHERE operation = ?",
+            ('invalid_filename',),
+        ).fetchall()
+        prefix = os.path.join(dir_path, '')   # ensures trailing path separator
+        current_set = set(current_strays)
+        for key, target in prior:
+            if target.startswith(prefix) and target not in current_set:
+                conn.execute(
+                    "DELETE FROM mover_errors WHERE key = ?", (key,))
+        conn.commit()
+    except sqlite3.Error as inner:
+        logger.error(
+            'Could not reconcile invalid_filename errors under %s: %s',
+            dir_path, inner,
+        )
+
+
 def _is_immediate(op, exc):
     """Return True iff this error should trigger a user notification on the
     first occurrence (rather than after MOVER_ERROR_THRESHOLD attempts)."""
@@ -391,6 +421,7 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
         return
 
     now = time.time()
+    current_invalid = []   # paths flagged this pass; used to reconcile errors
     for filename in os.listdir(DOWNLOADS_SNAPSHOTS_DIR):
         source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, filename)
         if not os.path.isfile(source):
@@ -398,7 +429,15 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
 
         m = _SNAPSHOT_FILENAME_RE.match(filename)
         if not m:
-            logger.debug('Skipping %s — does not match snapshot filename format', filename)
+            logger.error(
+                'Skipping %s — does not match snapshot filename format; '
+                'leaving in Downloads', source,
+            )
+            _try_record_error(
+                conn, 'invalid_filename', source,
+                ValueError('filename does not match snapshot format'),
+            )
+            current_invalid.append(source)
             continue
 
         age = now - os.path.getmtime(source)
@@ -408,6 +447,11 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
 
         date_str = m.group(1)   # 'YYYY-MM-DD'
         _move_one(conn, source, filename, date_str, dry_run=dry_run)
+
+    # Auto-heal: clear invalid_filename rows for files in Downloads that
+    # the user has since renamed or removed.
+    _reconcile_invalid_filename_errors(
+        conn, DOWNLOADS_SNAPSHOTS_DIR, current_invalid)
 
 
 def _move_one(
@@ -498,13 +542,22 @@ def _seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
     for (date_str,) in rows:
         date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, date_str)
         if not os.path.isdir(date_subdir):
-            # The DB says this day exists but the directory is gone (e.g. user
-            # manually deleted it).  Skip with a warning rather than failing.
-            logger.warning(
+            # DB says this day exists but the directory is gone (e.g. user
+            # manually deleted it).  Record an error and skip — the row
+            # will retry next tick, and the user is notified once the
+            # threshold is crossed.
+            logger.error(
                 'snapshots row %s has no on-disk directory at %s; skipping',
                 date_str, date_subdir,
             )
+            _try_record_error(
+                conn, 'missing_directory', date_subdir,
+                FileNotFoundError(
+                    f'snapshots row {date_str} has no on-disk directory'),
+            )
             continue
+        # Directory present — clear any prior 'missing_directory' error.
+        _try_clear_error(conn, 'missing_directory', date_subdir)
         _seal_directory(conn, date_subdir, dry_run=dry_run, date_key=date_str)
 
 
@@ -522,30 +575,22 @@ def _seal_directory(
     sealer passes it only when the directory's basename is itself a valid
     date (so non-date directories get a manifest but no DB row).
 
-    Crash-safety: if the manifest already exists but the DB row is still
-    sealed=0 (a prior run that crashed between the file write and the DB
-    update), don't rewrite the manifest — the file is already correct and
-    is now read-only.  Just flip the flag.
+    The manifest is always (re)written — even if one already exists.  A
+    prior crash may have left a partial manifest behind, and the cost of
+    rebuilding from the events tables is small compared to the risk of
+    leaving truncated content in place.  _write_manifest_file unlinks any
+    existing read-only manifest before writing.
 
     Errors writing/chmod'ing the manifest, or updating the DB, are logged
     but do not propagate.
     """
-    manifest_path = os.path.join(date_subdir, MANIFEST_FILENAME)
-
     if dry_run:
         logger.info('[dry-run] would seal %s', date_subdir)
         return
 
     try:
-        if os.path.exists(manifest_path):
-            # Recovery branch: a prior run wrote the manifest but didn't update
-            # the DB.  The manifest is read-only and shouldn't be rewritten —
-            # treat its presence as authoritative and just sync the DB.
-            logger.info('Manifest already exists at %s; marking sealed',
-                        date_subdir)
-        else:
-            count = _write_manifest_file(conn, date_subdir)
-            logger.info('Sealed %s (%d entries)', date_subdir, count)
+        count = _write_manifest_file(conn, date_subdir)
+        logger.info('Sealed %s (%d entries)', date_subdir, count)
         if date_key is not None:
             # Upsert: the auto seal pass always finds an existing row (the
             # mover inserted it).  The manual sealer may not — e.g. if the
@@ -619,11 +664,14 @@ def _rewrite_manifest_for_straggler(
 def _build_manifest_rows(
     conn: sqlite3.Connection, date_subdir: str,
 ):
-    """Return one tuple per snapshot file in the directory, sorted by filename.
+    """Return one tuple per *conforming* snapshot file in the directory,
+    sorted by filename.
 
-    The standard datetime-prefixed filenames sort chronologically, so the
-    manifest naturally lists events in the order they happened.  Files with
-    no matching DB row appear with empty metadata fields.
+    Files whose names don't match the canonical
+    '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' format are excluded from the
+    manifest; an ERROR is logged and an 'invalid_filename' mover_errors row
+    is recorded so the user is notified.  Conforming files with no matching
+    DB row are still included (with empty metadata fields).
     """
     files = sorted(
         f for f in os.listdir(date_subdir)
@@ -631,7 +679,20 @@ def _build_manifest_rows(
         and os.path.isfile(os.path.join(date_subdir, f))
     )
     rows = []
+    current_invalid = []
     for filename in files:
+        full_path = os.path.join(date_subdir, filename)
+        if not _SNAPSHOT_FILENAME_RE.match(filename):
+            logger.error(
+                'Excluding %s from manifest — does not match snapshot '
+                'filename format', full_path,
+            )
+            _try_record_error(
+                conn, 'invalid_filename', full_path,
+                ValueError('filename does not match snapshot format'),
+            )
+            current_invalid.append(full_path)
+            continue
         info = _lookup_event(conn, filename, date_subdir)
         if info is None:
             rows.append((_tsv_sanitise(filename), '', '', '', ''))
@@ -643,6 +704,10 @@ def _build_manifest_rows(
                 _tsv_sanitise(info['url']),
                 _tsv_sanitise(info['title']),
             ))
+
+    # Auto-heal: clear invalid_filename rows for files in this dir that
+    # the user has since renamed or removed.
+    _reconcile_invalid_filename_errors(conn, date_subdir, current_invalid)
     return rows
 
 

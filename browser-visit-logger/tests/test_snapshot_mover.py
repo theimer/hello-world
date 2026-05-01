@@ -458,16 +458,48 @@ class TestIdempotency(_MoverTestBase):
                          (prefixed, date_subdir))
 
     def test_skips_file_with_unrecognized_name_format(self):
-        # Files whose names don't match the snapshot format are ignored.
+        # Files whose names don't match the snapshot format are left in
+        # Downloads (not moved), ERROR-logged, and recorded as an
+        # 'invalid_filename' mover_errors row so the user is notified.
         stray = os.path.join(self.source_dir, 'random-file.mhtml')
         Path(stray).write_bytes(b'x')
         mtime = time.time() - 700
         os.utime(stray, (mtime, mtime))
 
-        snapshot_mover.main()
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover.main()
 
         self.assertTrue(os.path.exists(stray))
         self.assertEqual(os.listdir(self.dest_dir), [])
+        self.assertTrue(any('does not match snapshot filename format'
+                            in m for m in cm.output))
+        conn = sqlite3.connect(self.db_file)
+        row = conn.execute(
+            "SELECT operation, target FROM mover_errors "
+            "WHERE operation = 'invalid_filename'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ('invalid_filename', stray))
+
+    def test_move_pass_clears_invalid_filename_error_when_stray_removed(self):
+        # Pre-seed an invalid_filename row for a path that no longer exists
+        # in Downloads.  The move-pass reconcile should clear it.
+        gone = os.path.join(self.source_dir, 'never-existed.mhtml')
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._record_error(
+            conn, 'invalid_filename', gone,
+            ValueError('synthetic'))
+        conn.close()
+        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
+
+        snapshot_mover.main()   # source_dir empty, gone is not present
+
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'invalid_filename'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
     def test_skips_subdirectory_entries_in_downloads(self):
         os.makedirs(os.path.join(self.source_dir, 'subdir'))
@@ -704,17 +736,19 @@ class TestSealPass(_MoverTestBase):
         self.assertEqual(lines[1].split('\t'),
                          ['2024-01-15T10-00-00Z-orphan.mhtml', '', '', '', ''])
 
-    def test_recovery_preserves_existing_manifest_and_marks_sealed(self):
+    def test_recovery_rewrites_existing_manifest_and_marks_sealed(self):
         # Crash-recovery branch: a prior run wrote the manifest but didn't
-        # update the DB.  The seal pass must not rewrite the (read-only)
-        # manifest — it should leave the file alone and just flip sealed=1.
+        # update the DB.  The manifest may be partial / truncated, so the
+        # seal pass *always* rewrites it — and then flips sealed=1.
         date_subdir = self._seed_dir('2024-01-15')
         manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
-        Path(manifest).write_text('preexisting\n', encoding='utf-8')
+        Path(manifest).write_text('truncated-or-stale\n', encoding='utf-8')
         snapshot_mover.main()
-        self.assertEqual(Path(manifest).read_text(encoding='utf-8'),
-                         'preexisting\n')
-        # DB row was updated even though the file write was skipped.
+        # Manifest replaced with a freshly-written one (header line at top).
+        contents = Path(manifest).read_text(encoding='utf-8')
+        self.assertNotEqual(contents, 'truncated-or-stale\n')
+        self.assertTrue(contents.startswith('filename\ttag\ttimestamp\turl\ttitle\n'))
+        # DB row was flipped to sealed.
         self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
 
     def test_seal_processes_multiple_past_directories(self):
@@ -802,20 +836,117 @@ class TestSealPass(_MoverTestBase):
         self.assertFalse(os.path.exists(
             os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
 
-    def test_seal_pass_warns_when_row_directory_is_missing(self):
-        # Insert a row for a date whose directory doesn't exist on disk.
-        # The pass should log a warning, leave the row alone, and not crash.
+    def test_seal_pass_records_error_when_row_directory_is_missing(self):
+        # Insert a snapshots row for a date whose directory doesn't exist
+        # on disk.  The pass should ERROR-log, record a 'missing_directory'
+        # mover_errors row so the user is notified, and leave the snapshots
+        # row unsealed (we couldn't seal what isn't there).
         os.makedirs(self.dest_dir, exist_ok=True)
         conn = sqlite3.connect(self.db_file)
         conn.execute(
             "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", ('2024-01-15',))
         conn.commit()
         conn.close()
-        with self.assertLogs(snapshot_mover.logger, level='WARNING') as cm:
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
             snapshot_mover.main()
         self.assertTrue(any('no on-disk directory' in m for m in cm.output))
-        # Row remains unsealed (we couldn't seal the missing directory).
+        # Row remains unsealed.
         self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
+        # mover_errors row was recorded.
+        conn = sqlite3.connect(self.db_file)
+        err_row = conn.execute(
+            "SELECT operation, target FROM mover_errors "
+            "WHERE operation = 'missing_directory'"
+        ).fetchone()
+        conn.close()
+        expected_target = os.path.join(self.dest_dir, '2024-01-15')
+        self.assertEqual(err_row, ('missing_directory', expected_target))
+
+    def test_seal_pass_clears_missing_directory_error_when_dir_reappears(self):
+        # Pre-seed a missing_directory error for a date whose dir has now
+        # been re-created.  The next seal pass should clear the error row.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        date_subdir = self._seed_dir('2024-01-15')   # also creates snapshots row
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._record_error(
+            conn, 'missing_directory', date_subdir,
+            FileNotFoundError('previous miss'))
+        conn.close()
+
+        snapshot_mover.main()
+
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'missing_directory'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    def test_manifest_excludes_files_with_invalid_filename_format(self):
+        # Seed a directory with one conforming file (with an events row) and
+        # one non-conforming file.  The manifest should list only the
+        # conforming one; the other should produce an ERROR log + an
+        # 'invalid_filename' mover_errors row.
+        date_str = '2024-01-15'
+        date_subdir = os.path.join(self.dest_dir, date_str)
+        os.makedirs(date_subdir)
+        good = '2024-01-15T10-00-00Z-good.mhtml'
+        bad = 'random-non-snapshot.txt'
+        Path(date_subdir, good).write_bytes(b'g')
+        Path(date_subdir, bad).write_bytes(b'b')
+        conn = sqlite3.connect(self.db_file)
+        host.insert_visit(conn, '2024-01-15T10:00:00Z', 'https://g.com', 'Good')
+        conn.execute(
+            "INSERT INTO read_events (url, timestamp, filename, directory) "
+            "VALUES (?, ?, ?, ?)",
+            ('https://g.com', '2024-01-15T10:00:00Z', good, date_subdir),
+        )
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", (date_str,))
+        conn.commit()
+        conn.close()
+
+        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
+            snapshot_mover.main()
+
+        # Manifest excludes the bad file.
+        manifest = self._read_manifest(date_str)
+        self.assertIn(good, manifest)
+        self.assertNotIn(bad, manifest)
+        # ERROR was logged for the bad file.
+        self.assertTrue(any(bad in m and 'snapshot filename format' in m
+                            for m in cm.output))
+        # mover_errors row recorded for the bad file.
+        bad_path = os.path.join(date_subdir, bad)
+        conn = sqlite3.connect(self.db_file)
+        row = conn.execute(
+            "SELECT operation, target FROM mover_errors "
+            "WHERE operation = 'invalid_filename'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ('invalid_filename', bad_path))
+
+    def test_manifest_clears_invalid_filename_error_when_stray_removed(self):
+        # Pre-seed an invalid_filename row for a non-existent file under
+        # date_subdir.  After a manifest rebuild, the reconcile step should
+        # clear it.
+        date_str = '2024-01-15'
+        date_subdir = self._seed_dir(date_str)
+        gone = os.path.join(date_subdir, 'random-non-snapshot.txt')
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._record_error(
+            conn, 'invalid_filename', gone,
+            ValueError('synthetic'))
+        conn.close()
+
+        snapshot_mover.main()
+
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'invalid_filename'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
     def test_seal_pass_with_empty_snapshots_table_is_noop(self):
         # No rows → no work, no errors, no manifest writes.

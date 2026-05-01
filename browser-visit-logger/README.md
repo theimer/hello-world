@@ -355,6 +355,19 @@ notification once the row qualifies:
 - **Persistent failure**: the same `(operation, target)` has failed
   `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3, configurable
   via env var or `--error-threshold N`). One notification per streak.
+  Operations:
+  - `move` — `_move_one` failure (copy/chmod/UPDATE/INSERT/unlink).
+  - `seal` — `_seal_directory` failure (manifest write/chmod/DB update).
+  - `rewrite_manifest` — straggler-rewrite failure.
+  - `invalid_filename` — a file in `~/Downloads/browser-visit-snapshots/`
+    or in a daily snapshot directory has a name that doesn't match the
+    canonical `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format. The mover
+    leaves Downloads files in place and excludes the file from the
+    manifest. The row auto-clears when the user removes or renames the
+    file.
+  - `missing_directory` — the `snapshots` table has a row for a date
+    whose on-disk directory has been deleted. The row auto-clears if
+    the user re-creates the directory.
 - **Catastrophic failure**: notified on the first occurrence regardless
   of attempts. Includes:
   - Top-level uncaught exception (`operation = 'top_level'`).
@@ -367,7 +380,10 @@ A row stays in the table until the underlying problem is resolved.
 Three paths clear it:
 
 1. **Automatic** — the next successful run of the same operation
-   `_clear_error`s the row. Most users never need to touch the table.
+   `_clear_error`s the row. For `invalid_filename` and
+   `missing_directory`, a directory-scoped reconcile additionally
+   clears rows whose target file/dir no longer exists. Most users
+   never need to touch the table.
 2. **Manual, all rows** — `python3 native-host/snapshot_mover.py
    --clear-errors`. Use after acknowledging a batch of stale rows.
 3. **Manual, one row** — `python3 native-host/snapshot_mover.py
