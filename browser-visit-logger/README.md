@@ -47,6 +47,7 @@ read-only, and (once the day has fully passed) writes a
 | `~/browser-visits.db` | SQLite database — `visits`, `read_events`, `skimmed_events` |
 | `~/browser-visits-host.log` | Native host process log (rotated, 1 MiB × 3) |
 | `~/browser-visits-mover.log` | Snapshot mover process log (LaunchAgent stdout/stderr) |
+| `~/browser-visits-verifier.log` | Snapshot verifier process log (LaunchAgent stdout/stderr) |
 | `~/Downloads/browser-visit-snapshots/` | Snapshot staging dir (Chrome writes here) |
 | `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive (read-only files + read-only `MANIFEST.tsv`) |
 
@@ -123,8 +124,13 @@ bash install.sh
    the `key` field in `manifest.json`.
 2. Installs the native-messaging host manifest under Chrome's
    `NativeMessagingHosts` directory.
-3. On macOS, installs and bootstraps the snapshot mover as a LaunchAgent
-   (`com.browser.visit.logger.snapshot_mover`, `StartInterval = 3600`s).
+3. On macOS, installs and bootstraps two LaunchAgents:
+   - `com.browser.visit.logger.snapshot_mover` (`StartInterval = 3600`s,
+     hourly) — runs the move + seal pass.
+   - `com.browser.visit.logger.snapshot_verifier` (`StartInterval =
+     604800`s, weekly) — anti-entropy: re-checks every sealed
+     directory's manifest against disk + DB; failures escalate
+     immediately via Notification Center.
 4. Prints the extension ID and where to load the unpacked extension.
 
 After it finishes:
@@ -360,11 +366,36 @@ Exit codes: `0` if every directory verified passes; `1` if any
 directory fails verification, if the target doesn't exist, or on
 argument errors.
 
-To run on a schedule (macOS), add a second LaunchAgent that invokes
-the verifier with `--quiet --record --all`. Failures land in
-`mover_errors` keyed on the directory path, escalate immediately
-(`manifest_invalid` is classified as immediate), and surface via the
-same Notification Center banner the mover uses.
+**Anti-entropy schedule (macOS, installed by `install.sh`)**
+
+`install.sh` registers a second LaunchAgent —
+`com.browser.visit.logger.snapshot_verifier` — that invokes
+`snapshot_verifier.py --quiet --record --all` on a configurable
+`StartInterval` (default `604800` seconds = **1 week**).  Each tick:
+
+- Audits every `sealed=1` row in the `snapshots` table.
+- Records failures into `mover_errors` as op `manifest_invalid`
+  (immediate-class, so notification fires on first occurrence).
+- Clears `manifest_invalid` rows for directories that re-pass.
+- Drains the notification queue via `_escalate_errors`, so any
+  finding (and any other unread mover_errors row past its
+  threshold) reaches the user immediately — no waiting for the
+  next mover tick.
+
+Logs land in `~/browser-visits-verifier.log`.
+
+To change the cadence, edit `StartInterval` in
+`~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist`
+and reload:
+
+```bash
+launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_verifier
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist
+```
+
+Common values: `86400` (daily), `604800` (weekly, default),
+`2592000` (~monthly).  To audit on demand without waiting for the
+next tick, just run the script directly with `--all`.
 
 ### `reset.py`
 
@@ -490,6 +521,7 @@ env vars; env vars override defaults.
 | `BVL_LOG_FILE` | `~/browser-visits.log` | host, reset |
 | `BVL_HOST_LOG` | `~/browser-visits-host.log` | host, reset |
 | `BVL_MOVER_LOG` | `~/browser-visits-mover.log` | reset (mover writes via LaunchAgent stdout/stderr) |
+| `BVL_VERIFIER_LOG` | `~/browser-visits-verifier.log` | reset (verifier writes via LaunchAgent stdout/stderr) |
 | `BVL_DB_FILE` | `~/browser-visits.db` | host, mover, sealer, reset |
 | `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, reset |
 | `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer |
@@ -531,7 +563,8 @@ browser-visit-logger/
 │   ├── snapshot_sealer.py                  # Manual sealer CLI
 │   ├── snapshot_verifier.py                # Manifest verifier CLI
 │   ├── com.browser.visit.logger.json       # Host manifest (template-installed)
-│   └── com.browser.visit.logger.snapshot_mover.plist.template
+│   ├── com.browser.visit.logger.snapshot_mover.plist.template
+│   └── com.browser.visit.logger.snapshot_verifier.plist.template
 ├── tests/                                  # Python (pytest) + JS (jest)
 ├── install.sh
 ├── reset.py

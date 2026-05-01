@@ -32,6 +32,9 @@ HOST_PY="$NATIVE_DIR/host.py"
 MOVER_PY="$NATIVE_DIR/snapshot_mover.py"
 MOVER_PLIST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.snapshot_mover.plist.template"
 MOVER_PLIST_LABEL="com.browser.visit.logger.snapshot_mover"
+VERIFIER_PY="$NATIVE_DIR/snapshot_verifier.py"
+VERIFIER_PLIST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.snapshot_verifier.plist.template"
+VERIFIER_PLIST_LABEL="com.browser.visit.logger.snapshot_verifier"
 KEY_PEM="$NATIVE_DIR/generated_key.pem"
 HOST_NAME="com.browser.visit.logger"
 
@@ -222,6 +225,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 5c: Install snapshot verifier LaunchAgent (macOS only, anti-entropy)
+# ---------------------------------------------------------------------------
+VERIFIER_INSTALLED=0
+if [[ "$OS" == "Darwin" ]]; then
+  chmod +x "$VERIFIER_PY"
+  VERIFIER_PY_ABS="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$VERIFIER_PY")"
+
+  VERIFIER_PLIST="$LAUNCHAGENTS_DIR/$VERIFIER_PLIST_LABEL.plist"
+
+  # Substitute placeholders in the verifier plist template.
+  python3 - "$VERIFIER_PLIST_TEMPLATE" "$VERIFIER_PLIST" "$VERIFIER_PY_ABS" "$HOME" <<'PYEOF'
+import sys
+template_path, out_path, verifier_path, home = sys.argv[1:5]
+with open(template_path) as f:
+    text = f.read()
+text = text.replace('{{VERIFIER_PATH}}', verifier_path).replace('{{HOME}}', home)
+with open(out_path, 'w') as f:
+    f.write(text)
+PYEOF
+  info "Wrote LaunchAgent plist to $VERIFIER_PLIST"
+
+  launchctl bootout "$USER_DOMAIN/$VERIFIER_PLIST_LABEL" 2>/dev/null || true
+  if launchctl bootstrap "$USER_DOMAIN" "$VERIFIER_PLIST" 2>/dev/null; then
+    info "Verifier LaunchAgent loaded — runs every 604800s (1 week) by default."
+    VERIFIER_INSTALLED=1
+  else
+    info "WARNING: failed to bootstrap verifier LaunchAgent; you may need to log out/in or run 'launchctl bootstrap $USER_DOMAIN $VERIFIER_PLIST' manually."
+  fi
+else
+  info "Snapshot verifier LaunchAgent is macOS-only; skipping on $OS."
+fi
+
+# ---------------------------------------------------------------------------
 # Step 6: Print next-step instructions
 # ---------------------------------------------------------------------------
 cat <<EOF
@@ -230,10 +266,11 @@ cat <<EOF
   Browser Visit Logger — Installation complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Extension ID : $EXTENSION_ID
-Extension dir: $EXTENSION_DIR
-Native host  : $HOST_PY_ABS
-Snapshot mover: $([[ "$OS" == "Darwin" ]] && echo "$MOVER_PLIST_LABEL (LaunchAgent, every 3600s)" || echo "macOS-only, not installed")
+Extension ID    : $EXTENSION_ID
+Extension dir   : $EXTENSION_DIR
+Native host     : $HOST_PY_ABS
+Snapshot mover  : $([[ "$OS" == "Darwin" ]] && echo "$MOVER_PLIST_LABEL (LaunchAgent, every 3600s)" || echo "macOS-only, not installed")
+Snapshot verifier: $([[ "$OS" == "Darwin" ]] && echo "$VERIFIER_PLIST_LABEL (LaunchAgent, every 604800s)" || echo "macOS-only, not installed")
 
 Next steps:
   1. Open Chrome and go to: chrome://extensions
@@ -254,6 +291,15 @@ To change the snapshot mover interval (default 3600s):
        launchctl bootout gui/\$(id -u)/$MOVER_PLIST_LABEL
        launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$MOVER_PLIST_LABEL.plist
   • Mover output is logged to ~/browser-visits-mover.log
+
+To change the snapshot verifier interval (default 604800s = 1 week):
+  • Edit the StartInterval value in:
+       ~/Library/LaunchAgents/$VERIFIER_PLIST_LABEL.plist
+  • Reload it:
+       launchctl bootout gui/\$(id -u)/$VERIFIER_PLIST_LABEL
+       launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$VERIFIER_PLIST_LABEL.plist
+  • Verifier output is logged to ~/browser-visits-verifier.log
+  • To audit on demand: python3 $VERIFIER_PY_ABS --all
 
 If Chrome shows a different extension ID, re-run this script to regenerate.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

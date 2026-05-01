@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for Browser Visit Logger snapshot verifier (anti-entropy).
+
+  install.sh fills in the VERIFIER_PATH and HOME placeholders and writes
+  the result to:
+      ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist
+  then loads it via `launchctl bootstrap`.
+
+  Each tick runs the verifier in record-and-quiet mode against every sealed
+  daily directory tracked in the snapshots table.  Failures are written to
+  the mover_errors table as op 'manifest_invalid' and surfaced to the user
+  via macOS Notification Center; on subsequent passes the row clears
+  automatically once verification succeeds again.
+
+  StartInterval default is 604800 seconds (1 week).  Common alternative
+  values: 86400 (daily) or 2592000 (~monthly).  To change the cadence,
+  edit the integer below and reload:
+      launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_verifier
+      launchctl bootstrap gui/$(id -u) <path/to/this/plist>
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.browser.visit.logger.snapshot_verifier</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>{{VERIFIER_PATH}}</string>
+        <string>--quiet</string>
+        <string>--record</string>
+        <string>--all</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>604800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/browser-visits-verifier.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/browser-visits-verifier.log</string>
+</dict>
+</plist>
