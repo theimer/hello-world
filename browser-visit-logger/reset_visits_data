@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# reset_visits_data — convenience wrapper around reset.py.
+#
+# Wipes the local data the extension produced (logs, DB, snapshot
+# directories — selectable via flags).  All arguments are forwarded
+# verbatim to the underlying Python script; --help is supported and
+# produces both a brief wrapper note and the script's full --help
+# output.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="$SCRIPT_DIR/reset.py"
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      cat <<'EOF'
+reset_visits_data — wrapper around reset.py
+
+Wipes local data the extension produced.  Without flags, resets
+everything (visit log, host log, mover log, verifier log, DB, both
+snapshot directories) after a confirmation prompt.  Use the per-target
+flags to scope the reset; -f / --force skips confirmation.  All
+arguments are forwarded verbatim to the Python script.
+
+The remainder of this help is from the Python script:
+
+EOF
+      exec python3 "$TARGET" --help
+      ;;
+  esac
+done
+
+exec python3 "$TARGET" "$@"

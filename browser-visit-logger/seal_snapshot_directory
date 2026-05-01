@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# seal_snapshot_directory — convenience wrapper around
+# native-host/snapshot_sealer.py.
+#
+# Manually seals one daily snapshot directory (writes a read-only
+# MANIFEST.tsv and flips the snapshots row to sealed=1).  All arguments
+# are forwarded verbatim to the underlying Python script; --help is
+# supported and produces both a brief wrapper note and the script's full
+# --help output.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="$SCRIPT_DIR/native-host/snapshot_sealer.py"
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      cat <<'EOF'
+seal_snapshot_directory — wrapper around native-host/snapshot_sealer.py
+
+Manually seals one daily snapshot directory by date or path.  All
+arguments are forwarded verbatim to the Python script.  Useful for
+testing or for closing a directory before the auto seal pass would
+otherwise pick it up.
+
+The remainder of this help is from the Python script:
+
+EOF
+      exec python3 "$TARGET" --help
+      ;;
+  esac
+done
+
+exec python3 "$TARGET" "$@"

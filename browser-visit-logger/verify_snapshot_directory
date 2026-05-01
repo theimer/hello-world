@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# verify_snapshot_directory — convenience wrapper around
+# native-host/snapshot_verifier.py.
+#
+# Audits one (or every, with --all) sealed daily snapshot directory's
+# MANIFEST.tsv against the on-disk filesystem and the database.  All
+# arguments are forwarded verbatim to the underlying Python script;
+# --help is supported and produces both a brief wrapper note and the
+# script's full --help output.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="$SCRIPT_DIR/native-host/snapshot_verifier.py"
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      cat <<'EOF'
+verify_snapshot_directory — wrapper around native-host/snapshot_verifier.py
+
+Audits one (or every, with --all) sealed daily snapshot directory's
+MANIFEST.tsv against the on-disk filesystem and the database.  All
+arguments are forwarded verbatim to the Python script.  Combine
+--quiet --record --all for the canonical background-process invocation;
+omit --record for a side-effect-free terminal check.
+
+The remainder of this help is from the Python script:
+
+EOF
+      exec python3 "$TARGET" --help
+      ;;
+  esac
+done
+
+exec python3 "$TARGET" "$@"

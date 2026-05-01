@@ -184,6 +184,20 @@ All scripts live at the repo root or under `native-host/`. They share
 the same `BVL_*` env-var conventions and accept overriding flags so
 they're safe to point at test data.
 
+The four user-facing Python scripts each have an executable Bash
+wrapper at the repo root for convenience — e.g. `./move_snapshot
+--show-errors` instead of `python3 native-host/snapshot_mover.py
+--show-errors`. Each wrapper forwards all arguments verbatim and
+intercepts `--help` / `-h` to print a one-line wrapper note before
+delegating to the Python script's own argparse `--help`.
+
+| Wrapper | Underlying script |
+|---------|-------------------|
+| `./move_snapshot` | `native-host/snapshot_mover.py` |
+| `./seal_snapshot_directory` | `native-host/snapshot_sealer.py` |
+| `./verify_snapshot_directory` | `native-host/snapshot_verifier.py` |
+| `./reset_visits_data` | `reset.py` |
+
 ### `install.sh`
 
 One-shot installer; see [Installation](#installation). Re-run it any
@@ -569,6 +583,10 @@ browser-visit-logger/
 ├── install.sh
 ├── reset.py
 ├── point-to-worktree.py
+├── move_snapshot                           # Bash wrapper → snapshot_mover.py
+├── seal_snapshot_directory                 # Bash wrapper → snapshot_sealer.py
+├── verify_snapshot_directory               # Bash wrapper → snapshot_verifier.py
+├── reset_visits_data                       # Bash wrapper → reset.py
 ├── package.json                            # JS test deps + jest config
 └── requirements-test.txt                   # Python test deps
 ```
