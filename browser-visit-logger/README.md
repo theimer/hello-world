@@ -304,6 +304,68 @@ Files in the directory with no matching DB row appear with empty
 metadata fields. Tabs / newlines / CRs in titles are sanitised to
 spaces.
 
+### `native-host/snapshot_verifier.py`
+
+Checks that a sealed daily directory's `MANIFEST.tsv` is correct and
+consistent with the database. Designed to be invoked from either a
+terminal (ad-hoc auditing) or a background process (a periodic
+LaunchAgent / cron job).
+
+```bash
+# Verify by date (resolved under ICLOUD_SNAPSHOTS_DIR)
+python3 native-host/snapshot_verifier.py 2026-04-30
+
+# Verify by absolute or relative path
+python3 native-host/snapshot_verifier.py /Users/me/.../snapshots/2026-04-30
+
+# Verify every sealed directory in the snapshots table
+python3 native-host/snapshot_verifier.py --all
+
+# Background mode: silent on success, record failures into mover_errors
+# so they surface via the standard notification pipeline
+python3 native-host/snapshot_verifier.py --quiet --record --all
+```
+
+Flags:
+
+| Flag | Effect |
+|------|--------|
+| (positional `directory`) | Date or path to verify |
+| `--all` | Verify every `sealed=1` row in the `snapshots` table (mutually exclusive with the positional) |
+| `--quiet` | Print only failure summaries — suitable for background invocation |
+| `--record` | UPSERT each failure into `mover_errors` as op `manifest_invalid` (and clear the row on subsequent success) |
+| `-v`, `--verbose` | DEBUG log level |
+| `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
+| `--db FILE` | Override `BVL_DB_FILE` |
+
+Checks performed against each target directory:
+
+1. `MANIFEST.tsv` exists.
+2. Manifest is read-only (mode `0o444`).
+3. First line is the canonical header.
+4. Every data row has exactly 5 tab-delimited columns; no duplicate filenames.
+5. **Every file in the directory** (other than `MANIFEST.tsv` itself)
+   has a conforming snapshot filename — non-conforming files are
+   flagged whether or not they appear in the manifest.
+6. The set of conforming snapshot files in the directory equals the
+   set of filenames listed in the manifest.
+7. **Every manifest row has a corresponding events row in the DB**, and
+   its `(tag, timestamp, url, title)` matches. Orphan rows (manifest
+   entries with no DB backing) are always invalid.
+8. **Every conforming file in the directory has an events row in the
+   DB.** Orphan files are always invalid, even when correctly excluded
+   from the manifest.
+
+Exit codes: `0` if every directory verified passes; `1` if any
+directory fails verification, if the target doesn't exist, or on
+argument errors.
+
+To run on a schedule (macOS), add a second LaunchAgent that invokes
+the verifier with `--quiet --record --all`. Failures land in
+`mover_errors` keyed on the directory path, escalate immediately
+(`manifest_invalid` is classified as immediate), and surface via the
+same Notification Center banner the mover uses.
+
 ### `reset.py`
 
 Wipes local data the extension produced. Asks for confirmation by default.
@@ -369,12 +431,20 @@ notification once the row qualifies:
   - `top_level` — uncaught exception in `main()`.
   - `rewrite_manifest` — straggler-rewrite failure (only triggered by
     a fresh straggler arriving in the same dir).
+  - `manifest_invalid` — `snapshot_verifier.py --record` found a
+    sealed directory whose `MANIFEST.tsv` failed one or more checks.
+    Auto-clears on the next successful verification.
   - `invalid_filename` — a file in `~/Downloads/browser-visit-snapshots/`
     or in a daily snapshot directory has a name that doesn't match the
     canonical `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format.  The
     Downloads file is left in place; date-dir files are excluded from
     the manifest.  The row auto-clears when the user removes or
     renames the file.
+  - `orphan_file` — a conforming-named snapshot file in a daily
+    directory has no matching `read_events` / `skimmed_events` row.
+    The file is excluded from the manifest.  The row auto-clears when
+    the user removes the file or re-tags its URL via the popup so an
+    events row is recorded.
   - `OSError` with errno in `{ENOSPC, EROFS, EDQUOT}` — disk full,
     read-only filesystem, or quota exceeded.
   - `sqlite3.DatabaseError` other than `OperationalError` — typically
@@ -459,6 +529,7 @@ browser-visit-logger/
 │   ├── host.py                             # Native messaging host
 │   ├── snapshot_mover.py                   # Periodic archiver (mover + seal)
 │   ├── snapshot_sealer.py                  # Manual sealer CLI
+│   ├── snapshot_verifier.py                # Manifest verifier CLI
 │   ├── com.browser.visit.logger.json       # Host manifest (template-installed)
 │   └── com.browser.visit.logger.snapshot_mover.plist.template
 ├── tests/                                  # Python (pytest) + JS (jest)

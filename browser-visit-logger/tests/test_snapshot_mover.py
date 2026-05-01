@@ -734,16 +734,59 @@ class TestSealPass(_MoverTestBase):
             elif 's.mhtml' in fields[0]:
                 self.assertEqual(fields[1], 'skimmed')
 
-    def test_manifest_handles_file_without_db_row(self):
-        self._seed_dir('2024-01-15', [
+    def test_manifest_excludes_orphan_files_and_records_orphan_error(self):
+        # A conforming snapshot file with no events row is an orphan.
+        # Per the "correct sealed directory" invariant, orphans must
+        # NOT appear in the manifest — the mover excludes them and
+        # records an 'orphan_file' mover_errors row instead.
+        date_subdir = self._seed_dir('2024-01-15', [
             ('2024-01-15T10-00-00Z-orphan.mhtml', None, None, None, None),
         ])
         snapshot_mover.main()
         lines = self._read_manifest('2024-01-15').splitlines()
-        self.assertEqual(len(lines), 2)  # header + 1 row
-        # All metadata fields blank after the filename
-        self.assertEqual(lines[1].split('\t'),
-                         ['2024-01-15T10-00-00Z-orphan.mhtml', '', '', '', ''])
+        # Header only — orphan excluded.
+        self.assertEqual(lines, ['filename\ttag\ttimestamp\turl\ttitle'])
+        conn = sqlite3.connect(self.db_file)
+        row = conn.execute(
+            "SELECT operation, target FROM mover_errors "
+            "WHERE operation = 'orphan_file'"
+        ).fetchone()
+        conn.close()
+        expected_target = os.path.join(
+            date_subdir, '2024-01-15T10-00-00Z-orphan.mhtml')
+        self.assertEqual(row, ('orphan_file', expected_target))
+
+    def test_manifest_clears_orphan_file_error_when_events_row_appears(self):
+        # Pre-seed an orphan_file error, then add the missing events row
+        # and re-run main().  Reconcile should clear the error.
+        date_str = '2024-01-15'
+        date_subdir = self._seed_dir(date_str, [
+            ('2024-01-15T10-00-00Z-x.mhtml', None, None, None, None),
+        ])
+        orphan_path = os.path.join(date_subdir, '2024-01-15T10-00-00Z-x.mhtml')
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._record_error(
+            conn, 'orphan_file', orphan_path,
+            ValueError('previous orphan'))
+        # Now add the missing events row so the file is no longer an orphan.
+        host.insert_visit(conn, '2024-01-15T10:00:00Z', 'https://x.com', 'X')
+        conn.execute(
+            "INSERT INTO read_events (url, timestamp, filename, directory) "
+            "VALUES (?, ?, ?, ?)",
+            ('https://x.com', '2024-01-15T10:00:00Z',
+             '2024-01-15T10-00-00Z-x.mhtml', date_subdir),
+        )
+        conn.commit()
+        conn.close()
+
+        snapshot_mover.main()
+
+        conn = sqlite3.connect(self.db_file)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'orphan_file'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
 
     def test_recovery_rewrites_existing_manifest_and_marks_sealed(self):
         # Crash-recovery branch: a prior run wrote the manifest but didn't

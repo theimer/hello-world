@@ -153,12 +153,20 @@ _FIX_HINTS = {
     'invalid_filename':
         "Rename the file to match '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' "
         'or remove it; the row clears on the next mover run.',
+    'orphan_file':
+        'Snapshot file has no matching events row.  Either delete the '
+        'file, or re-tag its URL via the popup to recreate the row; '
+        'either way clears on the next mover run.',
     'missing_directory':
         "Re-create the directory, OR remove the snapshots row "
         "(`sqlite3 <db> \"DELETE FROM snapshots WHERE date='<YYYY-MM-DD>'\"`).",
     'top_level':
         'Check ~/browser-visits-mover.log for the traceback, then '
         '`snapshot_mover.py --clear-errors` once the bug is fixed.',
+    'manifest_invalid':
+        'Re-seal the directory: delete MANIFEST.tsv and run '
+        '`snapshot_sealer.py <date>`, then `snapshot_mover.py '
+        '--clear-error N` to clear this row.',
 }
 
 EVENTS_TABLES = ('read_events', 'skimmed_events')
@@ -299,21 +307,25 @@ def _try_clear_error(conn, op, target):
             'Could not clear %s error for %s: %s', op, target, inner)
 
 
-def _reconcile_invalid_filename_errors(conn, dir_path, current_strays):
-    """Auto-heal 'invalid_filename' rows under dir_path.
+def _reconcile_dir_scoped_errors(conn, op, dir_path, current_strays):
+    """Auto-heal `op` rows whose target lives under dir_path.
 
-    Removes rows whose target lives under dir_path but isn't in the
-    current_strays set — i.e. files the user has since renamed or
-    removed.  Used by both the move pass (Downloads scan) and
-    _build_manifest_rows (date-subdir scan), each scoped to its own
-    directory.
+    Removes rows whose target is under dir_path but isn't in the
+    current_strays set — i.e. files the user has since renamed,
+    removed, or otherwise resolved.  Used by:
+
+      - _move_pass with op='invalid_filename' on Downloads.
+      - _build_manifest_rows with op='invalid_filename' on the date dir
+        (non-conforming filenames excluded from the manifest).
+      - _build_manifest_rows with op='orphan_file' on the date dir
+        (conforming files with no DB row, also excluded from the manifest).
 
     Best-effort: logs and returns on DB error.
     """
     try:
         prior = conn.execute(
             "SELECT key, target FROM mover_errors WHERE operation = ?",
-            ('invalid_filename',),
+            (op,),
         ).fetchall()
         prefix = os.path.join(dir_path, '')   # ensures trailing path separator
         current_set = set(current_strays)
@@ -324,8 +336,8 @@ def _reconcile_invalid_filename_errors(conn, dir_path, current_strays):
         conn.commit()
     except sqlite3.Error as inner:
         logger.error(
-            'Could not reconcile invalid_filename errors under %s: %s',
-            dir_path, inner,
+            'Could not reconcile %s errors under %s: %s',
+            op, dir_path, inner,
         )
 
 
@@ -351,7 +363,8 @@ def _is_immediate(op, exc):
     3. Catastrophic OSError errnos and DB integrity errors — the
        underlying disk / DB needs attention before any retry can succeed.
     """
-    if op in ('top_level', 'rewrite_manifest', 'invalid_filename'):
+    if op in ('top_level', 'rewrite_manifest', 'invalid_filename',
+              'orphan_file', 'manifest_invalid'):
         return True
     if isinstance(exc, OSError) and exc.errno in _IMMEDIATE_OSERROR_ERRNOS:
         return True
@@ -496,8 +509,8 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
 
     # Auto-heal: clear invalid_filename rows for files in Downloads that
     # the user has since renamed or removed.
-    _reconcile_invalid_filename_errors(
-        conn, DOWNLOADS_SNAPSHOTS_DIR, current_invalid)
+    _reconcile_dir_scoped_errors(
+        conn, 'invalid_filename', DOWNLOADS_SNAPSHOTS_DIR, current_invalid)
 
 
 def _move_one(
@@ -710,14 +723,20 @@ def _rewrite_manifest_for_straggler(
 def _build_manifest_rows(
     conn: sqlite3.Connection, date_subdir: str,
 ):
-    """Return one tuple per *conforming* snapshot file in the directory,
-    sorted by filename.
+    """Return one tuple per *conforming, non-orphan* snapshot file in the
+    directory, sorted by filename.
 
-    Files whose names don't match the canonical
-    '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' format are excluded from the
-    manifest; an ERROR is logged and an 'invalid_filename' mover_errors row
-    is recorded so the user is notified.  Conforming files with no matching
-    DB row are still included (with empty metadata fields).
+    Two categories are excluded from the manifest, each producing an
+    ERROR log line plus a mover_errors row so the user is notified:
+
+      - Non-conforming filenames (don't match
+        '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>') → op 'invalid_filename'.
+      - Conforming files with no matching events row in the DB
+        (orphans) → op 'orphan_file'.
+
+    The exclusion of orphan files matches the "correct sealed directory"
+    invariant enforced by snapshot_verifier.py: every manifest row must
+    correspond to a real DB row.
     """
     files = sorted(
         f for f in os.listdir(date_subdir)
@@ -726,6 +745,7 @@ def _build_manifest_rows(
     )
     rows = []
     current_invalid = []
+    current_orphan = []
     for filename in files:
         full_path = os.path.join(date_subdir, filename)
         if not _SNAPSHOT_FILENAME_RE.match(filename):
@@ -741,19 +761,35 @@ def _build_manifest_rows(
             continue
         info = _lookup_event(conn, filename, date_subdir)
         if info is None:
-            rows.append((_tsv_sanitise(filename), '', '', '', ''))
-        else:
-            rows.append((
-                _tsv_sanitise(filename),
-                info['tag'],
-                _tsv_sanitise(info['timestamp']),
-                _tsv_sanitise(info['url']),
-                _tsv_sanitise(info['title']),
-            ))
+            # Orphan file: a conforming snapshot file with no events row.
+            # Per the "correct sealed directory" definition, such files
+            # are not allowed in the manifest.  Exclude and record so the
+            # user can either re-tag the URL or remove the file.
+            logger.error(
+                'Excluding %s from manifest — no events row in DB for '
+                'this file (orphan)', full_path,
+            )
+            _try_record_error(
+                conn, 'orphan_file', full_path,
+                ValueError('snapshot file has no matching events row'),
+            )
+            current_orphan.append(full_path)
+            continue
+        rows.append((
+            _tsv_sanitise(filename),
+            info['tag'],
+            _tsv_sanitise(info['timestamp']),
+            _tsv_sanitise(info['url']),
+            _tsv_sanitise(info['title']),
+        ))
 
-    # Auto-heal: clear invalid_filename rows for files in this dir that
-    # the user has since renamed or removed.
-    _reconcile_invalid_filename_errors(conn, date_subdir, current_invalid)
+    # Auto-heal: clear invalid_filename / orphan_file rows for files in
+    # this dir that the user has since fixed (renamed, removed, or — for
+    # orphans — recorded an events row for).
+    _reconcile_dir_scoped_errors(
+        conn, 'invalid_filename', date_subdir, current_invalid)
+    _reconcile_dir_scoped_errors(
+        conn, 'orphan_file', date_subdir, current_orphan)
     return rows
 
 
