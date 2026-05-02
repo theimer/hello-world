@@ -43,13 +43,13 @@ read-only, and (once the day has fully passed) writes a
 
 | Path | What it is |
 |------|------------|
-| `~/browser-visits.log` | TSV append-only log of every visit and tag action |
-| `~/browser-visits.db` | SQLite database — `visits`, `read_events`, `skimmed_events` |
+| `~/browser-visits-<YYYY-MM-DD>.log` | Per-day TSV append-only log of every visit and tag action.  One file per UTC day; the sealer collects each completed day's log into the matching iCloud sealed dir |
+| `~/browser-visits.db` | SQLite database — `visits`, `read_events`, `skimmed_events`, `snapshots`, `mover_errors` |
 | `~/browser-visits-host.log` | Native host process log (rotated, 1 MiB × 3) |
 | `~/browser-visits-mover.log` | Snapshot mover process log (LaunchAgent stdout/stderr) |
 | `~/browser-visits-verifier.log` | Snapshot verifier process log (LaunchAgent stdout/stderr) |
 | `~/Downloads/browser-visit-snapshots/` | Snapshot staging dir (Chrome writes here) |
-| `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive (read-only files + read-only `MANIFEST.tsv`) |
+| `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive: read-only snapshot files + read-only `MANIFEST.tsv` + read-only `browser-visits-<YYYY-MM-DD>.log` |
 
 All paths can be overridden via `BVL_*` environment variables — see
 [Configuration](#configuration).
@@ -141,7 +141,7 @@ After it finishes:
    the installer.
 4. Visit any page, then verify with:
    ```bash
-   tail ~/browser-visits.log
+   tail ~/browser-visits-$(date -u +%Y-%m-%d).log
    sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY timestamp DESC LIMIT 10;"
    ```
 
@@ -269,12 +269,25 @@ exclusive.
    recovered on the next tick.
 2. **Seal pass** — DB-driven, no filesystem rescan. Queries
    `snapshots WHERE sealed = 0 AND date < today_utc`. For each row:
-   verifies the on-disk directory exists (warns and skips if not),
-   writes a tab-delimited `MANIFEST.tsv` enumerating the directory's
-   contents, chmods it `0o444`, then flips `sealed = 1`. If the
-   manifest already exists (recovery from a partial prior seal that
-   crashed before the DB update), the file is left untouched and only
-   the DB flag is flipped.
+   creates `<dest>/<YYYY-MM-DD>/` if it doesn't yet exist (covers
+   activity-only days where host wrote a per-day log but no snapshot
+   files landed), writes a tab-delimited `MANIFEST.tsv` enumerating
+   the directory's contents and chmods it `0o444`, **moves
+   `<BVL_LOG_DIR>/browser-visits-<date>.log` into the dir and chmods
+   it `0o444`**, then flips `sealed = 1`.  If the manifest write or
+   log move fails, the row stays at `sealed=0` and the next tick
+   retries.
+3. **Orphan-log merge pass** — anti-entropy for the rare case where a
+   host invocation in flight at seal time leaves a result line in
+   `<BVL_LOG_DIR>` after the seal already moved its action half into
+   iCloud.  Each tick the mover scans `BVL_LOG_DIR` for past-day
+   `browser-visits-<date>.log` files; for any whose iCloud
+   counterpart already exists, the orphan is appended into the iCloud
+   copy (chmod 0o644 → append → chmod 0o444) and the orphan is
+   deleted.  For any whose iCloud counterpart doesn't exist (host
+   crashed mid-startup before it could insert the snapshots row),
+   `INSERT OR IGNORE INTO snapshots (date, sealed=0)` so the next
+   normal seal pass picks it up.
 
 ### `native-host/snapshot_sealer.py`
 
@@ -311,8 +324,12 @@ delete the manifest first.
 
 If the directory's basename is a valid `YYYY-MM-DD` date, the sealer
 also upserts a `(date, sealed=1)` row into the `snapshots` table — so
-the auto seal pass won't re-process it. Non-date-named directories
-get a manifest but no table row.
+the auto seal pass won't re-process it.  When a per-day log file
+exists in `BVL_LOG_DIR` for that date, it's moved into the sealed dir
+(chmod `0o444`) as part of the seal — same flow as the auto sealer.
+The orphan-log merge pass also runs after the manual seal, so
+ad-hoc seals clean up any race orphans in `BVL_LOG_DIR`.
+Non-date-named directories get a manifest but no table row and no log.
 
 **Manifest format** — `MANIFEST.tsv`, one header row + one row per file:
 
@@ -417,19 +434,23 @@ next tick, just run the script directly with `--all`.
 Wipes local data the extension produced. Asks for confirmation by default.
 
 ```bash
-# Reset everything (visit log, host log, mover log, DB, both snapshot dirs)
+# Reset everything (per-day visit logs, host log, mover log, DB, both snapshot dirs)
 python3 reset.py
 
 # Skip confirmation
 python3 reset.py -f
 
 # Reset one thing only
-python3 reset.py --log         # ~/browser-visits.log
+python3 reset.py --log         # all ~/browser-visits-<date>.log files in BVL_LOG_DIR
 python3 reset.py --host-log    # host log + mover log
 python3 reset.py --db          # ~/browser-visits.db
 python3 reset.py --snapshots   # ~/Downloads/browser-visit-snapshots/
-python3 reset.py --icloud      # ~/Documents/browser-visit-logger/
+python3 reset.py --icloud      # ~/Documents/browser-visit-logger/  (also wipes per-day logs sealed in iCloud)
 ```
+
+`--log` only deletes per-day logs that still live in `BVL_LOG_DIR`.
+Per-day logs that have already been moved into iCloud sealed dirs are
+wiped by `--icloud` — same separation between log and snapshot data.
 
 Respects the same `BVL_*` env vars as the host, so custom paths Just
 Work. Safe to run with no targets present — missing files/dirs are
@@ -438,15 +459,21 @@ reported and skipped.
 ### `native-host/visits_rebuilder.py`
 
 Reconstructs `~/browser-visits.db` from two side-channels that survive
-DB loss: the on-disk log (`~/browser-visits.log`) and the iCloud
-snapshot archive.  Two phases run by default:
+DB loss: the per-day on-disk logs (`~/browser-visits-<date>.log` plus
+each sealed iCloud subdir's bundled log) and the iCloud snapshot
+archive.  Two phases run by default:
 
 1. **Log replay** — every host invocation writes a UUID-prefixed
-   action line followed by a result line; the rebuilder pairs them by
-   UUID and re-applies each *successful* action via the same
-   `host.py` helpers used at write-time.  Error pairs are skipped
-   (the DB write didn't happen).  Orphan / malformed lines are
-   counted and trip a non-zero exit.
+   action line followed by a result line, pinned to the day the
+   invocation started.  The rebuilder enumerates per-day logs from
+   `BVL_LOG_DIR` *and* every sealed iCloud subdir, sorts them
+   chronologically, and pairs action+result UUIDs across files (so
+   the rare cross-day seal-race orphan is handled correctly).
+   Successful pairs are re-applied via the same `host.py` helpers
+   used at write-time; error pairs are skipped (the DB write didn't
+   happen); orphan / malformed lines are counted and trip a non-zero
+   exit.  Each replayed log file's date also produces a `snapshots`
+   row (mirrors the live INSERT host.py does).
 2. **Filesystem rehydration** — iterates every `YYYY-MM-DD`
    subdirectory under the iCloud root, upserts a `snapshots` row
    (`sealed = 1` if `MANIFEST.tsv` exists), and updates each event
@@ -461,15 +488,15 @@ snapshot archive.  Two phases run by default:
 # Skip the wipe; rely on idempotency
 ./rebuild_visits_data --no-truncate
 
-# Phase 1 only (e.g. log present, iCloud unreachable)
+# Phase 1 only (e.g. logs present, iCloud unreachable)
 ./rebuild_visits_data --log-only
 
-# Phase 2 only (log lost, iCloud archive intact)
+# Phase 2 only (logs lost, iCloud archive intact)
 ./rebuild_visits_data --rehydrate-only
 
 # Operate on isolated paths (useful in tests / experiments)
 ./rebuild_visits_data \
-    --log /tmp/visits.log --db /tmp/test.db \
+    --log-dir /tmp/logs --db /tmp/test.db \
     --source /tmp/dl --dest /tmp/icloud
 ```
 
@@ -479,7 +506,7 @@ Flags:
 |------|--------|
 | `--truncate` (default) / `--no-truncate` | DROP and recreate the four rebuildable tables before phase 1.  `mover_errors` is left alone in either case. |
 | `--log-only` / `--rehydrate-only` | Skip phase 2 / phase 1 (mutually exclusive). |
-| `--log FILE` | Override `BVL_LOG_FILE` |
+| `--log-dir DIR` | Override `BVL_LOG_DIR` (the per-day logs root) |
 | `--db FILE` | Override `BVL_DB_FILE` |
 | `--source DIR` | Override `BVL_DOWNLOADS_SNAPSHOTS_DIR` |
 | `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
@@ -593,13 +620,13 @@ env vars; env vars override defaults.
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `BVL_LOG_FILE` | `~/browser-visits.log` | host, reset |
+| `BVL_LOG_DIR` | `~` | host, mover (orphan-merge + log move during seal), sealer, rebuilder, reset.  The directory holding per-day `browser-visits-<UTC-date>.log` files. |
 | `BVL_HOST_LOG` | `~/browser-visits-host.log` | host, reset |
 | `BVL_MOVER_LOG` | `~/browser-visits-mover.log` | reset (mover writes via LaunchAgent stdout/stderr) |
 | `BVL_VERIFIER_LOG` | `~/browser-visits-verifier.log` | reset (verifier writes via LaunchAgent stdout/stderr) |
-| `BVL_DB_FILE` | `~/browser-visits.db` | host, mover, sealer, reset |
-| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, reset |
-| `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer |
+| `BVL_DB_FILE` | `~/browser-visits.db` | host, mover, sealer, rebuilder, reset |
+| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, rebuilder, reset |
+| `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer, rebuilder |
 | `BVL_MOVER_MIN_AGE_SECONDS` | `60` | mover |
 | `BVL_MOVER_ERROR_THRESHOLD` | `3` | mover (consecutive failures before persistent-error notification) |
 

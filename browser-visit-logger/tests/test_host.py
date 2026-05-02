@@ -109,18 +109,20 @@ class TestWriteMessage(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 FIXED_REC_ID = '0' * 32  # placeholder UUID hex; tests assert on field positions
+FIXED_DATE   = '2026-01-15'  # placeholder UTC date; per-day log files key off this
 
 
 class TestAppendLog(unittest.TestCase):
 
     def _run(self, timestamp, url, title, tag='', filename='',
-             record_id=FIXED_REC_ID) -> str:
-        """Call append_log with a temp file and return its contents."""
+             record_id=FIXED_REC_ID, date_iso=FIXED_DATE) -> str:
+        """Call append_log against a temp LOG_DIR and return the per-day file."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'visits.log')
-            with patch.object(host, 'LOG_FILE', path):
-                host.append_log(record_id, timestamp, url, title, tag, filename)
-            return Path(path).read_text(encoding='utf-8')
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_log(record_id, date_iso, timestamp, url, title,
+                                tag, filename)
+            return Path(tmp, f'browser-visits-{date_iso}.log').read_text(
+                encoding='utf-8')
 
     def test_tsv_format(self):
         content = self._run('2026-01-01T00:00:00Z', 'https://example.com', 'Example Domain')
@@ -151,10 +153,12 @@ class TestAppendLog(unittest.TestCase):
 
     def test_appends_multiple_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'visits.log')
-            with patch.object(host, 'LOG_FILE', path):
-                host.append_log(FIXED_REC_ID, 'ts1', 'https://a.com', 'A')
-                host.append_log(FIXED_REC_ID, 'ts2', 'https://b.com', 'B')
+            path = os.path.join(tmp, f'browser-visits-{FIXED_DATE}.log')
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_log(FIXED_REC_ID, FIXED_DATE,
+                                'ts1', 'https://a.com', 'A')
+                host.append_log(FIXED_REC_ID, FIXED_DATE,
+                                'ts2', 'https://b.com', 'B')
             lines = Path(path).read_text().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertIn('https://a.com', lines[0])
@@ -212,17 +216,18 @@ class TestAppendLog(unittest.TestCase):
 
     def test_append_result_log_writes_two_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'visits.log')
-            with patch.object(host, 'LOG_FILE', path):
-                host.append_result_log(FIXED_REC_ID, 'success')
+            path = os.path.join(tmp, f'browser-visits-{FIXED_DATE}.log')
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_result_log(FIXED_REC_ID, FIXED_DATE, 'success')
             content = Path(path).read_text(encoding='utf-8')
         self.assertEqual(content, f'{FIXED_REC_ID}\tsuccess\n')
 
     def test_append_result_log_sanitises_tabs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'visits.log')
-            with patch.object(host, 'LOG_FILE', path):
-                host.append_result_log(FIXED_REC_ID, 'error: foo\tbar')
+            path = os.path.join(tmp, f'browser-visits-{FIXED_DATE}.log')
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_result_log(FIXED_REC_ID, FIXED_DATE,
+                                       'error: foo\tbar')
             content = Path(path).read_text(encoding='utf-8').rstrip('\n')
         self.assertEqual(content, f'{FIXED_REC_ID}\terror: foo bar')
 
@@ -230,6 +235,33 @@ class TestAppendLog(unittest.TestCase):
         content = self._run('ts', 'https://example.com', 'Example', tag='mem\torable')
         parts = content.rstrip('\n').split('\t')
         self.assertEqual(parts[4], 'mem orable')
+
+    def test_per_day_filename_uses_date_iso(self):
+        # The on-disk filename embeds the date_iso passed in.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_log(FIXED_REC_ID, '2026-04-29',
+                                'ts', 'https://a.com', 'A')
+                host.append_log(FIXED_REC_ID, '2026-04-30',
+                                'ts', 'https://a.com', 'A')
+            files = sorted(p.name for p in Path(tmp).iterdir())
+        self.assertEqual(files, [
+            'browser-visits-2026-04-29.log',
+            'browser-visits-2026-04-30.log',
+        ])
+
+    def test_two_calls_same_date_share_a_single_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, f'browser-visits-{FIXED_DATE}.log')
+            with patch.object(host, 'LOG_DIR', tmp):
+                host.append_log(FIXED_REC_ID, FIXED_DATE,
+                                'ts1', 'https://a.com', 'A')
+                host.append_result_log(FIXED_REC_ID, FIXED_DATE, 'success')
+            lines = Path(path).read_text().splitlines()
+            files = list(Path(tmp).iterdir())
+        # Action + result both went to the same per-day file.
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(files), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +296,15 @@ class TestDatabase(unittest.TestCase):
     def test_ensure_db_creates_skimmed_events_table(self):
         conn = self._conn()
         self.assertIn('skimmed_events', self._tables(conn))
+        conn.close()
+
+    def test_ensure_db_creates_snapshots_table(self):
+        # Owned by host.ensure_db so per-invocation snapshots-row inserts
+        # succeed even on a brand-new install with no mover run yet.
+        conn = self._conn()
+        self.assertIn('snapshots', self._tables(conn))
+        cols = {r[1] for r in conn.execute('PRAGMA table_info(snapshots)')}
+        self.assertEqual(cols, {'date', 'sealed'})
         conn.close()
 
     def _event_cols(self, conn, table):
@@ -783,11 +824,27 @@ class TestQueryVisit(unittest.TestCase):
 # (subprocess-based integration tests don't contribute to coverage)
 # ---------------------------------------------------------------------------
 
+def _today_iso():
+    """UTC-today as ISO date — matches host.main()'s date-pinning logic."""
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _today_log_path(tmp):
+    """Per-day log path for today (UTC) inside the test's tmp LOG_DIR."""
+    return os.path.join(tmp, f'browser-visits-{_today_iso()}.log')
+
+
 class TestMain(unittest.TestCase):
     """Exercise every branch of main() by calling it in-process."""
 
     def _call_main(self, message: dict, tmp: str, extra_patches=()) -> dict:
-        """Call host.main() with fake stdin/stdout and isolated temp paths."""
+        """Call host.main() with fake stdin/stdout and isolated temp paths.
+
+        host.main() picks the per-day log file under host.LOG_DIR; tests
+        therefore patch the *directory* and read the resulting per-day file
+        via _today_log_path(tmp).
+        """
         out_buf = io.BytesIO()
         mock_stdout = MagicMock()
         mock_stdout.buffer = out_buf
@@ -798,8 +855,8 @@ class TestMain(unittest.TestCase):
         base_patches = [
             patch('sys.stdin',  mock_stdin),
             patch('sys.stdout', mock_stdout),
-            patch.object(host, 'LOG_FILE', os.path.join(tmp, 'visits.log')),
-            patch.object(host, 'DB_FILE',  os.path.join(tmp, 'visits.db')),
+            patch.object(host, 'LOG_DIR', tmp),
+            patch.object(host, 'DB_FILE', os.path.join(tmp, 'visits.db')),
         ]
 
         with contextlib.ExitStack() as stack:
@@ -865,7 +922,7 @@ class TestMain(unittest.TestCase):
     def test_query_does_not_write_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main({'action': 'query', 'url': 'https://example.com'}, tmp)
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     # --- input validation ---
 
@@ -916,7 +973,7 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._call_main(
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'}, tmp)
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         self.assertEqual(len(lines), 2)
         action_parts = lines[0].split('\t')
         result_parts = lines[1].split('\t')
@@ -933,6 +990,42 @@ class TestMain(unittest.TestCase):
             row = sqlite3.connect(os.path.join(tmp, 'visits.db')).execute(
                 'SELECT url, timestamp, title FROM visits').fetchone()
         self.assertEqual(row, ('https://example.com', 'ts', 'Title'))
+
+    def test_invocation_pins_log_file_to_invocation_start_date(self):
+        # Even if the wall clock crosses midnight UTC mid-invocation, both the
+        # action and the result line stay in the start-of-invocation date's
+        # log file.  Stub host's datetime so date.now() returns 2026-04-29
+        # for the duration of one main() call, regardless of how many times
+        # main() actually queries it.
+        import datetime as real_dt
+
+        class _FrozenDate:
+            def isoformat(self):
+                return '2026-04-29'
+
+        class _FrozenDateTime:
+            @staticmethod
+            def now(tz=None):
+                fixed = MagicMock()
+                fixed.date.return_value = _FrozenDate()
+                return fixed
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub_dt = MagicMock()
+            stub_dt.datetime  = _FrozenDateTime
+            stub_dt.timezone  = real_dt.timezone
+            self._call_main(
+                {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Title'},
+                tmp,
+                extra_patches=[patch.object(host, 'datetime', stub_dt)],
+            )
+            files = sorted(p.name for p in Path(tmp).iterdir()
+                           if p.name.startswith('browser-visits-'))
+            # Read while the tmp dir is still alive.
+            self.assertEqual(files, ['browser-visits-2026-04-29.log'])
+            lines = Path(tmp, 'browser-visits-2026-04-29.log').read_text().splitlines()
+        # Both action and result land in the pinned-date file.
+        self.assertEqual(len(lines), 2)
 
     # --- log write failure ---
 
@@ -1054,7 +1147,7 @@ class TestIntegration(unittest.TestCase):
     def _invoke(self, message: dict, tmp: str) -> dict:
         """Send one native message to host.py as a subprocess; return response."""
         env = os.environ.copy()
-        env['BVL_LOG_FILE'] = os.path.join(tmp, 'visits.log')
+        env['BVL_LOG_DIR']  = tmp
         env['BVL_DB_FILE']  = os.path.join(tmp, 'visits.db')
         env['BVL_HOST_LOG'] = os.path.join(tmp, 'host.log')
 
@@ -1083,7 +1176,7 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': '2026-01-01T00:00:00Z', 'url': 'https://example.com', 'title': 'Example Domain'},
                 tmp,
             )
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         action_parts = lines[0].split('\t')
         result_parts = lines[1].split('\t')
         self.assertRegex(action_parts[0], r'^[0-9a-f]{32}$')
@@ -1112,7 +1205,7 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'url': 'https://example.com', 'title': 'No Timestamp'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('timestamp', resp.get('message', ''))
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
             self.assertFalse(Path(tmp, 'visits.db').exists())
 
     def test_empty_timestamp_rejected(self):
@@ -1120,7 +1213,7 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'timestamp': '', 'url': 'https://example.com', 'title': 'Title'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('timestamp', resp.get('message', ''))
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_sequential_invocations_accumulate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1131,7 +1224,7 @@ class TestIntegration(unittest.TestCase):
                      'title': f'Site {i}'},
                     tmp,
                 )
-            log_lines = Path(tmp, 'visits.log').read_text().splitlines()
+            log_lines = Path(_today_log_path(tmp)).read_text().splitlines()
             self.assertEqual(len(log_lines), 6)  # 2 lines per invocation
 
             conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
@@ -1158,7 +1251,7 @@ class TestIntegration(unittest.TestCase):
                     {'timestamp': '2026-01-01T00:00:00Z', 'url': 'https://example.com', 'title': 'Example'},
                     tmp,
                 )
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         self.assertEqual(len(lines), 6)  # 2 lines per invocation
 
     def test_duplicate_url_preserves_original_timestamp(self):
@@ -1181,14 +1274,14 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'timestamp': 'ts', 'url': None, 'title': 'Title'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('url', resp.get('message', ''))
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_null_timestamp_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': None, 'url': 'https://example.com', 'title': 'Title'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('timestamp', resp.get('message', ''))
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_null_title_treated_as_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1204,20 +1297,20 @@ class TestIntegration(unittest.TestCase):
             resp = self._invoke({'timestamp': 'ts', 'url': '', 'title': 'Whatever'}, tmp)
             self.assertEqual(resp['status'], 'error')
             self.assertIn('url', resp.get('message', ''))
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
             self.assertFalse(Path(tmp, 'visits.db').exists())
 
     def test_whitespace_only_url_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': 'ts', 'url': '   ', 'title': 'Whatever'}, tmp)
             self.assertEqual(resp['status'], 'error')
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_missing_url_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             resp = self._invoke({'timestamp': 'ts', 'title': 'No URL at all'}, tmp)
             self.assertEqual(resp['status'], 'error')
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_empty_title_with_valid_url_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1244,7 +1337,7 @@ class TestIntegration(unittest.TestCase):
             os.makedirs(db_collision)
 
             env = os.environ.copy()
-            env['BVL_LOG_FILE'] = os.path.join(tmp, 'visits.log')
+            env['BVL_LOG_DIR']  = tmp
             env['BVL_DB_FILE']  = db_collision
             env['BVL_HOST_LOG'] = os.path.join(tmp, 'host.log')
 
@@ -1256,7 +1349,7 @@ class TestIntegration(unittest.TestCase):
                 env=env,
             )
             resp = _unframe(result.stdout)
-            log_content = Path(tmp, 'visits.log').read_text()
+            log_content = Path(_today_log_path(tmp)).read_text()
 
         self.assertEqual(resp['status'], 'error')
         self.assertTrue(any('db' in e for e in resp.get('errors', [])))
@@ -1373,7 +1466,7 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': 'ts-tag', 'url': url, 'title': 'Example',
                  'tag': 'read', 'filename': 'browser-visit-snapshots/abc.mhtml'},
                 tmp)
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         # lines[0]=visit action, lines[1]=visit result, lines[2]=tag action, lines[3]=tag result
         self.assertEqual(len(lines), 4)
         tag_action = lines[2].split('\t')
@@ -1393,7 +1486,7 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': 'ts', 'url': 'https://example.com', 'title': 'Example'},
                 tmp,
             )
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         action_parts = lines[0].split('\t')
         self.assertEqual(len(lines), 2)
         # 4 fields: record_id, timestamp, url, title
@@ -1418,7 +1511,7 @@ class TestIntegration(unittest.TestCase):
             ).fetchone()
             conn.close()
             # Log should show action line + success (not an error)
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], 'ts')       # timestamp from tag message
         self.assertEqual(row[1], '1')        # of_interest applied
@@ -1433,13 +1526,40 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': 'ts1', 'url': 'https://a.com', 'title': 'A'}, tmp)
             self._invoke(
                 {'timestamp': 'ts2', 'url': 'https://b.com', 'title': 'B'}, tmp)
-            lines = Path(tmp, 'visits.log').read_text().splitlines()
+            lines = Path(_today_log_path(tmp)).read_text().splitlines()
         first_id  = lines[0].split('\t')[0]
         second_id = lines[2].split('\t')[0]
         self.assertNotEqual(first_id, second_id)
         # Each invocation's action and result share their own record_id
         self.assertEqual(lines[1].split('\t')[0], first_id)
         self.assertEqual(lines[3].split('\t')[0], second_id)
+
+    def test_invocation_inserts_snapshots_row_for_today(self):
+        # Every host write invocation does INSERT OR IGNORE on a snapshots
+        # row for today's UTC date so the seal pass picks up the day even
+        # if no snapshot file ever lands.  Run twice and assert it's still
+        # exactly one row, sealed=0.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke(
+                {'timestamp': 'ts1', 'url': 'https://a.com', 'title': 'A'}, tmp)
+            self._invoke(
+                {'timestamp': 'ts2', 'url': 'https://b.com', 'title': 'B'}, tmp)
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            rows = conn.execute(
+                'SELECT date, sealed FROM snapshots').fetchall()
+            conn.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], _today_iso())
+        self.assertEqual(rows[0][1], 0)
+
+    def test_query_invocation_does_not_insert_snapshots_row(self):
+        # Query is a read-only path — it must not create a snapshots row.
+        with tempfile.TemporaryDirectory() as tmp:
+            self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            n = conn.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0]
+            conn.close()
+        self.assertEqual(n, 0)
 
     def test_query_unknown_url_returns_null_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1523,7 +1643,7 @@ class TestIntegration(unittest.TestCase):
     def test_query_does_not_write_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke({'action': 'query', 'url': 'https://example.com'}, tmp)
-            self.assertFalse(Path(tmp, 'visits.log').exists())
+            self.assertFalse(Path(_today_log_path(tmp)).exists())
 
     def test_query_missing_url_returns_error(self):
         with tempfile.TemporaryDirectory() as tmp:

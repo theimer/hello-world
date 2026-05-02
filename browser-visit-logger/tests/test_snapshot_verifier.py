@@ -62,12 +62,15 @@ class _VerifierTestBase(unittest.TestCase):
 
     # -- helpers --
 
-    def _seed_dir(self, date_str, files=()):
+    def _seed_dir(self, date_str, files=(), include_log=True):
         """Create dest_dir/<date_str>/ with the given files + visits/events
-        rows + a sealed=1 snapshots row.
+        rows + a sealed=1 snapshots row + (by default) a per-day log file
+        at mode 0o444 so the verifier's log-file check passes.
 
         files is an iterable of (filename, table, url, ts, title); pass
         table=None to leave a file with no DB row.  Returns the date subdir.
+        Pass include_log=False for tests that exercise the missing/writable
+        log paths.
         """
         date_subdir = os.path.join(self.dest_dir, date_str)
         os.makedirs(date_subdir, exist_ok=True)
@@ -89,6 +92,11 @@ class _VerifierTestBase(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+        if include_log:
+            log_path = os.path.join(
+                date_subdir, snapshot_mover._log_filename_for(date_str))
+            Path(log_path).write_text('', encoding='utf-8')
+            os.chmod(log_path, 0o444)
         return date_subdir
 
     def _seal(self, date_str):
@@ -373,6 +381,68 @@ class TestVerifyDirectory(_VerifierTestBase):
         self.assertFalse(is_valid)
         self.assertGreaterEqual(len(issues), 2)
 
+    # --- check 10: per-day log presence + mode ---
+
+    def test_missing_per_day_log_fails(self):
+        # Set up a sealed dir without the per-day log file.
+        date_subdir = self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ], include_log=False)
+        self._seal('2024-01-15')
+        is_valid, issues = self._verify(date_subdir)
+        self.assertFalse(is_valid)
+        self.assertTrue(any('Per-day log file not found' in i for i in issues))
+
+    def test_writable_per_day_log_flags_mode(self):
+        date_subdir = self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ])
+        self._seal('2024-01-15')
+        log_path = os.path.join(
+            date_subdir, snapshot_mover._log_filename_for('2024-01-15'))
+        os.chmod(log_path, 0o644)
+        is_valid, issues = self._verify(date_subdir)
+        self.assertFalse(is_valid)
+        self.assertTrue(any('Per-day log is not read-only' in i for i in issues))
+
+    def test_per_day_log_as_directory_is_flagged(self):
+        date_subdir = self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ], include_log=False)
+        self._seal('2024-01-15')
+        # Replace the would-be log with a directory of the same name.
+        bogus = os.path.join(
+            date_subdir, snapshot_mover._log_filename_for('2024-01-15'))
+        os.makedirs(bogus)
+        is_valid, issues = self._verify(date_subdir)
+        self.assertFalse(is_valid)
+        self.assertTrue(any('not a regular file' in i for i in issues))
+
+    def test_non_date_directory_skips_log_check(self):
+        # Manually-sealed non-date dirs (e.g. an imported archive) have no
+        # expected per-day log filename; the verifier must not require one.
+        target = os.path.join(self.tmp.name, 'misc-import')
+        os.makedirs(target)
+        snapshot_sealer.cli(['--db', self.db_file, target])
+        is_valid, issues = self._verify(target)
+        self.assertTrue(is_valid, f'unexpected issues: {issues}')
+
+    def test_per_day_log_does_not_count_as_extra_file(self):
+        # Regression: the file-level check (#6) used to flag the log as
+        # non-conforming (it doesn't match _SNAPSHOT_FILENAME_RE).  After
+        # the verifier was taught about expected_log, the log file should
+        # be transparent to that check.
+        date_subdir = self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ])
+        self._seal('2024-01-15')
+        is_valid, issues = self._verify(date_subdir)
+        self.assertTrue(is_valid, f'unexpected issues: {issues}')
+
 
 # ---------------------------------------------------------------------------
 # CLI — happy path, error paths, --quiet, --record
@@ -484,6 +554,12 @@ class TestVerifierCli(_VerifierTestBase):
         os.makedirs(date_subdir)
         # Use the sealer to write a real manifest in the alt location.
         snapshot_sealer.cli(['--db', self.db_file, '--dest', alt_dest, date_str])
+        # Drop a per-day log file so the verifier's log-file check passes
+        # (a normal seal would have moved one in; this test bypasses LOG_DIR).
+        log_path = os.path.join(date_subdir,
+                                snapshot_mover._log_filename_for(date_str))
+        Path(log_path).write_text('', encoding='utf-8')
+        os.chmod(log_path, 0o444)
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([

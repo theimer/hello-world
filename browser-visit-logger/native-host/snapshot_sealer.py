@@ -121,11 +121,17 @@ def cli(argv=None) -> int:
     conn = sqlite3.connect(snapshot_mover.DB_FILE)
     try:
         snapshot_mover._ensure_snapshots_table(conn)
+        snapshot_mover._ensure_mover_errors_table(conn)
         snapshot_mover._seal_directory(
             conn, target,
             dry_run=args.dry_run,
             date_key=_extract_date_key(target),
         )
+        # Anti-entropy: clean up race orphans / backfill missing snapshots
+        # rows from past-day logs in LOG_DIR.  Skipped on dry-run so it
+        # remains a strict report-only mode.
+        if not args.dry_run:
+            snapshot_mover._orphan_log_merge_pass(conn)
     finally:
         conn.close()
     return 0

@@ -157,31 +157,35 @@ class TestWrapperForwarding(unittest.TestCase):
         # without a confirmation prompt and exit 0.
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
-            env['BVL_LOG_FILE']  = os.path.join(tmp, 'visits.log')
+            env['BVL_LOG_DIR']   = tmp
             env['BVL_HOST_LOG']  = os.path.join(tmp, 'host.log')
             env['BVL_MOVER_LOG'] = os.path.join(tmp, 'mover.log')
             env['BVL_DB_FILE']   = os.path.join(tmp, 'visits.db')
             env['BVL_DOWNLOADS_SNAPSHOTS_DIR'] = os.path.join(tmp, 'dl')
+            # Drop a per-day log so --log has something to delete.
+            Path(tmp, 'browser-visits-2026-01-15.log').touch()
             result = subprocess.run(
                 [str(REPO_ROOT / 'reset_visits_data'), '--log', '-f'],
                 capture_output=True, text=True, timeout=10, env=env,
             )
             self.assertEqual(result.returncode, 0,
                              f'stderr: {result.stderr}')
+            # Per-day log was deleted.
+            self.assertFalse(Path(tmp, 'browser-visits-2026-01-15.log').exists())
 
-    def test_rebuild_visits_data_forwards_overrides_against_empty_log(self):
-        # rebuild_visits_data --log <empty file> --db <new path> --source/--dest
-        # against an empty log should reach the rebuilder, exit 0, and print
-        # the per-phase summary lines.
+    def test_rebuild_visits_data_forwards_overrides_against_empty_log_dir(self):
+        # rebuild_visits_data --log-dir <empty dir> --db <new path>
+        # --source/--dest against an empty log dir should reach the
+        # rebuilder, exit 0, and print the per-phase summary lines.
         with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, 'visits.log')
-            Path(log).touch()
-            db   = os.path.join(tmp, 'visits.db')
-            src  = os.path.join(tmp, 'dl');     os.makedirs(src)
-            dest = os.path.join(tmp, 'icloud'); os.makedirs(dest)
+            log_dir = os.path.join(tmp, 'logs');   os.makedirs(log_dir)
+            db      = os.path.join(tmp, 'visits.db')
+            src     = os.path.join(tmp, 'dl');     os.makedirs(src)
+            dest    = os.path.join(tmp, 'icloud'); os.makedirs(dest)
             result = subprocess.run(
                 [str(REPO_ROOT / 'rebuild_visits_data'),
-                 '--log', log, '--db', db, '--source', src, '--dest', dest],
+                 '--log-dir', log_dir, '--db', db,
+                 '--source', src, '--dest', dest],
                 capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0,

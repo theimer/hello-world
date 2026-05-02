@@ -293,6 +293,50 @@ class TestSealerSnapshotsTable(_SealerTestBase):
         conn.close()
         self.assertEqual(count, 0)
 
+    def test_seal_moves_per_day_log_into_sealed_dir(self):
+        # When a per-day log for the date being sealed exists in LOG_DIR,
+        # the manual sealer moves it into the sealed dir (chmod 0o444).
+        from unittest.mock import patch
+        date_subdir = self._make_dir('2024-01-15')
+        log_dir = os.path.join(self.tmp.name, 'logs')
+        os.makedirs(log_dir)
+        log_src = os.path.join(log_dir, 'browser-visits-2024-01-15.log')
+        Path(log_src).write_text('uuid\taction\nuuid\tsuccess\n',
+                                 encoding='utf-8')
+        with patch.object(snapshot_mover, 'LOG_DIR', log_dir):
+            rc = snapshot_sealer.cli([
+                '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15',
+            ])
+        self.assertEqual(rc, 0)
+        log_dst = os.path.join(date_subdir, 'browser-visits-2024-01-15.log')
+        self.assertTrue(os.path.exists(log_dst))
+        self.assertFalse(os.path.exists(log_src))
+        self.assertEqual(os.stat(log_dst).st_mode & 0o777, 0o444)
+
+    def test_manual_seal_runs_orphan_merge_pass(self):
+        # The manual sealer wires the orphan-merge pass after the seal so
+        # ad-hoc seals also clean up race orphans in LOG_DIR.
+        from unittest.mock import patch
+        # Sealing 2024-01-15.  Pre-seed an unrelated past-day orphan log
+        # (2024-01-10) in LOG_DIR with no iCloud counterpart — the
+        # orphan-merge backfill branch should INSERT the snapshots row.
+        self._make_dir('2024-01-15')
+        log_dir = os.path.join(self.tmp.name, 'logs')
+        os.makedirs(log_dir)
+        Path(log_dir, 'browser-visits-2024-01-10.log').write_text(
+            'uuid\taction\nuuid\tsuccess\n', encoding='utf-8')
+        with patch.object(snapshot_mover, 'LOG_DIR', log_dir):
+            snapshot_sealer.cli([
+                '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15',
+            ])
+        # 2024-01-10's snapshots row was backfilled with sealed=0.
+        conn = sqlite3.connect(self.db_file)
+        row = conn.execute(
+            "SELECT date, sealed FROM snapshots WHERE date = '2024-01-10'"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ('2024-01-10', 0))
+
 
 if __name__ == '__main__':  # pragma: no cover
     unittest.main()

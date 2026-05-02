@@ -54,8 +54,21 @@ Schema
         directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
         PRIMARY KEY (url, timestamp)
     )
+
+    snapshots (
+        date   TEXT PRIMARY KEY,         -- 'YYYY-MM-DD' (UTC) of host activity
+        sealed INTEGER NOT NULL DEFAULT 0
+    )
+
+Log file layout
+---------------
+The visit log is split per UTC day: <LOG_DIR>/browser-visits-<YYYY-MM-DD>.log.
+Each invocation pins its date at start (so action+result lines stay together
+even across midnight UTC).  The sealer (snapshot_mover.py) moves each day's
+log into the matching iCloud snapshot directory once the day is complete.
 """
 
+import datetime
 import json
 import logging
 import os
@@ -71,7 +84,9 @@ from logging.handlers import RotatingFileHandler
 # (env var overrides are used by the test suite to isolate test output)
 # ---------------------------------------------------------------------------
 HOME     = os.path.expanduser('~')
-LOG_FILE = os.environ.get('BVL_LOG_FILE', os.path.join(HOME, 'browser-visits.log'))
+# Per-day visit logs live under LOG_DIR as `browser-visits-<UTC-date>.log`.
+# The sealer collects each day's log into the matching iCloud snapshot dir.
+LOG_DIR  = os.environ.get('BVL_LOG_DIR',  HOME)
 DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
 HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 
@@ -144,6 +159,19 @@ def ensure_db(conn: sqlite3.Connection) -> None:
     # One row per read/skimmed event (individual timestamps).
     _ensure_events_table(conn, 'read_events')
     _ensure_events_table(conn, 'skimmed_events')
+
+    # snapshots table: one row per UTC day with host activity.  host.py
+    # inserts (date, sealed=0) on every write invocation; the sealer flips
+    # to sealed=1 once it has moved the day's log + written MANIFEST.tsv.
+    # Owned here (rather than only by snapshot_mover) so a brand-new
+    # install with no mover run yet still has the table available for
+    # host's per-invocation INSERT OR IGNORE.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            date   TEXT PRIMARY KEY,
+            sealed INTEGER NOT NULL DEFAULT 0
+        )
+    """)
 
     conn.commit()
 
@@ -275,20 +303,27 @@ def tag_visit(
 # Log file helper
 # ---------------------------------------------------------------------------
 
+def _log_path_for(date_iso: str) -> str:
+    """Return the per-day log file path for a UTC date 'YYYY-MM-DD'."""
+    return os.path.join(LOG_DIR, f'browser-visits-{date_iso}.log')
+
+
 def append_log(
-    record_id: str, timestamp: str, url: str, title: str,
+    record_id: str, date_iso: str,
+    timestamp: str, url: str, title: str,
     tag: str = '', filename: str = '',
 ) -> None:
-    """Append one TSV action line, prefixed with record_id.
+    """Append one TSV action line, prefixed with record_id, to the per-day log.
+
+    The log file is `<LOG_DIR>/browser-visits-<date_iso>.log`.  date_iso is
+    pinned at host invocation start so this line and the matching result line
+    always land in the same file even if the wall clock crosses midnight UTC
+    mid-invocation.
 
     Field layout:
         <record_id>\\t<timestamp>\\t<url>\\t<title>                          # auto-log
         <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>                   # of_interest
         <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>\\t<filename>      # read / skimmed
-
-    record_id correlates this line with its later result line so a replay
-    tool can pair them safely even under concurrent host invocations.
-    filename is included only for read / skimmed tags.
     """
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
@@ -299,17 +334,18 @@ def append_log(
         if tag in ('read', 'skimmed'):
             fields.append(sanitise(filename))
     line = '\t'.join(fields) + '\n'
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+    with open(_log_path_for(date_iso), 'a', encoding='utf-8') as f:
         f.write(line)
 
 
-def append_result_log(record_id: str, result: str) -> None:
-    """Append a result line prefixed with record_id: 'success' or 'error: <message>'."""
+def append_result_log(record_id: str, date_iso: str, result: str) -> None:
+    """Append a result line prefixed with record_id to the per-day log:
+    '<record_id>\\tsuccess' or '<record_id>\\terror: <message>'."""
     def sanitise(s: str) -> str:
         return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
 
     line = sanitise(record_id) + '\t' + sanitise(result) + '\n'
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+    with open(_log_path_for(date_iso), 'a', encoding='utf-8') as f:
         f.write(line)
 
 # ---------------------------------------------------------------------------
@@ -329,6 +365,10 @@ def main() -> None:
         return
 
     record_id = uuid.uuid4().hex
+    # Pin the per-day log file to the date the invocation started.  Used for
+    # both the action and the result line so they always land in the same
+    # file even if the wall clock crosses midnight UTC mid-invocation.
+    today_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
     url    = (message.get('url') or '').strip()
     action = (message.get('action') or '').strip()
@@ -369,7 +409,7 @@ def main() -> None:
 
     # First write: record the intended action
     try:
-        append_log(record_id, timestamp, url, title, tag, filename)
+        append_log(record_id, today_iso, timestamp, url, title, tag, filename)
     except Exception as exc:
         logger.error('Log file write failed: %s', exc)
         errors.append(f'log: {exc}')
@@ -377,10 +417,17 @@ def main() -> None:
     # Write to SQLite.  Always insert the visit first (INSERT OR IGNORE, so the
     # original first-visit timestamp wins if the row already exists); then apply
     # the tag if one is present.  This means tagging always works even when the
-    # background auto-log hasn't finished writing yet.
+    # background auto-log hasn't finished writing yet.  Also INSERT OR IGNORE a
+    # snapshots row for today so the seal pass picks up activity-only days
+    # uniformly with snapshot-bearing days.
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
+            (today_iso,),
+        )
+        conn.commit()
         insert_visit(conn, timestamp, url, title)
         if tag:
             tag_visit(conn, url, tag, timestamp, filename)
@@ -392,7 +439,7 @@ def main() -> None:
     # Second write: record the result
     log_result = f'error: {"; ".join(errors)}' if errors else 'success'
     try:
-        append_result_log(record_id, log_result)
+        append_result_log(record_id, today_iso, log_result)
     except Exception as exc:
         logger.error('Log file result write failed: %s', exc)
 

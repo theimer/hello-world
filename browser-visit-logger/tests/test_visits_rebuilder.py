@@ -92,17 +92,25 @@ class TestReplayLog(unittest.TestCase):
         for d in self._tmpdirs:
             shutil.rmtree(d, ignore_errors=True)
 
-    def _replay(self, *lines):
-        """Common harness: write the lines, replay against a fresh DB,
-        return (db_path, stats).  The temp dir lives until tearDown."""
+    def _replay(self, *lines, date_iso='2026-01-01'):
+        """Common harness: write a single per-day log, replay against a
+        fresh DB, return (db_path, stats).  The temp dir lives until
+        tearDown.
+
+        log_dir = <tmp>/logs (containing one browser-visits-<date>.log)
+        icloud_dir = <tmp>/icloud (empty — phase 1 only walks the iCloud
+                     dir for additional log files).
+        """
         tmp = tempfile.mkdtemp()
         self._tmpdirs.append(tmp)
-        log = os.path.join(tmp, 'visits.log')
-        _write_log(log, *lines)
+        log_dir    = os.path.join(tmp, 'logs');   os.makedirs(log_dir)
+        icloud_dir = os.path.join(tmp, 'icloud'); os.makedirs(icloud_dir)
+        log_path = os.path.join(log_dir, f'browser-visits-{date_iso}.log')
+        _write_log(log_path, *lines)
         db = _fresh_db(tmp)
         conn = sqlite3.connect(db)
         try:
-            stats = vr.replay_log(conn, log)
+            stats = vr.replay_logs(conn, log_dir, icloud_dir)
         finally:
             conn.close()
         return db, stats
@@ -255,9 +263,11 @@ class TestReplayLog(unittest.TestCase):
         # must produce no additional rows or counter increments.  This is
         # the regression test for the rowcount-gated _insert_event fix.
         with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, 'visits.log')
+            log_dir    = os.path.join(tmp, 'logs');   os.makedirs(log_dir)
+            icloud_dir = os.path.join(tmp, 'icloud'); os.makedirs(icloud_dir)
+            log_path = os.path.join(log_dir, 'browser-visits-2026-01-01.log')
             _write_log(
-                log,
+                log_path,
                 _action(REC_A, 'ts0', 'https://a.com', 'A'),
                 _result(REC_A, 'success'),
                 _action(REC_B, 'ts1', 'https://a.com', 'A',
@@ -272,7 +282,7 @@ class TestReplayLog(unittest.TestCase):
             db = _fresh_db(tmp)
             conn = sqlite3.connect(db)
             try:
-                vr.replay_log(conn, log)
+                vr.replay_logs(conn, log_dir, icloud_dir)
                 first = conn.execute(
                     'SELECT url, timestamp, title, of_interest, read, skimmed '
                     'FROM visits'
@@ -284,7 +294,7 @@ class TestReplayLog(unittest.TestCase):
                     'SELECT timestamp, filename FROM skimmed_events'
                 ).fetchall()
 
-                vr.replay_log(conn, log)
+                vr.replay_logs(conn, log_dir, icloud_dir)
                 second = conn.execute(
                     'SELECT url, timestamp, title, of_interest, read, skimmed '
                     'FROM visits'
@@ -363,6 +373,215 @@ class TestReplayLog(unittest.TestCase):
         self.assertEqual(stats.read_events, 0)
         self.assertEqual(stats.skimmed_events, 0)
         self.assertEqual(stats.of_interest_set, 0)
+
+
+class TestReplayLogsMultiFile(unittest.TestCase):
+    """Replay across multiple per-day log files in log_dir + iCloud subdirs."""
+
+    def setUp(self):
+        self._tmpdirs = []
+
+    def tearDown(self):
+        import shutil
+        for d in self._tmpdirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _setup(self):
+        tmp = tempfile.mkdtemp()
+        self._tmpdirs.append(tmp)
+        log_dir    = os.path.join(tmp, 'logs');   os.makedirs(log_dir)
+        icloud_dir = os.path.join(tmp, 'icloud'); os.makedirs(icloud_dir)
+        db = _fresh_db(tmp)
+        return tmp, log_dir, icloud_dir, db
+
+    def test_reads_logs_from_log_dir_and_icloud_subdirs(self):
+        tmp, log_dir, icloud_dir, db = self._setup()
+        # Past-day log inside iCloud (sealed day).
+        sealed_dir = os.path.join(icloud_dir, '2026-04-29')
+        os.makedirs(sealed_dir)
+        _write_log(
+            os.path.join(sealed_dir, 'browser-visits-2026-04-29.log'),
+            _action(REC_A, '2026-04-29T10:00:00Z', 'https://past.com', 'Past'),
+            _result(REC_A, 'success'),
+        )
+        # Today-ish log in log_dir.
+        _write_log(
+            os.path.join(log_dir, 'browser-visits-2026-05-01.log'),
+            _action(REC_B, '2026-05-01T10:00:00Z', 'https://today.com', 'Today'),
+            _result(REC_B, 'success'),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            stats = vr.replay_logs(conn, log_dir, icloud_dir)
+            urls = sorted(r[0] for r in conn.execute(
+                'SELECT url FROM visits').fetchall())
+        finally:
+            conn.close()
+        self.assertEqual(urls, ['https://past.com', 'https://today.com'])
+        self.assertEqual(stats.visits_inserted, 2)
+
+    def test_chronological_order_keeps_first_visit_timestamp(self):
+        # A URL first visited day 1 and re-visited day 5: visits.timestamp
+        # must end up as day 1's value (INSERT OR IGNORE keeps first).
+        # We deliberately set up day-5's file lexicographically before
+        # day-1's via os.listdir-order shenanigans; the rebuilder must
+        # still process day-1 first because of the date-sort.
+        tmp, log_dir, icloud_dir, db = self._setup()
+        # Day 5 log in iCloud (under its sealed dir).
+        os.makedirs(os.path.join(icloud_dir, '2026-05-05'))
+        _write_log(
+            os.path.join(icloud_dir, '2026-05-05',
+                         'browser-visits-2026-05-05.log'),
+            _action(REC_B, '2026-05-05T10:00:00Z',
+                    'https://x.com', 'X (later)'),
+            _result(REC_B, 'success'),
+        )
+        # Day 1 log in log_dir.
+        _write_log(
+            os.path.join(log_dir, 'browser-visits-2026-05-01.log'),
+            _action(REC_A, '2026-05-01T10:00:00Z',
+                    'https://x.com', 'X (first)'),
+            _result(REC_A, 'success'),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            vr.replay_logs(conn, log_dir, icloud_dir)
+            row = conn.execute(
+                'SELECT url, timestamp, title FROM visits WHERE url = ?',
+                ('https://x.com',),
+            ).fetchone()
+        finally:
+            conn.close()
+        # First-visit timestamp wins.
+        self.assertEqual(row, ('https://x.com', '2026-05-01T10:00:00Z',
+                               'X (first)'))
+
+    def test_split_by_seal_race_pairs_action_with_result(self):
+        # Race orphan: action line in the iCloud log, matching result line
+        # in log_dir's same-date log.  The rebuilder's shared `pending`
+        # dict spans files, so it pairs them as a normal success.
+        tmp, log_dir, icloud_dir, db = self._setup()
+        date = '2026-04-29'
+        os.makedirs(os.path.join(icloud_dir, date))
+        # iCloud log has the action.
+        _write_log(
+            os.path.join(icloud_dir, date, f'browser-visits-{date}.log'),
+            _action(REC_A, f'{date}T10:00:00Z', 'https://race.com', 'Race'),
+        )
+        # log_dir has the matching result.
+        _write_log(
+            os.path.join(log_dir, f'browser-visits-{date}.log'),
+            _result(REC_A, 'success'),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            stats = vr.replay_logs(conn, log_dir, icloud_dir)
+            urls = [r[0] for r in conn.execute(
+                'SELECT url FROM visits').fetchall()]
+        finally:
+            conn.close()
+        # Action and result paired; no orphan reports.
+        self.assertEqual(urls, ['https://race.com'])
+        self.assertEqual(stats.success_records, 1)
+        self.assertEqual(stats.orphan_actions, 0)
+        self.assertEqual(stats.orphan_results, 0)
+
+    def test_log_inside_icloud_dir_with_mismatched_date_is_skipped(self):
+        # Defensive: a log file whose filename embeds date X but lives
+        # inside iCloud's date-Y subdir is skipped with a warning (could
+        # indicate corruption or a misplaced file).
+        tmp, log_dir, icloud_dir, db = self._setup()
+        os.makedirs(os.path.join(icloud_dir, '2026-04-29'))
+        # File named for 2026-05-01 but inside the 2026-04-29 dir.
+        _write_log(
+            os.path.join(icloud_dir, '2026-04-29',
+                         'browser-visits-2026-05-01.log'),
+            _action(REC_A, 'ts', 'https://x.com', 'X'),
+            _result(REC_A, 'success'),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            with self.assertLogs(vr.logger, level='WARNING') as cm:
+                stats = vr.replay_logs(conn, log_dir, icloud_dir)
+            n = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+        self.assertEqual(stats.success_records, 0)
+        self.assertTrue(any('does not match its parent directory' in m
+                            for m in cm.output))
+
+    def test_replay_inserts_snapshots_row_per_log_file(self):
+        # Mirror of host.py: every log file's date should produce a
+        # snapshots row (sealed=0).  Phase 2 may then flip sealed=1 for
+        # iCloud-resident logs.
+        tmp, log_dir, icloud_dir, db = self._setup()
+        _write_log(
+            os.path.join(log_dir, 'browser-visits-2026-05-01.log'),
+            _action(REC_A, 'ts', 'https://a.com', 'A'),
+            _result(REC_A, 'success'),
+        )
+        os.makedirs(os.path.join(icloud_dir, '2026-04-29'))
+        _write_log(
+            os.path.join(icloud_dir, '2026-04-29',
+                         'browser-visits-2026-04-29.log'),
+            _action(REC_B, 'ts', 'https://b.com', 'B'),
+            _result(REC_B, 'success'),
+        )
+        conn = sqlite3.connect(db)
+        try:
+            vr.replay_logs(conn, log_dir, icloud_dir)
+            rows = sorted(conn.execute(
+                'SELECT date, sealed FROM snapshots').fetchall())
+        finally:
+            conn.close()
+        # Both dates represented; both at sealed=0 (phase 2 not run here).
+        self.assertEqual(rows, [('2026-04-29', 0), ('2026-05-01', 0)])
+
+    def test_no_logs_anywhere_is_a_clean_noop(self):
+        tmp, log_dir, icloud_dir, db = self._setup()
+        conn = sqlite3.connect(db)
+        try:
+            stats = vr.replay_logs(conn, log_dir, icloud_dir)
+            n = conn.execute('SELECT COUNT(*) FROM visits').fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+        self.assertEqual(stats.visits_inserted, 0)
+        self.assertEqual(stats.success_records, 0)
+
+    def test_collect_log_paths_skips_non_log_entries(self):
+        # _collect_log_paths must filter out:
+        #  - non-date entries at the iCloud root
+        #  - date-named *files* (not dirs) at the iCloud root
+        #  - non-log entries inside a date subdir
+        #  - non-regular-file log entries inside a date subdir
+        #  - non-matching entries in log_dir
+        tmp, log_dir, icloud_dir, db = self._setup()
+        # Junk in iCloud root: a non-date dir and a date-named file.
+        os.makedirs(os.path.join(icloud_dir, 'not-a-date'))
+        Path(os.path.join(icloud_dir, '2026-04-30')).touch()
+        # Inside a real date dir: a non-log filename and a directory-shaped
+        # entry whose name matches the log regex.
+        date_dir = os.path.join(icloud_dir, '2026-04-29')
+        os.makedirs(date_dir)
+        Path(os.path.join(date_dir, 'README.txt')).touch()
+        os.makedirs(os.path.join(date_dir, 'browser-visits-2026-04-29.log'))
+        # Junk in log_dir: a non-matching filename.
+        Path(os.path.join(log_dir, 'unrelated.txt')).touch()
+        # A real log file that should be picked up.
+        _write_log(
+            os.path.join(log_dir, 'browser-visits-2026-05-01.log'),
+            _action(REC_A, 'ts', 'https://a.com', 'A'),
+            _result(REC_A, 'success'),
+        )
+
+        paths = vr._collect_log_paths(log_dir, icloud_dir)
+        self.assertEqual(
+            paths,
+            [('2026-05-01',
+              os.path.join(log_dir, 'browser-visits-2026-05-01.log'))],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +724,32 @@ class TestRehydrateFilesystem(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(stats.snapshots_upserted, 0)
 
+    def test_rehydrate_skips_per_day_log_file_in_date_dir(self):
+        # A sealed iCloud date dir contains the per-day log alongside
+        # snapshot files.  The log file must NOT be reported as
+        # files_without_events — it's expected and replayed by phase 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            icloud = os.path.join(tmp, 'icloud')
+            date = '2026-04-29'
+            date_dir = os.path.join(icloud, date)
+            os.makedirs(date_dir)
+            Path(os.path.join(date_dir, 'MANIFEST.tsv')).write_text(
+                'filename\ttag\ttimestamp\turl\ttitle\n')
+            Path(os.path.join(date_dir, f'browser-visits-{date}.log')).write_text(
+                '')
+            db = _fresh_db(tmp)
+            conn = sqlite3.connect(db)
+            try:
+                stats = vr.rehydrate_filesystem(
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
+            finally:
+                conn.close()
+        # Log file is not counted as a file_without_events.
+        self.assertEqual(stats.files_without_events, 0)
+        # Snapshots row was inserted as sealed=1.
+        self.assertEqual(stats.snapshots_upserted, 1)
+        self.assertEqual(stats.sealed_dirs, 1)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -514,22 +759,31 @@ class _CLIBase(unittest.TestCase):
     """Shared setup: build a temp dir with a log + DB + source/dest dirs and
     return the CLI flag list."""
 
-    def _mk(self, lines=()):
-        """Create a tmp dir and return (tmp, args, paths)."""
+    def _mk(self, lines=(), date_iso='2026-01-01'):
+        """Create a tmp dir and return (tmp, args, paths).
+
+        log_dir holds <log_dir>/browser-visits-<date_iso>.log seeded with
+        the given lines.  Use date_iso to pin the filename so tests can
+        also read it back from paths['log'].
+        """
         tmp = tempfile.mkdtemp()
         paths = {
-            'log':  os.path.join(tmp, 'visits.log'),
-            'db':   os.path.join(tmp, 'visits.db'),
-            'src':  os.path.join(tmp, 'dl'),
-            'dest': os.path.join(tmp, 'icloud'),
+            'log_dir': os.path.join(tmp, 'logs'),
+            'log':     None,  # filled in once log_dir exists
+            'db':      os.path.join(tmp, 'visits.db'),
+            'src':     os.path.join(tmp, 'dl'),
+            'dest':    os.path.join(tmp, 'icloud'),
         }
-        _write_log(paths['log'], *lines)
+        os.makedirs(paths['log_dir'])
         os.makedirs(paths['src'])
         os.makedirs(paths['dest'])
-        args = ['--log',    paths['log'],
-                '--db',     paths['db'],
-                '--source', paths['src'],
-                '--dest',   paths['dest']]
+        paths['log'] = os.path.join(
+            paths['log_dir'], f'browser-visits-{date_iso}.log')
+        _write_log(paths['log'], *lines)
+        args = ['--log-dir', paths['log_dir'],
+                '--db',      paths['db'],
+                '--source',  paths['src'],
+                '--dest',    paths['dest']]
         return tmp, args, paths
 
     def _run(self, args):
@@ -537,16 +791,16 @@ class _CLIBase(unittest.TestCase):
         # cli() mutates host.* and snapshot_mover.* globals; restore them so
         # one test doesn't pollute the next.
         saved = (
-            host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE,
-            snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
+            host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+            snapshot_mover.ICLOUD_SNAPSHOTS_DIR, snapshot_mover.LOG_DIR,
         )
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
                 rc = vr.cli(args)
         finally:
-            (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE,
-             snapshot_mover.ICLOUD_SNAPSHOTS_DIR) = saved
+            (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+             snapshot_mover.ICLOUD_SNAPSHOTS_DIR, snapshot_mover.LOG_DIR) = saved
         return rc, buf.getvalue()
 
 
@@ -584,10 +838,10 @@ class TestCLI(_CLIBase):
         finally:
             __import__('shutil').rmtree(tmp, ignore_errors=True)
 
-    def test_missing_log_exits_nonzero(self):
+    def test_missing_log_dir_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
-            args = ['--log', os.path.join(tmp, 'no-such.log'),
-                    '--db',  os.path.join(tmp, 'visits.db')]
+            args = ['--log-dir', os.path.join(tmp, 'no-such-dir'),
+                    '--db',      os.path.join(tmp, 'visits.db')]
             rc, _ = self._run(args)
         self.assertEqual(rc, 1)
 
@@ -681,13 +935,22 @@ class TestCLI(_CLIBase):
         ))
         try:
             # Pre-create an iCloud date dir so rehydrate, if invoked, would
-            # add a snapshots row; --log-only must suppress that.
+            # add a snapshots row for it; --log-only must suppress that.
             os.makedirs(os.path.join(paths['dest'], '2026-04-29'))
             rc, out = self._run(args + ['--log-only'])
             self.assertEqual(rc, 0)
             self.assertIn('replay:',     out)
             self.assertNotIn('rehydrate:', out)
-            self.assertEqual(_row_count(paths['db'], 'snapshots'), 0)
+            # Phase 1 inserts a snapshots row per log file's date; phase 2
+            # was skipped, so the iCloud-only date 2026-04-29 must NOT
+            # have produced a row.
+            conn = sqlite3.connect(paths['db'])
+            dates = sorted(r[0] for r in conn.execute(
+                'SELECT date FROM snapshots').fetchall())
+            conn.close()
+            self.assertNotIn('2026-04-29', dates)
+            # The log's date IS expected (phase 1 mirrors host.py's INSERT).
+            self.assertEqual(dates, ['2026-01-01'])
         finally:
             __import__('shutil').rmtree(tmp, ignore_errors=True)
 
@@ -708,10 +971,8 @@ class TestCLI(_CLIBase):
 
     def test_missing_db_parent_dir_exits_nonzero(self):
         with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, 'visits.log')
-            Path(log).touch()
-            args = ['--log', log,
-                    '--db', os.path.join(tmp, 'no-such-dir', 'visits.db')]
+            args = ['--log-dir', tmp,
+                    '--db',      os.path.join(tmp, 'no-such-dir', 'visits.db')]
             rc, _ = self._run(args)
         self.assertEqual(rc, 1)
 
@@ -763,7 +1024,8 @@ class TestEndToEnd(unittest.TestCase):
         payload = json.dumps(message).encode('utf-8')
         framed = struct.pack('<I', len(payload)) + payload
 
-        log_path = os.path.join(tmp, 'visits.log')
+        log_dir  = os.path.join(tmp, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
         db_path  = os.path.join(tmp, 'visits.db')
         src      = os.path.join(tmp, 'dl')
 
@@ -772,8 +1034,8 @@ class TestEndToEnd(unittest.TestCase):
         stdin.buffer  = stdin   # host expects sys.stdin.buffer
         stdout.buffer = stdout  # and sys.stdout.buffer
 
-        with patch.object(host, 'LOG_FILE', log_path), \
-             patch.object(host, 'DB_FILE',  db_path), \
+        with patch.object(host, 'LOG_DIR', log_dir), \
+             patch.object(host, 'DB_FILE', db_path), \
              patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', src), \
              patch.object(sys, 'stdin',  stdin), \
              patch.object(sys, 'stdout', stdout):
@@ -807,10 +1069,10 @@ class TestEndToEnd(unittest.TestCase):
 
     def test_round_trip_matches_original(self):
         with tempfile.TemporaryDirectory() as tmp:
-            src  = os.path.join(tmp, 'dl');     os.makedirs(src)
-            dest = os.path.join(tmp, 'icloud'); os.makedirs(dest)
-            db   = os.path.join(tmp, 'visits.db')
-            log  = os.path.join(tmp, 'visits.log')
+            src     = os.path.join(tmp, 'dl');     os.makedirs(src)
+            dest    = os.path.join(tmp, 'icloud'); os.makedirs(dest)
+            log_dir = os.path.join(tmp, 'logs')    # _drive_host creates it
+            db      = os.path.join(tmp, 'visits.db')
 
             # Seed a few host invocations: visit, of_interest, read, skimmed.
             self._drive_host({'timestamp': '2026-04-29T10:00:00Z',
@@ -839,35 +1101,41 @@ class TestEndToEnd(unittest.TestCase):
             saved = (
                 snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
+                snapshot_mover.LOG_DIR,
                 snapshot_mover.DB_FILE,
             )
             try:
                 snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR = src
                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR    = dest
+                snapshot_mover.LOG_DIR                 = log_dir
                 snapshot_mover.DB_FILE                 = db
                 conn = sqlite3.connect(db)
                 snapshot_mover._ensure_snapshots_table(conn)
                 snapshot_mover._ensure_mover_errors_table(conn)
                 snapshot_mover._move_pass(conn)
                 snapshot_mover._seal_pass(conn)
+                snapshot_mover._orphan_log_merge_pass(conn)
                 conn.close()
             finally:
                 (snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
                  snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
+                 snapshot_mover.LOG_DIR,
                  snapshot_mover.DB_FILE) = saved
 
             # Snapshot table contents, wipe the DB, run the rebuild.
             before = self._snapshot_tables(db)
             os.unlink(db)
 
-            saved2 = (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE,
-                      snapshot_mover.ICLOUD_SNAPSHOTS_DIR)
+            saved2 = (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+                      snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
+                      snapshot_mover.LOG_DIR)
             try:
-                rc = vr.cli(['--log', log, '--db', db,
+                rc = vr.cli(['--log-dir', log_dir, '--db', db,
                              '--source', src, '--dest', dest])
             finally:
-                (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE,
-                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR) = saved2
+                (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
+                 snapshot_mover.LOG_DIR) = saved2
             self.assertEqual(rc, 0)
 
             after = self._snapshot_tables(db)
@@ -887,16 +1155,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 class TestWrapperSmoke(unittest.TestCase):
 
-    def test_wrapper_runs_against_empty_log(self):
+    def test_wrapper_runs_against_empty_log_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, 'visits.log')
-            Path(log).touch()
-            db   = os.path.join(tmp, 'visits.db')
-            src  = os.path.join(tmp, 'dl');     os.makedirs(src)
-            dest = os.path.join(tmp, 'icloud'); os.makedirs(dest)
+            log_dir = os.path.join(tmp, 'logs');   os.makedirs(log_dir)
+            db      = os.path.join(tmp, 'visits.db')
+            src     = os.path.join(tmp, 'dl');     os.makedirs(src)
+            dest    = os.path.join(tmp, 'icloud'); os.makedirs(dest)
             result = subprocess.run(
                 [str(REPO_ROOT / 'rebuild_visits_data'),
-                 '--log', log, '--db', db, '--source', src, '--dest', dest],
+                 '--log-dir', log_dir, '--db', db,
+                 '--source', src, '--dest', dest],
                 capture_output=True, text=True, timeout=10,
             )
         self.assertEqual(result.returncode, 0,
