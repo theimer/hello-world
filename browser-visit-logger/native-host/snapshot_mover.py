@@ -121,6 +121,9 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     'BVL_ICLOUD_SNAPSHOTS_DIR',
     os.path.join(HOME, 'Documents', 'browser-visit-logger', 'snapshots'),
 )
+# host.py writes per-day visit logs into this dir; the sealer collects each
+# completed day's log into the matching iCloud snapshot subdir.
+LOG_DIR = os.environ.get('BVL_LOG_DIR', HOME)
 MIN_AGE_SECONDS = int(os.environ.get('BVL_MOVER_MIN_AGE_SECONDS', '60'))
 
 # Number of consecutive same-(op, target) failures before a "persistent"
@@ -334,7 +337,9 @@ def _reconcile_dir_scoped_errors(conn, op, dir_path, current_strays):
                 conn.execute(
                     "DELETE FROM mover_errors WHERE key = ?", (key,))
         conn.commit()
-    except sqlite3.Error as inner:
+    except sqlite3.Error as inner:  # pragma: no cover
+        # Defensive: a mid-reconcile DB failure means the user already
+        # has bigger problems.  Best-effort log; the seal pass continues.
         logger.error(
             'Could not reconcile %s errors under %s: %s',
             op, dir_path, inner,
@@ -589,9 +594,13 @@ def _seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
     """Seal every snapshots-table row whose date is strictly before today (UTC)
     and whose `sealed` flag is still 0.
 
-    Driven entirely by the database — no filesystem rescan.  The mover's
-    move pass keeps the table in sync with the on-disk daily directories
-    by inserting a row each time it creates one.
+    Driven by the database.  Rows come from two sources: the move pass
+    inserts one when a snapshot file lands in a new date dir; host.py
+    inserts one on every write invocation (covers activity-only days
+    that produced no snapshot files).
+
+    The iCloud date dir is created on the fly if absent — both branches
+    above can produce a snapshots row without a matching dir on disk.
     """
     today = _today_utc()
     rows = conn.execute(
@@ -601,21 +610,17 @@ def _seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
     for (date_str,) in rows:
         date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, date_str)
         if not os.path.isdir(date_subdir):
-            # DB says this day exists but the directory is gone (e.g. user
-            # manually deleted it).  Record an error and skip — the row
-            # will retry next tick, and the user is notified once the
-            # threshold is crossed.
-            logger.error(
-                'snapshots row %s has no on-disk directory at %s; skipping',
-                date_str, date_subdir,
-            )
-            _try_record_error(
-                conn, 'missing_directory', date_subdir,
-                FileNotFoundError(
-                    f'snapshots row {date_str} has no on-disk directory'),
-            )
-            continue
-        # Directory present — clear any prior 'missing_directory' error.
+            if dry_run:
+                logger.info(
+                    '[dry-run] would create %s for activity-only day',
+                    date_subdir)
+            else:
+                try:
+                    os.makedirs(date_subdir, exist_ok=True)
+                except OSError as exc:
+                    logger.error('Failed to create %s: %s', date_subdir, exc)
+                    _try_record_error(conn, 'seal', date_subdir, exc)
+                    continue
         _try_clear_error(conn, 'missing_directory', date_subdir)
         _seal_directory(conn, date_subdir, dry_run=dry_run, date_key=date_str)
 
@@ -649,12 +654,17 @@ def _seal_directory(
 
     try:
         count = _write_manifest_file(conn, date_subdir)
+        # Move the day's log file into the sealed dir if one exists in
+        # LOG_DIR.  Done before flipping sealed=1 so a failure leaves the
+        # row at sealed=0 and the seal will retry on the next tick.
+        if date_key is not None:
+            _move_log_into_sealed_dir(date_subdir, date_key)
         logger.info('Sealed %s (%d entries)', date_subdir, count)
         if date_key is not None:
             # Upsert: the auto seal pass always finds an existing row (the
-            # mover inserted it).  The manual sealer may not — e.g. if the
-            # user is sealing a directory imported from elsewhere — so we
-            # tolerate the no-row case by inserting first.
+            # mover or host inserted it).  The manual sealer may not — e.g.
+            # if the user is sealing a directory imported from elsewhere —
+            # so we tolerate the no-row case by inserting first.
             conn.execute(
                 "INSERT INTO snapshots (date, sealed) VALUES (?, 1) "
                 "ON CONFLICT(date) DO UPDATE SET sealed = 1",
@@ -666,6 +676,85 @@ def _seal_directory(
     except (OSError, sqlite3.Error) as exc:
         logger.error('Failed to seal %s: %s', date_subdir, exc)
         _try_record_error(conn, 'seal', date_subdir, exc)
+
+
+def _log_filename_for(date_iso: str) -> str:
+    """Per-day log filename used by both host.py and the sealer."""
+    return f'browser-visits-{date_iso}.log'
+
+
+def _move_log_into_sealed_dir(date_subdir: str, date_iso: str) -> None:
+    """Move <LOG_DIR>/browser-visits-<date>.log into date_subdir, chmod 0o444.
+
+    No-op if no log file for that date exists in LOG_DIR (e.g. the day
+    had read/skimmed events from a clock-skewed host but no auto-log).
+    Caller is responsible for catching OSError.
+    """
+    src = os.path.join(LOG_DIR, _log_filename_for(date_iso))
+    if not os.path.exists(src):
+        return
+    dst = os.path.join(date_subdir, _log_filename_for(date_iso))
+    shutil.move(src, dst)
+    os.chmod(dst, 0o444)
+
+
+_LOG_FILENAME_RE = re.compile(r'^browser-visits-(\d{4}-\d{2}-\d{2})\.log$')
+
+
+def _orphan_log_merge_pass(conn: sqlite3.Connection) -> None:
+    """Anti-entropy: scan LOG_DIR for past-day per-day logs and reconcile.
+
+    Two cases:
+      1. **Race orphan** — the iCloud counterpart already exists.  This
+         means the seal pass moved an earlier copy and a host invocation
+         in the seal-window race has since recreated the file in LOG_DIR
+         with stragglers.  Append the orphan into the iCloud log and
+         delete the orphan.
+      2. **Lost snapshots row** — no iCloud counterpart exists and there
+         is no snapshots row for the date (e.g. the host crashed between
+         the snapshots INSERT OR IGNORE and the first log write).
+         Backfill the snapshots row at sealed=0 so the next normal seal
+         pass picks it up.
+
+    Skips today's UTC log file — it's still being written.
+    """
+    if not os.path.isdir(LOG_DIR):
+        return
+    today_iso = _today_utc().isoformat()
+    for entry in sorted(os.listdir(LOG_DIR)):
+        m = _LOG_FILENAME_RE.match(entry)
+        if not m:
+            continue
+        date_iso = m.group(1)
+        if date_iso >= today_iso:
+            continue
+        src = os.path.join(LOG_DIR, entry)
+        date_subdir = os.path.join(ICLOUD_SNAPSHOTS_DIR, date_iso)
+        dst = os.path.join(date_subdir, entry)
+        try:
+            if os.path.exists(dst):
+                # Race orphan — chmod +w the iCloud log, append, chmod 0o444.
+                os.chmod(dst, 0o644)
+                with open(src, 'r', encoding='utf-8') as fsrc, \
+                        open(dst, 'a', encoding='utf-8') as fdst:
+                    fdst.write(fsrc.read())
+                os.chmod(dst, 0o444)
+                os.unlink(src)
+                logger.info('Merged orphan log %s into %s', src, dst)
+                _try_clear_error(conn, 'seal', date_subdir)
+            else:
+                # No iCloud counterpart — make sure the seal pass picks
+                # it up on the next tick.  INSERT OR IGNORE is a no-op if
+                # the row already exists (the common case — host inserted
+                # it).  Defensive for the host-crash-mid-startup scenario.
+                conn.execute(
+                    "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
+                    (date_iso,),
+                )
+                conn.commit()
+        except OSError as exc:
+            logger.error('orphan-merge for %s: %s', src, exc)
+            _try_record_error(conn, 'seal', date_subdir, exc)
 
 
 def _write_manifest_file(
@@ -738,9 +827,19 @@ def _build_manifest_rows(
     invariant enforced by snapshot_verifier.py: every manifest row must
     correspond to a real DB row.
     """
+    # Determine the per-day log filename to skip alongside MANIFEST.tsv.
+    # Only date-named directories have one; manual seals of non-date dirs
+    # have no expected log filename (and so nothing to skip).
+    basename = os.path.basename(os.path.normpath(date_subdir))
+    expected_log = (
+        _log_filename_for(basename)
+        if _DATE_DIR_RE.match(basename)
+        else None
+    )
     files = sorted(
         f for f in os.listdir(date_subdir)
         if f != MANIFEST_FILENAME
+        and f != expected_log
         and os.path.isfile(os.path.join(date_subdir, f))
     )
     rows = []
@@ -839,6 +938,8 @@ def main(dry_run: bool = False) -> None:
         _ensure_mover_errors_table(conn)
         _move_pass(conn, dry_run=dry_run)
         _seal_pass(conn, dry_run=dry_run)
+        if not dry_run:
+            _orphan_log_merge_pass(conn)
         _escalate_errors(conn)
     except Exception as exc:
         # Top-level: best-effort record + escalate, then fall back to a

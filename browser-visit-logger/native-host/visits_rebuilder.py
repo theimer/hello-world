@@ -118,18 +118,79 @@ def _is_result_payload(payload: str) -> bool:
     return payload == 'success' or payload.startswith('error: ')
 
 
-def replay_log(conn: sqlite3.Connection, log_path: str) -> ReplayStats:
-    """Phase 1: replay a UUID-prefixed TSV log into the DB.
+# Per-day log filename pattern: 'browser-visits-YYYY-MM-DD.log'.
+_LOG_FILENAME_RE = re.compile(r'^browser-visits-(\d{4}-\d{2}-\d{2})\.log$')
 
-    Action lines are buffered in a dict keyed by record_id; each result
-    line pops its matching action.  Successful pairs are applied via
-    host.py's helpers.  Error pairs are counted but skipped (the DB
-    write didn't happen, so there's nothing to replay).  Orphans on
-    either side are counted and logged.
+
+def _collect_log_paths(log_dir: str, icloud_dir: str) -> list:
+    """Return the list of per-day log files to replay, in chronological
+    order (sorted by the date in the filename).
+
+    Sources:
+      1. <log_dir>/browser-visits-<date>.log — today's log + any past-day
+         logs that haven't been moved yet (race orphans, log-only days
+         pending the next sealer tick).
+      2. <icloud_dir>/<YYYY-MM-DD>/browser-visits-<same-date>.log — every
+         sealed iCloud subdir's log.  Defensive: if a log inside a date
+         subdir has a different embedded date, it's skipped with a warning.
+
+    Sort key is the date in the filename, so a URL first visited day 1
+    and re-visited day 5 ends up with day-1's timestamp in
+    ``visits.timestamp`` (INSERT OR IGNORE keeps the first replayed value).
     """
-    stats = ReplayStats()
-    pending: dict = {}  # record_id -> parsed action fields
+    # Each entry: (date_iso, source_priority, path).  source_priority sorts
+    # iCloud (0) before log_dir (1) so when both have a same-date file
+    # (the cross-day seal-race case) the iCloud copy is processed first
+    # — its action lines populate `pending` before log_dir's stragglers
+    # arrive with the matching result lines.
+    discovered = []
 
+    if os.path.isdir(icloud_dir):
+        for date_entry in os.listdir(icloud_dir):
+            if not snapshot_mover._DATE_DIR_RE.match(date_entry):
+                continue
+            date_dir = os.path.join(icloud_dir, date_entry)
+            if not os.path.isdir(date_dir):
+                continue
+            for entry in os.listdir(date_dir):
+                m = _LOG_FILENAME_RE.match(entry)
+                if not m:
+                    continue
+                full = os.path.join(date_dir, entry)
+                if not os.path.isfile(full):
+                    continue
+                if m.group(1) != date_entry:
+                    logger.warning(
+                        'Log file %s embedded date does not match its '
+                        'parent directory %s — skipping',
+                        full, date_dir)
+                    continue
+                discovered.append((m.group(1), 0, full))
+
+    if os.path.isdir(log_dir):
+        for entry in os.listdir(log_dir):
+            m = _LOG_FILENAME_RE.match(entry)
+            if not m:
+                continue
+            full = os.path.join(log_dir, entry)
+            if os.path.isfile(full):
+                discovered.append((m.group(1), 1, full))
+
+    discovered.sort(key=lambda t: (t[0], t[1]))
+    return [(date_iso, path) for date_iso, _, path in discovered]
+
+
+def _replay_one_file(conn: sqlite3.Connection, log_path: str,
+                     pending: dict, stats: ReplayStats) -> None:
+    """Replay a single per-day log file using the shared pending dict.
+
+    Action lines accumulate into pending; result lines pop their matching
+    action and apply (success) or count (error).  pending may carry over
+    UUIDs across files — the cross-file race window described in
+    docs/rebuild-visits-from-log.md.  Orphan reporting is left to the
+    caller (replay_logs) so that pending is fully drained before
+    reporting.
+    """
     with open(log_path, 'r', encoding='utf-8') as f:
         for raw in f:
             line = raw.rstrip('\n')
@@ -137,7 +198,9 @@ def replay_log(conn: sqlite3.Connection, log_path: str) -> ReplayStats:
                 continue
             parts = line.split('\t')
             if not _looks_like_uuid(parts[0]):
-                logger.warning('Skipping malformed log line (non-UUID prefix): %r', raw)
+                logger.warning(
+                    'Skipping malformed log line in %s (non-UUID prefix): %r',
+                    log_path, raw)
                 stats.malformed_lines += 1
                 continue
             record_id = parts[0]
@@ -149,7 +212,8 @@ def replay_log(conn: sqlite3.Connection, log_path: str) -> ReplayStats:
                 action = pending.pop(record_id, None)
                 if action is None:
                     logger.warning(
-                        'Result line for %s has no matching action — skipping', record_id)
+                        'Result line for %s in %s has no matching action — skipping',
+                        record_id, log_path)
                     stats.orphan_results += 1
                     continue
                 if rest[0] == 'success':
@@ -162,19 +226,47 @@ def replay_log(conn: sqlite3.Connection, log_path: str) -> ReplayStats:
             # Otherwise it's an action line.
             action = _parse_action_fields(rest)
             if action is None:
-                logger.warning('Skipping malformed action line: %r', raw)
+                logger.warning('Skipping malformed action line in %s: %r',
+                               log_path, raw)
                 stats.malformed_lines += 1
                 continue
             if record_id in pending:
                 # Duplicate UUID for a pending action — the host should
                 # never emit this.  Drop the prior, count the new one.
                 logger.warning(
-                    'Duplicate record_id %s while a prior action is pending — '
-                    'dropping the prior orphan', record_id)
+                    'Duplicate record_id %s in %s while a prior action is '
+                    'pending — dropping the prior orphan', record_id, log_path)
                 stats.orphan_actions += 1
             pending[record_id] = action
 
-    # Anything still pending after EOF is an orphan action.
+
+def replay_logs(conn: sqlite3.Connection,
+                log_dir: str, icloud_dir: str) -> ReplayStats:
+    """Phase 1: enumerate every per-day log under log_dir and icloud_dir
+    and replay them chronologically into the DB.
+
+    A single ``pending`` dict spans all files so a UUID's action half in
+    one file pairs with its result half in another (handles the
+    cross-day seal race).  Anything left in pending at the end is an
+    orphan action.
+    """
+    stats = ReplayStats()
+    pending: dict = {}
+
+    for date_iso, log_path in _collect_log_paths(log_dir, icloud_dir):
+        logger.info('Replaying %s', log_path)
+        # Mirror host.py's per-invocation INSERT OR IGNORE: each day with
+        # a log file gets a snapshots row.  Phase 2's rehydrate may flip
+        # sealed=1 if the iCloud dir for that date has a manifest; if not,
+        # the row stays sealed=0 (e.g. today's log, which the sealer
+        # wouldn't touch anyway).
+        conn.execute(
+            "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
+            (date_iso,),
+        )
+        _replay_one_file(conn, log_path, pending, stats)
+
+    # Anything still pending after all files are exhausted is an orphan action.
     if pending:
         for record_id in pending:
             logger.warning('Action %s has no matching result line', record_id)
@@ -253,8 +345,11 @@ def rehydrate_filesystem(
         else:
             stats.unsealed_dirs += 1
 
+        # Skip the manifest and the per-day log file; phase 1 already
+        # replayed the log, and the manifest is verified separately.
+        log_filename = snapshot_mover._log_filename_for(entry)
         for fname in sorted(os.listdir(date_dir)):
-            if fname == 'MANIFEST.tsv':
+            if fname == 'MANIFEST.tsv' or fname == log_filename:
                 continue
             if not snapshot_mover._SNAPSHOT_FILENAME_RE.match(fname):
                 continue
@@ -297,7 +392,7 @@ def _truncate_rebuildable_tables(conn: sqlite3.Connection) -> None:
 
 def rebuild(
     conn: sqlite3.Connection, *,
-    log_path: str, icloud_dir: str, downloads_dir: str,
+    log_dir: str, icloud_dir: str, downloads_dir: str,
     do_log: bool = True, do_rehydrate: bool = True, truncate: bool = True,
 ) -> RebuildStats:
     stats = RebuildStats(truncated=truncate)
@@ -307,7 +402,7 @@ def rebuild(
     snapshot_mover._ensure_snapshots_table(conn)
 
     if do_log:
-        stats.replay = replay_log(conn, log_path)
+        stats.replay = replay_logs(conn, log_dir, icloud_dir)
     if do_rehydrate:
         stats.rehydrate = rehydrate_filesystem(conn, icloud_dir, downloads_dir)
     return stats
@@ -343,8 +438,9 @@ def _parse_args(argv=None):
                    help='skip phase 2 (filesystem rehydration)')
     p.add_argument('--rehydrate-only', action='store_true',
                    help='skip phase 1 (log replay)')
-    p.add_argument('--log', metavar='FILE', dest='log_path',
-                   help=f'override the log file path (default {host.LOG_FILE})')
+    p.add_argument('--log-dir', metavar='DIR', dest='log_dir',
+                   help=f'override the per-day logs directory '
+                        f'(default {host.LOG_DIR})')
     p.add_argument('--db', metavar='FILE', dest='db_path',
                    help=f'override the SQLite database path (default {host.DB_FILE})')
     p.add_argument('--source', metavar='DIR',
@@ -372,7 +468,7 @@ def cli(argv=None) -> int:
     )
     logger.setLevel(log_level)
 
-    log_path      = args.log_path or host.LOG_FILE
+    log_dir       = args.log_dir  or host.LOG_DIR
     db_path       = args.db_path  or host.DB_FILE
     downloads_dir = args.source   or host.DOWNLOADS_SNAPSHOTS_DIR
     icloud_dir    = args.dest     or snapshot_mover.ICLOUD_SNAPSHOTS_DIR
@@ -385,10 +481,12 @@ def cli(argv=None) -> int:
     # directory) use the same values the user passed on the CLI.
     host.DOWNLOADS_SNAPSHOTS_DIR = downloads_dir
     host.DB_FILE                 = db_path
+    host.LOG_DIR                 = log_dir
     snapshot_mover.ICLOUD_SNAPSHOTS_DIR = icloud_dir
+    snapshot_mover.LOG_DIR              = log_dir
 
-    if do_log and not os.path.exists(log_path):
-        print(f'No log file at {log_path}', file=sys.stderr)
+    if do_log and not os.path.isdir(log_dir):
+        print(f'No log directory at {log_dir}', file=sys.stderr)
         return _EXIT_INPUT_ERROR
 
     db_dir = os.path.dirname(db_path) or '.'
@@ -401,7 +499,7 @@ def cli(argv=None) -> int:
         try:
             stats = rebuild(
                 conn,
-                log_path=log_path,
+                log_dir=log_dir,
                 icloud_dir=icloud_dir,
                 downloads_dir=downloads_dir,
                 do_log=do_log, do_rehydrate=do_rehydrate,

@@ -59,16 +59,20 @@ class _MoverTestBase(unittest.TestCase):
 
         self.source_dir = os.path.join(self.tmp.name, 'downloads')
         self.dest_dir   = os.path.join(self.tmp.name, 'icloud')
+        self.log_dir    = os.path.join(self.tmp.name, 'logs')
         self.db_file    = os.path.join(self.tmp.name, 'visits.db')
         os.makedirs(self.source_dir)
+        os.makedirs(self.log_dir)
         # dest_dir intentionally NOT created — main() should create the root
 
         for module, attrs in (
             (host,            {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
                                'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
+                               'LOG_DIR':                 self.log_dir,
                                'DB_FILE':                 self.db_file}),
             (snapshot_mover,  {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
                                'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
+                               'LOG_DIR':                 self.log_dir,
                                'DB_FILE':                 self.db_file}),
         ):
             for name, value in attrs.items():
@@ -888,31 +892,36 @@ class TestSealPass(_MoverTestBase):
         self.assertFalse(os.path.exists(
             os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
 
-    def test_seal_pass_records_error_when_row_directory_is_missing(self):
-        # Insert a snapshots row for a date whose directory doesn't exist
-        # on disk.  The pass should ERROR-log, record a 'missing_directory'
-        # mover_errors row so the user is notified, and leave the snapshots
-        # row unsealed (we couldn't seal what isn't there).
+    def test_seal_pass_creates_dir_for_activity_only_day(self):
+        # Insert a snapshots row for a past date with no on-disk dir yet
+        # (the activity-only-day case: host inserted the row but the move
+        # pass never created a dir because no snapshot files landed).
+        # The seal pass creates the dir, writes a header-only MANIFEST,
+        # and flips sealed=1.
         os.makedirs(self.dest_dir, exist_ok=True)
         conn = sqlite3.connect(self.db_file)
         conn.execute(
             "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", ('2024-01-15',))
         conn.commit()
         conn.close()
-        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-        self.assertTrue(any('no on-disk directory' in m for m in cm.output))
-        # Row remains unsealed.
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
-        # mover_errors row was recorded.
+
+        snapshot_mover.main()
+
+        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        self.assertTrue(os.path.isdir(date_subdir))
+        self.assertTrue(os.path.exists(manifest))
+        # Header-only manifest (no snapshot files for the day).
+        lines = Path(manifest).read_text().splitlines()
+        self.assertEqual(lines, ['\t'.join(snapshot_mover._MANIFEST_HEADER)])
+        # Row flipped to sealed=1, no missing_directory error recorded.
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
         conn = sqlite3.connect(self.db_file)
-        err_row = conn.execute(
-            "SELECT operation, target FROM mover_errors "
-            "WHERE operation = 'missing_directory'"
-        ).fetchone()
+        n = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'missing_directory'"
+        ).fetchone()[0]
         conn.close()
-        expected_target = os.path.join(self.dest_dir, '2024-01-15')
-        self.assertEqual(err_row, ('missing_directory', expected_target))
+        self.assertEqual(n, 0)
 
     def test_seal_pass_clears_missing_directory_error_when_dir_reappears(self):
         # Pre-seed a missing_directory error for a date whose dir has now
@@ -1005,6 +1014,213 @@ class TestSealPass(_MoverTestBase):
         os.makedirs(self.dest_dir, exist_ok=True)
         snapshot_mover.main()  # must not raise
         self.assertEqual(os.listdir(self.dest_dir), [])
+
+    # -- per-day log move during seal --
+
+    def _write_log(self, date_str, content='line\n'):
+        """Drop a per-day log file into the test's LOG_DIR for date_str."""
+        path = os.path.join(self.log_dir,
+                            snapshot_mover._log_filename_for(date_str))
+        Path(path).write_text(content, encoding='utf-8')
+        return path
+
+    def test_seal_moves_per_day_log_into_sealed_dir_chmod_0o444(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        log_src = self._write_log('2024-01-15', 'action-line\nresult-line\n')
+        snapshot_mover.main()
+        log_dst = os.path.join(date_subdir,
+                               snapshot_mover._log_filename_for('2024-01-15'))
+        self.assertFalse(os.path.exists(log_src))
+        self.assertTrue(os.path.exists(log_dst))
+        self.assertEqual(Path(log_dst).read_text(), 'action-line\nresult-line\n')
+        self.assertEqual(os.stat(log_dst).st_mode & 0o777, 0o444)
+
+    def test_seal_with_no_log_in_log_dir_succeeds_silently(self):
+        # No per-day log for the date — the seal still succeeds, just
+        # without a log file inside the sealed dir.
+        date_subdir = self._seed_dir('2024-01-15')
+        snapshot_mover.main()
+        files = sorted(os.listdir(date_subdir))
+        self.assertNotIn(snapshot_mover._log_filename_for('2024-01-15'), files)
+        self.assertIn(snapshot_mover.MANIFEST_FILENAME, files)
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
+
+    def test_seal_records_seal_error_when_log_move_fails(self):
+        # Force a failure by making the destination dir un-writable AFTER
+        # _write_manifest_file has already written the manifest into it.
+        # We patch shutil.move to raise so the manifest write succeeds but
+        # the log move fails — the row should remain unsealed.
+        date_subdir = self._seed_dir('2024-01-15')
+        self._write_log('2024-01-15')
+        with patch('shutil.move', side_effect=OSError('boom')):
+            snapshot_mover.main()
+        # Row stays unsealed because log move failed.
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
+        # mover_errors row recorded.
+        conn = sqlite3.connect(self.db_file)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors "
+            "WHERE operation = 'seal' AND target = ?",
+            (date_subdir,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+
+    # -- orphan-log merge pass --
+
+    def test_orphan_merge_appends_orphan_into_sealed_log(self):
+        # Race: pre-seed a sealed dir with a log file containing the action,
+        # then drop a same-named log file into LOG_DIR containing the result.
+        # Orphan-merge should append + chmod 0o444 + delete the orphan.
+        date_subdir = self._seed_dir('2024-01-15', sealed=1)
+        # Pre-existing sealed log in iCloud (contains the action half).
+        sealed_log = os.path.join(date_subdir,
+                                  snapshot_mover._log_filename_for('2024-01-15'))
+        Path(sealed_log).write_text('uuid\taction\n', encoding='utf-8')
+        os.chmod(sealed_log, 0o444)
+        # Manifest already present so the day stays sealed=1.
+        Path(date_subdir, snapshot_mover.MANIFEST_FILENAME).write_text(
+            '\t'.join(snapshot_mover._MANIFEST_HEADER) + '\n',
+            encoding='utf-8',
+        )
+        os.chmod(os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME),
+                 0o444)
+        # Race orphan in LOG_DIR (the result half).
+        orphan = self._write_log('2024-01-15', 'uuid\tsuccess\n')
+
+        snapshot_mover.main()
+
+        self.assertFalse(os.path.exists(orphan))
+        merged = Path(sealed_log).read_text()
+        self.assertEqual(merged, 'uuid\taction\nuuid\tsuccess\n')
+        self.assertEqual(os.stat(sealed_log).st_mode & 0o777, 0o444)
+
+    def test_orphan_merge_backfills_snapshots_row_when_no_icloud_log(self):
+        # Past-day log exists in LOG_DIR with no iCloud counterpart and no
+        # snapshots row.  The orphan-merge pass should INSERT OR IGNORE the
+        # snapshots row at sealed=0 so the next normal seal pass picks it up.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        self._write_log('2024-01-10', 'uuid\taction\nuuid\tsuccess\n')
+
+        snapshot_mover.main()
+
+        # Row was backfilled AND immediately sealed (the same main() call
+        # runs the seal pass right before the orphan-merge — in the
+        # backfill case the merge runs in a *future* mover tick.  But
+        # main()'s order is move → seal → orphan-merge, so the backfill's
+        # row will be picked up on the NEXT tick.  Either way the row
+        # exists by the end of this main() call.)
+        self.assertIsNotNone(self._snapshots_row('2024-01-10'))
+        # Run main() again so the seal pass actually processes the row.
+        snapshot_mover.main()
+        date_subdir = os.path.join(self.dest_dir, '2024-01-10')
+        sealed_log = os.path.join(date_subdir,
+                                  snapshot_mover._log_filename_for('2024-01-10'))
+        self.assertTrue(os.path.exists(sealed_log))
+        self.assertEqual(self._snapshots_row('2024-01-10'), ('2024-01-10', 1))
+
+    def test_orphan_merge_leaves_today_log_alone(self):
+        # Today's log is still being written by host invocations; the
+        # orphan-merge pass must not touch it.
+        today_iso = self.TODAY.isoformat()
+        today_log = self._write_log(today_iso, 'uuid\taction\n')
+        snapshot_mover.main()
+        self.assertTrue(os.path.exists(today_log))
+        # And no snapshots row was created for today — only past dates
+        # are eligible for backfill.
+        self.assertIsNone(self._snapshots_row(today_iso))
+
+    def test_orphan_merge_is_idempotent_with_no_orphans(self):
+        # No log files in LOG_DIR → orphan-merge is a noop.  Run main()
+        # twice; nothing should change between the two snapshots.
+        snapshot_mover.main()
+        snapshot_mover.main()  # second pass also a noop, no errors
+        self.assertEqual(os.listdir(self.log_dir), [])
+
+    def test_orphan_merge_returns_early_when_log_dir_missing(self):
+        # If LOG_DIR doesn't exist (e.g. user nuked it manually), the
+        # orphan-merge pass should return without raising.
+        import shutil
+        shutil.rmtree(self.log_dir)
+        snapshot_mover.main()  # must not raise
+        self.assertFalse(os.path.isdir(self.log_dir))
+
+    def test_orphan_merge_records_seal_error_when_merge_fails(self):
+        # Pre-seed both halves of a race (iCloud log + LOG_DIR orphan).
+        # Make the iCloud log unwritable so the merge's chmod+append
+        # fails; the orphan-merge pass should record a seal:<dir>
+        # mover_error.
+        date_subdir = self._seed_dir('2024-01-15', sealed=1)
+        Path(date_subdir, snapshot_mover.MANIFEST_FILENAME).write_text(
+            '\t'.join(snapshot_mover._MANIFEST_HEADER) + '\n')
+        os.chmod(os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME),
+                 0o444)
+        sealed_log = os.path.join(date_subdir,
+                                  snapshot_mover._log_filename_for('2024-01-15'))
+        Path(sealed_log).write_text('uuid\taction\n')
+        os.chmod(sealed_log, 0o444)
+        self._write_log('2024-01-15', 'uuid\tsuccess\n')
+
+        with patch('shutil.move'):  # stub so seal pass log-move is no-op
+            with patch('builtins.open', side_effect=OSError('boom')):
+                snapshot_mover.main()
+
+        conn = sqlite3.connect(self.db_file)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM mover_errors "
+            "WHERE operation = 'seal' AND target = ?", (date_subdir,),
+        ).fetchone()[0]
+        conn.close()
+        self.assertGreaterEqual(n, 1)
+
+    def test_seal_pass_dry_run_logs_would_create_for_activity_only_day(self):
+        # Insert a snapshots row for a past date with no on-disk dir.
+        # In dry-run, _seal_pass should log the would-create line and not
+        # actually create the directory.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
+            ('2024-01-15',))
+        conn.commit()
+        conn.close()
+        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
+            snapshot_mover.main(dry_run=True)
+        self.assertTrue(any('would create' in m for m in cm.output))
+        self.assertFalse(os.path.isdir(os.path.join(self.dest_dir, '2024-01-15')))
+
+    def test_seal_pass_records_seal_error_when_dir_creation_fails(self):
+        # Force os.makedirs to raise OSError when the seal pass tries to
+        # create the date dir.  The pass should record a seal:<dir>
+        # mover_error and continue.
+        os.makedirs(self.dest_dir, exist_ok=True)
+        conn = sqlite3.connect(self.db_file)
+        conn.execute(
+            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
+            ('2024-01-15',))
+        conn.commit()
+        conn.close()
+
+        real_makedirs = os.makedirs
+
+        def boom_for_date_dir(path, *args, **kwargs):
+            if path.endswith('2024-01-15'):
+                raise OSError('disk full')
+            return real_makedirs(path, *args, **kwargs)
+
+        with patch('os.makedirs', side_effect=boom_for_date_dir):
+            snapshot_mover.main()
+
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation, target FROM mover_errors "
+            "WHERE operation = 'seal'"
+        ).fetchall()
+        conn.close()
+        self.assertEqual(rows,
+                         [('seal', os.path.join(self.dest_dir, '2024-01-15'))])
+        # snapshots row stays unsealed.
+        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
 
 
 class TestTodayUtc(unittest.TestCase):

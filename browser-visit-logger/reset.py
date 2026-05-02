@@ -3,7 +3,7 @@
 reset.py — Delete all local data produced by the Browser Visit Logger extension.
 
 Files and directories managed:
-  browser-visits.log                       — TSV visit/action log         (BVL_LOG_FILE)
+  browser-visits-<UTC-date>.log            — per-day TSV visit/action logs (BVL_LOG_DIR)
   browser-visits-host.log                  — native host process log      (BVL_HOST_LOG)
   browser-visits-mover.log                 — snapshot mover process log   (BVL_MOVER_LOG)
   browser-visits-verifier.log              — snapshot verifier process log (BVL_VERIFIER_LOG)
@@ -14,12 +14,16 @@ Files and directories managed:
 
 Usage:
     python reset.py                 # reset everything (with confirmation)
-    python reset.py --log           # reset only the visit log
+    python reset.py --log           # reset only the per-day visit logs in BVL_LOG_DIR
     python reset.py --host-log      # reset only the host, mover, and verifier process logs
     python reset.py --db            # reset only the database
     python reset.py --snapshots     # reset only the local Downloads snapshots dir
     python reset.py --icloud        # reset only the iCloud archive directory
     python reset.py -f              # skip confirmation prompt
+
+--log only deletes per-day logs in BVL_LOG_DIR (e.g. ~/browser-visits-*.log).
+Per-day logs that have already been moved into iCloud sealed dirs are wiped
+by --icloud, parallel to today's separation between log and snapshot data.
 
 The same BVL_* environment variables used by host.py are respected here,
 so custom paths work automatically.
@@ -27,17 +31,32 @@ so custom paths work automatically.
 
 import argparse
 import os
+import re
 import shutil
 import sys
 
 HOME         = os.path.expanduser('~')
-LOG_FILE     = os.environ.get('BVL_LOG_FILE',      os.path.join(HOME, 'browser-visits.log'))
+LOG_DIR      = os.environ.get('BVL_LOG_DIR',       HOME)
 HOST_LOG     = os.environ.get('BVL_HOST_LOG',      os.path.join(HOME, 'browser-visits-host.log'))
 MOVER_LOG    = os.environ.get('BVL_MOVER_LOG',     os.path.join(HOME, 'browser-visits-mover.log'))
 VERIFIER_LOG = os.environ.get('BVL_VERIFIER_LOG',  os.path.join(HOME, 'browser-visits-verifier.log'))
 DB_FILE      = os.environ.get('BVL_DB_FILE',       os.path.join(HOME, 'browser-visits.db'))
 SNAP_DIR   = os.environ.get('BVL_DOWNLOADS_SNAPSHOTS_DIR',
                             os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'))
+
+# Per-day visit logs follow `browser-visits-YYYY-MM-DD.log`.  Strict regex so
+# we don't accidentally match the host/mover/verifier process logs (which
+# share the `browser-visits-` prefix but have non-date suffixes).
+_LOG_FILENAME_RE = re.compile(r'^browser-visits-\d{4}-\d{2}-\d{2}\.log$')
+
+
+def _per_day_log_paths():
+    """Return absolute paths of per-day visit logs in LOG_DIR."""
+    return sorted(
+        os.path.join(LOG_DIR, name)
+        for name in os.listdir(LOG_DIR)
+        if _LOG_FILENAME_RE.match(name)
+    ) if os.path.isdir(LOG_DIR) else []
 # iCloud archive root — wipe the whole tree (currently snapshots/ but we may
 # add other subdirectories in the future).
 ICLOUD_DIR = os.path.join(HOME, 'Documents', 'browser-visit-logger')
@@ -83,7 +102,16 @@ def main() -> None:
     # Each entry: (path, label, kind)  where kind is 'file' or 'dir'
     targets = []
     if do_log:
-        targets.append((LOG_FILE,   'visit log',                       'file'))
+        per_day_logs = _per_day_log_paths()
+        if per_day_logs:
+            for p in per_day_logs:
+                targets.append((p, 'per-day visit log', 'file'))
+        else:
+            # Surface the LOG_DIR path even when nothing matches, so users
+            # see what was checked.
+            targets.append(
+                (os.path.join(LOG_DIR, 'browser-visits-*.log'),
+                 'per-day visit logs (none found)', 'glob'))
     if do_host_log:
         targets.append((HOST_LOG,     'host log',                      'file'))
         targets.append((MOVER_LOG,    'mover log',                     'file'))
@@ -97,7 +125,10 @@ def main() -> None:
 
     print('The following will be permanently deleted:')
     for path, label, kind in targets:
-        status = 'exists' if os.path.exists(path) else 'not found'
+        if kind == 'glob':
+            status = 'no match'
+        else:
+            status = 'exists' if os.path.exists(path) else 'not found'
         print(f'  [{status}] {path}')
 
     if not args.force:
@@ -114,6 +145,8 @@ def main() -> None:
     for path, label, kind in targets:
         if kind == 'dir':
             _delete_dir(path, label)
+        elif kind == 'glob':
+            print(f'{label}: no matches under {path}')
         else:
             _delete_file(path, label)
 

@@ -116,14 +116,26 @@ def verify_directory(conn, date_subdir):
             continue
         manifest_entries[filename] = (tag, timestamp, url, title)
 
+    # Determine the expected per-day log filename for this directory.
+    # Only date-named directories have one — a manually-sealed
+    # non-date directory does not.
+    basename = os.path.basename(os.path.normpath(date_subdir))
+    expected_log = (
+        snapshot_mover._log_filename_for(basename)
+        if snapshot_mover._DATE_DIR_RE.match(basename)
+        else None
+    )
+
     # 6. File-level check: every file in the directory (other than the
-    #    manifest itself) must have a conforming snapshot filename.
-    #    Non-conforming files are flagged regardless of whether they
-    #    appear in the manifest.
+    #    manifest and the per-day log) must have a conforming snapshot
+    #    filename.  Non-conforming files are flagged regardless of
+    #    whether they appear in the manifest.
     conforming_on_disk = set()
     for f in os.listdir(date_subdir):
         full = os.path.join(date_subdir, f)
         if f == snapshot_mover.MANIFEST_FILENAME:
+            continue
+        if expected_log is not None and f == expected_log:
             continue
         if not os.path.isfile(full):
             continue
@@ -182,6 +194,23 @@ def verify_directory(conn, date_subdir):
             issues.append(
                 f'{filename}: conforming file in directory has no '
                 f'corresponding events row in DB')
+
+    # 10. Per-day log file: must be present, a regular file, mode 0o444.
+    #     The sealer always moves the day's log into the sealed dir as
+    #     part of the seal flow, so absence here means an incomplete
+    #     seal or post-seal tampering.  Non-date directories (manual
+    #     seals of e.g. an imported archive) have no expected log.
+    if expected_log is not None:
+        log_path = os.path.join(date_subdir, expected_log)
+        if not os.path.exists(log_path):
+            issues.append(f'Per-day log file not found at {log_path}')
+        elif not os.path.isfile(log_path):
+            issues.append(f'Per-day log {log_path} is not a regular file')
+        else:
+            log_mode = os.stat(log_path).st_mode & 0o777
+            if log_mode != 0o444:
+                issues.append(
+                    f'Per-day log is not read-only (mode {log_mode:#o})')
 
     return len(issues) == 0, issues
 
