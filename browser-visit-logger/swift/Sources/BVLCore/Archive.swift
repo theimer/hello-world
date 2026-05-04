@@ -88,19 +88,33 @@ public enum Archive {
                     WHERE filename = ? AND directory = ?
                     """, [dateSubdir, basename, Paths.downloadsSnapshotsDir])
             }
-            // (e) INSERT OR IGNORE the snapshots row.  We don't need to
-            //     detect stragglers in the host's per-tag path (sealed
-            //     dirs only happen in the verifier's seal pass, and
-            //     only past dates can be sealed) — straggler handling
-            //     stays in the verifier.
+            // (e) Detect "straggler": a file whose date maps to a
+            //     directory whose snapshots row is already sealed=1.
+            //     Detection has to happen before the INSERT OR IGNORE
+            //     below — that statement no-ops on an existing row
+            //     and can't tell us the prior state.
+            let prevSealed = try db.queryOne(
+                "SELECT sealed FROM snapshots WHERE date = ?",
+                [dateStr], map: { $0.int(0) })
+            let isStraggler = (prevSealed == 1)
+            // (f) INSERT OR IGNORE the snapshots row.  Preserves any
+            //     existing row — including a sealed=1 one, so a
+            //     straggler doesn't reopen the day; we rewrite the
+            //     manifest below instead.
             try db.run("""
                 INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)
                 """, [dateStr])
-            // (f) Remove the source.
+            // (g) Remove the source.
             try FileManager.default.removeItem(atPath: source)
             log?.info("Moved \(source) -> \(dest) (read-only)")
-            // (g) Move succeeded — clear any prior 'move' error.
+            // (h) Move succeeded — clear any prior 'move' error.
             MoverErrors.tryClear(db, op: "move", target: source, log: log)
+            // (i) Straggler — rewrite the manifest so it includes the
+            //     just-moved file.  The sealed flag stays 1.
+            if isStraggler {
+                Seal.rewriteManifestForStraggler(
+                    db, dateSubdir: dateSubdir, log: log)
+            }
         } catch {
             log?.error("Failed to move \(source): \(error)")
             MoverErrors.tryRecord(
