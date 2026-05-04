@@ -161,7 +161,7 @@ class TestWrapperForwarding(unittest.TestCase):
             env['BVL_HOST_LOG']  = os.path.join(tmp, 'host.log')
             env['BVL_MOVER_LOG'] = os.path.join(tmp, 'mover.log')
             env['BVL_DB_FILE']   = os.path.join(tmp, 'visits.db')
-            env['BVL_DOWNLOADS_SNAPSHOTS_DIR'] = os.path.join(tmp, 'dl')
+            env['BVL_STAGING_SNAPSHOTS_DIR'] = os.path.join(tmp, 'staging')
             # Drop a per-day log so --log has something to delete.
             Path(tmp, 'browser-visits-2026-01-15.log').touch()
             result = subprocess.run(

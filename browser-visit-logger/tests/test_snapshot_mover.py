@@ -5,7 +5,7 @@ Each test sets up an isolated triplet of (source_dir, dest_dir, db_file)
 under a temporary directory, then patches both `host` and `snapshot_mover`
 module-level constants to point at it.
 
-The mover scans the Downloads filesystem rather than querying the DB, so
+The mover scans the staging directory rather than querying the DB, so
 tests create source files with the permanent datetime-prefixed filename that
 host.py would have assigned at record time.
 
@@ -57,7 +57,7 @@ class _MoverTestBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-        self.source_dir = os.path.join(self.tmp.name, 'downloads')
+        self.source_dir = os.path.join(self.tmp.name, 'staging')
         self.dest_dir   = os.path.join(self.tmp.name, 'icloud')
         self.log_dir    = os.path.join(self.tmp.name, 'logs')
         self.db_file    = os.path.join(self.tmp.name, 'visits.db')
@@ -66,11 +66,11 @@ class _MoverTestBase(unittest.TestCase):
         # dest_dir intentionally NOT created — main() should create the root
 
         for module, attrs in (
-            (host,            {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
+            (host,            {'STAGING_SNAPSHOTS_DIR': self.source_dir,
                                'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
                                'LOG_DIR':                 self.log_dir,
                                'DB_FILE':                 self.db_file}),
-            (snapshot_mover,  {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
+            (snapshot_mover,  {'STAGING_SNAPSHOTS_DIR': self.source_dir,
                                'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
                                'LOG_DIR':                 self.log_dir,
                                'DB_FILE':                 self.db_file}),
@@ -231,8 +231,8 @@ class TestMovePass(_MoverTestBase):
         self.assertTrue(os.path.exists(os.path.join(ds3, pf3)))
 
     def test_moves_file_even_without_db_row(self):
-        # A file in Downloads with no corresponding DB row (e.g., the host.py
-        # message was lost) should still be moved to clean up Downloads.
+        # A file in the staging dir with no corresponding DB row (e.g., the
+        # host.py message was lost) should still be moved to clean up staging.
         prefixed = _snap(ISO_TS1, 'no-db-row.mhtml')
         src = os.path.join(self.source_dir, prefixed)
         Path(src).write_bytes(b'data')
@@ -311,8 +311,8 @@ class TestMovePass(_MoverTestBase):
         conn.commit()
         conn.close()
 
-        # A straggler shows up in Downloads with a date prefix matching the
-        # already-sealed day.
+        # A straggler shows up in the staging dir with a date prefix matching
+        # the already-sealed day.
         self._make_event('read_events', 'https://new.com', ISO_TS1, 'new.mhtml',
                          age_seconds=700)
 
@@ -420,7 +420,7 @@ class TestIdempotency(_MoverTestBase):
                          age_seconds=700)
         date_subdir, _ = self._dest_info(prefixed)
         snapshot_mover.main()
-        snapshot_mover.main()   # source gone — nothing left in Downloads
+        snapshot_mover.main()   # source gone — nothing left in staging
         self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
         self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
         self.assertEqual(self._row('read_events', 'https://a.com'),
@@ -428,7 +428,7 @@ class TestIdempotency(_MoverTestBase):
 
     def test_retry_cleans_up_source_when_db_already_says_icloud(self):
         # Simulate: prior run did copy + DB update but crashed before unlinking.
-        # Source still in Downloads; DB already says iCloud.
+        # Source still in staging; DB already says iCloud.
         prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
@@ -449,7 +449,7 @@ class TestIdempotency(_MoverTestBase):
                          (prefixed, date_subdir))
 
     def test_retry_recovers_from_crash_between_copy_and_db_update(self):
-        # Source exists, dest already exists (from prior copy), DB still says Downloads.
+        # Source exists, dest already exists (from prior copy), DB still says staging.
         # Next run should overwrite the dest (safe, same data), update DB, unlink source.
         prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
@@ -472,7 +472,7 @@ class TestIdempotency(_MoverTestBase):
 
     def test_skips_file_with_unrecognized_name_format(self):
         # Files whose names don't match the snapshot format are left in
-        # Downloads (not moved), ERROR-logged, and recorded as an
+        # the staging dir (not moved), ERROR-logged, and recorded as an
         # 'invalid_filename' mover_errors row so the user is notified.
         stray = os.path.join(self.source_dir, 'random-file.mhtml')
         Path(stray).write_bytes(b'x')
@@ -496,7 +496,7 @@ class TestIdempotency(_MoverTestBase):
 
     def test_move_pass_clears_invalid_filename_error_when_stray_removed(self):
         # Pre-seed an invalid_filename row for a path that no longer exists
-        # in Downloads.  The move-pass reconcile should clear it.
+        # in the staging dir.  The move-pass reconcile should clear it.
         gone = os.path.join(self.source_dir, 'never-existed.mhtml')
         conn = sqlite3.connect(self.db_file)
         snapshot_mover._record_error(
@@ -514,7 +514,7 @@ class TestIdempotency(_MoverTestBase):
         conn.close()
         self.assertEqual(count, 0)
 
-    def test_skips_subdirectory_entries_in_downloads(self):
+    def test_skips_subdirectory_entries_in_staging(self):
         os.makedirs(os.path.join(self.source_dir, 'subdir'))
         snapshot_mover.main()
         self.assertEqual(os.listdir(self.dest_dir), [])
@@ -543,12 +543,12 @@ class TestEdgeCases(_MoverTestBase):
         snapshot_mover.main()   # should not raise
         self.assertTrue(os.path.isdir(self.dest_dir))
 
-    def test_downloads_dir_absent_is_a_noop(self):
+    def test_staging_dir_absent_is_a_noop(self):
         os.rmdir(self.source_dir)   # empty, safe to remove
         snapshot_mover.main()       # should not raise
         self.assertTrue(os.path.isdir(self.dest_dir))
 
-    def test_copy_failure_leaves_source_in_downloads(self):
+    def test_copy_failure_leaves_source_in_staging(self):
         prefixed = _snap(ISO_TS1, 'a.mhtml')
         self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
                          age_seconds=700)
@@ -1359,7 +1359,7 @@ class TestErrorRecording(unittest.TestCase):
 
     def test_is_immediate_invalid_filename(self):
         # Same single-shot reasoning for the date-subdir case (which is
-        # what classification has to cover for both Downloads and date-dir
+        # what classification has to cover for both staging and date-dir
         # variants of this op).
         self.assertTrue(snapshot_mover._is_immediate(
             'invalid_filename', ValueError('synthetic')))
@@ -1846,8 +1846,8 @@ class TestErrorWiring(_MoverTestBase):
         self.assertTrue(any(op == 'rewrite_manifest' and target == date_subdir
                             for op, target in rows))
 
-    def test_invalid_filename_in_downloads_notifies_on_first_occurrence(self):
-        # Stray non-snapshot file in Downloads.  After one main() run, the
+    def test_invalid_filename_in_staging_notifies_on_first_occurrence(self):
+        # Stray non-snapshot file in the staging dir.  After one main() run, the
         # row should be marked notified=1 (escalated immediately because
         # 'invalid_filename' is now classified as immediate).
         stray = os.path.join(self.source_dir, 'random.bin')
@@ -1943,7 +1943,7 @@ class TestCli(unittest.TestCase):
     def setUp(self):
         self._saved = {
             name: getattr(snapshot_mover, name)
-            for name in ('DOWNLOADS_SNAPSHOTS_DIR', 'ICLOUD_SNAPSHOTS_DIR',
+            for name in ('STAGING_SNAPSHOTS_DIR', 'ICLOUD_SNAPSHOTS_DIR',
                          'DB_FILE', 'MIN_AGE_SECONDS', 'MOVER_ERROR_THRESHOLD')
         }
         self._saved_level = snapshot_mover.logger.level
@@ -1988,7 +1988,7 @@ class TestCli(unittest.TestCase):
             '--error-threshold', '7',
         ])
         snapshot_mover._apply_args(ns)
-        self.assertEqual(snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR, '/tmp/src')
+        self.assertEqual(snapshot_mover.STAGING_SNAPSHOTS_DIR, '/tmp/src')
         self.assertEqual(snapshot_mover.ICLOUD_SNAPSHOTS_DIR,    '/tmp/dst')
         self.assertEqual(snapshot_mover.DB_FILE,                 '/tmp/test.db')
         self.assertEqual(snapshot_mover.MIN_AGE_SECONDS,         5)
@@ -2021,7 +2021,7 @@ class TestCli(unittest.TestCase):
             db_file    = os.path.join(tmp, 'visits.db')
             os.makedirs(source_dir)
 
-            with patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', source_dir), \
+            with patch.object(host, 'STAGING_SNAPSHOTS_DIR', source_dir), \
                  patch.object(host, 'ICLOUD_SNAPSHOTS_DIR',    dest_dir):
                 conn = sqlite3.connect(db_file)
                 host.ensure_db(conn)
@@ -2138,10 +2138,10 @@ class TestErrorCli(unittest.TestCase):
 
     def test_show_errors_skips_move_and_seal_pass(self):
         # Even with sources present that would normally be moved, --show-errors
-        # must not run the move pass.  Use a temp Downloads dir with one file
+        # must not run the move pass.  Use a temp staging dir with one file
         # and a non-existent dest to make any move attempt visible.
         snapshot_mover.DB_FILE = self.db_file
-        src = os.path.join(self.tmp.name, 'downloads')
+        src = os.path.join(self.tmp.name, 'staging')
         os.makedirs(src)
         Path(src, '2024-01-15T10-00-00Z-x.mhtml').write_bytes(b'data')
         captured = io.StringIO()

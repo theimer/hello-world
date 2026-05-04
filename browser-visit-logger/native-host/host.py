@@ -21,12 +21,19 @@ Tag action (from popup.js / background.js):
     → INSERT OR IGNORE the visit row first (so tagging always works even if the
       auto-log hasn't fired yet), then update of_interest, read, or skimmed;
       append 4-field TSV line.
-      For "read" and "skimmed": Chrome saves a snapshot and sends its filename
-      (Chrome's relative path under ~/Downloads). This host normalizes the
-      filename to its basename and records both the basename and the parent
-      directory (initially the Downloads snapshots dir). A separate periodic
-      mover (snapshot_mover.py) later copies the file to the iCloud directory
-      and updates the directory column in place.
+      For "read" and "skimmed": Chrome saves a snapshot to ~/Downloads and
+      sends its Downloads-relative path.  host.py immediately relocates the
+      file out of ~/Downloads (a TCC-protected location) into a staging dir
+      under ~/Library/Application Support, then records the basename plus the
+      staging dir as the event row's directory.  A separate periodic mover
+      (snapshot_mover.py) later copies the file to the iCloud directory and
+      updates the directory column in place.
+
+      Why the relocate: the launchd-spawned mover does not inherit Chrome's
+      TCC grant for ~/Downloads, so it cannot read snapshots dropped there.
+      host.py is spawned by Chrome via native messaging and therefore can —
+      so we use that one Chrome-spawned hop to escape Downloads before the
+      mover ever has to look.
 
 Schema
 ------
@@ -43,7 +50,7 @@ Schema
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
-        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
+        directory TEXT NOT NULL DEFAULT '<STAGING_SNAPSHOTS_DIR>',  -- absolute parent dir
         PRIMARY KEY (url, timestamp)
     )
 
@@ -51,7 +58,7 @@ Schema
         url       TEXT NOT NULL,
         timestamp TEXT NOT NULL,
         filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
-        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
+        directory TEXT NOT NULL DEFAULT '<STAGING_SNAPSHOTS_DIR>',  -- absolute parent dir
         PRIMARY KEY (url, timestamp)
     )
 
@@ -90,11 +97,22 @@ LOG_DIR  = os.environ.get('BVL_LOG_DIR',  HOME)
 DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
 HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 
-# Snapshot storage locations.  Chrome writes snapshots to the Downloads dir;
-# the periodic mover later copies them to the iCloud-synced Documents dir.
+# Snapshot storage locations.
+#
+# Chrome's downloads API forces files under ~/Downloads, so that's where
+# every snapshot first lands.  ~/Downloads is TCC-protected on macOS and
+# the launchd-spawned mover cannot read it.  host.py runs under Chrome's
+# TCC grant, so we use it as a one-hop relocator: each invocation moves
+# any file from DOWNLOADS_SNAPSHOTS_DIR into STAGING_SNAPSHOTS_DIR.  The
+# events table records the staging dir; the mover reads from there.
 DOWNLOADS_SNAPSHOTS_DIR = os.environ.get(
     'BVL_DOWNLOADS_SNAPSHOTS_DIR',
     os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'),
+)
+STAGING_SNAPSHOTS_DIR = os.environ.get(
+    'BVL_STAGING_SNAPSHOTS_DIR',
+    os.path.join(HOME, 'Library', 'Application Support',
+                 'browser-visit-logger', 'inbox'),
 )
 ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     'BVL_ICLOUD_SNAPSHOTS_DIR',
@@ -181,12 +199,12 @@ def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
 
     table is a trusted internal constant, never user-supplied.
 
-    The DEFAULT for directory embeds DOWNLOADS_SNAPSHOTS_DIR at table-creation
+    The DEFAULT for directory embeds STAGING_SNAPSHOTS_DIR at table-creation
     time so that ad-hoc INSERTs (e.g. via sqlite3 CLI) get a sensible value;
     _insert_event always specifies the directory explicitly.  Single-quotes in
     the path are escaped to prevent SQL syntax errors on unusual home paths.
     """
-    default_dir_lit = "'" + DOWNLOADS_SNAPSHOTS_DIR.replace("'", "''") + "'"
+    default_dir_lit = "'" + STAGING_SNAPSHOTS_DIR.replace("'", "''") + "'"
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             url       TEXT NOT NULL,
@@ -208,7 +226,9 @@ def _insert_event(
     The filename is normalized to its basename before being stored (background.js
     sends Chrome's relative path under Downloads, e.g. 'browser-visit-snapshots/
     <hash>.mhtml'; the parent directory is captured separately in the directory
-    column so the basename alone is sufficient).
+    column so the basename alone is sufficient).  The directory recorded is
+    STAGING_SNAPSHOTS_DIR — host.py's main() relocates the file there from
+    Downloads before this call runs.
 
     Returns True if the URL exists (event inserted or duplicate ignored),
     False if no visits record exists for the URL.
@@ -221,7 +241,7 @@ def _insert_event(
         cursor = conn.execute(
             f"INSERT OR IGNORE INTO {table} (url, timestamp, filename, directory) "
             f"VALUES (?, ?, ?, ?)",
-            (url, timestamp, basename, DOWNLOADS_SNAPSHOTS_DIR),
+            (url, timestamp, basename, STAGING_SNAPSHOTS_DIR),
         )
         if cursor.rowcount > 0:
             conn.execute(
@@ -298,6 +318,58 @@ def tag_visit(
         return False
     conn.commit()
     return cursor.rowcount > 0
+
+# ---------------------------------------------------------------------------
+# Snapshot relocation — escape Downloads' TCC bubble while we're still
+# spawned by Chrome.  See module docstring for the why.
+# ---------------------------------------------------------------------------
+
+def _sweep_downloads_to_staging() -> None:
+    """Move every file in DOWNLOADS_SNAPSHOTS_DIR to STAGING_SNAPSHOTS_DIR.
+
+    Called at the start of every write invocation.  Handles two cases in
+    one pass:
+
+      1. The file Chrome just dropped for *this* invocation's tag message —
+         its filename matches what background.js reported, and after this
+         call it lives in the staging dir where _insert_event records it.
+      2. Files left behind by a prior host.py crash between Chrome's
+         download and the original sweep — the mover can't reach them
+         (no TCC grant for Downloads), but host.py can, so each fresh
+         host.py invocation gets a chance to recover them.
+
+    Best-effort: any failure is logged but does not raise.  The events row
+    for case (1) is still written pointing at STAGING_SNAPSHOTS_DIR even if
+    the move failed — orphan rows (row without file) are surfaced later by
+    the snapshot verifier; orphan files (file without row, e.g. case 2
+    recoveries that arrive in staging before the user has re-tagged the
+    URL) by the seal pass.  Idempotent.
+    """
+    if not os.path.isdir(DOWNLOADS_SNAPSHOTS_DIR):
+        return
+    try:
+        os.makedirs(STAGING_SNAPSHOTS_DIR, exist_ok=True)
+    except OSError as exc:
+        logger.error('Sweep: could not create staging dir %s: %s',
+                     STAGING_SNAPSHOTS_DIR, exc)
+        return
+    try:
+        names = os.listdir(DOWNLOADS_SNAPSHOTS_DIR)
+    except OSError as exc:
+        logger.error('Sweep: could not list %s: %s',
+                     DOWNLOADS_SNAPSHOTS_DIR, exc)
+        return
+    for name in names:
+        src = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, name)
+        dst = os.path.join(STAGING_SNAPSHOTS_DIR, name)
+        try:
+            if not os.path.isfile(src):
+                continue
+            os.replace(src, dst)
+        except OSError as exc:
+            logger.error('Sweep: failed to relocate %s -> %s: %s',
+                         src, dst, exc)
+
 
 # ---------------------------------------------------------------------------
 # Log file helper
@@ -406,6 +478,14 @@ def main() -> None:
         return
 
     errors = []
+
+    # Move Chrome's snapshot drops out of ~/Downloads (TCC-protected on
+    # macOS, unreadable by the launchd-spawned mover) into the staging
+    # dir before any DB/log writes.  This runs on every write invocation
+    # so a host.py crash that left a file behind in Downloads gets a
+    # chance to be recovered on the next user action.  Best-effort —
+    # logged failures don't block the rest of the invocation.
+    _sweep_downloads_to_staging()
 
     # First write: record the intended action
     try:

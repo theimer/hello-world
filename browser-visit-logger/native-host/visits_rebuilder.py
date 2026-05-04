@@ -17,7 +17,7 @@ tool restores it from two side-channels that *are* still durable:
      once the directory has been sealed.  Phase 2 ("filesystem
      rehydration") repopulates the ``snapshots`` table and updates the
      ``directory`` column on event rows whose snapshot file has since
-     been moved out of Downloads.
+     been moved out of the staging dir.
 
 ``mover_errors`` is intentionally *not* recovered.  Filesystem-derived
 rows (orphan_file, invalid_filename, missing_directory,
@@ -308,13 +308,13 @@ def _apply_action(conn: sqlite3.Connection, action: dict, stats: ReplayStats) ->
 # ---------------------------------------------------------------------------
 
 def rehydrate_filesystem(
-    conn: sqlite3.Connection, icloud_dir: str, downloads_dir: str,
+    conn: sqlite3.Connection, icloud_dir: str, staging_dir: str,
 ) -> RehydrateStats:
     """Phase 2: walk the iCloud archive, repopulate snapshots, relocate events.
 
     Files matching the snapshot filename pattern have any matching event
     rows updated to point at the date subdirectory (only rows whose
-    ``directory`` column still says Downloads — already-relocated rows
+    ``directory`` column still says staging — already-relocated rows
     are left alone).  Orphan files are *not* deleted; the next
     snapshot_verifier pass will flag them.
     """
@@ -358,7 +358,7 @@ def rehydrate_filesystem(
                 cur = conn.execute(
                     f"UPDATE {table} SET directory = ? "
                     f"WHERE filename = ? AND directory = ?",
-                    (date_dir, fname, downloads_dir),
+                    (date_dir, fname, staging_dir),
                 )
                 relocated_here += cur.rowcount
             if relocated_here > 0:
@@ -392,7 +392,7 @@ def _truncate_rebuildable_tables(conn: sqlite3.Connection) -> None:
 
 def rebuild(
     conn: sqlite3.Connection, *,
-    log_dir: str, icloud_dir: str, downloads_dir: str,
+    log_dir: str, icloud_dir: str, staging_dir: str,
     do_log: bool = True, do_rehydrate: bool = True, truncate: bool = True,
 ) -> RebuildStats:
     stats = RebuildStats(truncated=truncate)
@@ -404,7 +404,7 @@ def rebuild(
     if do_log:
         stats.replay = replay_logs(conn, log_dir, icloud_dir)
     if do_rehydrate:
-        stats.rehydrate = rehydrate_filesystem(conn, icloud_dir, downloads_dir)
+        stats.rehydrate = rehydrate_filesystem(conn, icloud_dir, staging_dir)
     return stats
 
 
@@ -444,8 +444,8 @@ def _parse_args(argv=None):
     p.add_argument('--db', metavar='FILE', dest='db_path',
                    help=f'override the SQLite database path (default {host.DB_FILE})')
     p.add_argument('--source', metavar='DIR',
-                   help=f'override the Downloads snapshots root '
-                        f'(default {host.DOWNLOADS_SNAPSHOTS_DIR})')
+                   help=f'override the staging snapshots root '
+                        f'(default {host.STAGING_SNAPSHOTS_DIR})')
     p.add_argument('--dest', metavar='DIR',
                    help=f'override the iCloud snapshots root '
                         f'(default {snapshot_mover.ICLOUD_SNAPSHOTS_DIR})')
@@ -468,10 +468,10 @@ def cli(argv=None) -> int:
     )
     logger.setLevel(log_level)
 
-    log_dir       = args.log_dir  or host.LOG_DIR
-    db_path       = args.db_path  or host.DB_FILE
-    downloads_dir = args.source   or host.DOWNLOADS_SNAPSHOTS_DIR
-    icloud_dir    = args.dest     or snapshot_mover.ICLOUD_SNAPSHOTS_DIR
+    log_dir     = args.log_dir  or host.LOG_DIR
+    db_path     = args.db_path  or host.DB_FILE
+    staging_dir = args.source   or host.STAGING_SNAPSHOTS_DIR
+    icloud_dir  = args.dest     or snapshot_mover.ICLOUD_SNAPSHOTS_DIR
 
     do_log       = not args.rehydrate_only
     do_rehydrate = not args.log_only
@@ -479,11 +479,12 @@ def cli(argv=None) -> int:
     # Apply overrides to the imported modules so helpers downstream (e.g.
     # _ensure_events_table's directory DEFAULT, tag_visit's recorded
     # directory) use the same values the user passed on the CLI.
-    host.DOWNLOADS_SNAPSHOTS_DIR = downloads_dir
-    host.DB_FILE                 = db_path
-    host.LOG_DIR                 = log_dir
-    snapshot_mover.ICLOUD_SNAPSHOTS_DIR = icloud_dir
-    snapshot_mover.LOG_DIR              = log_dir
+    host.STAGING_SNAPSHOTS_DIR          = staging_dir
+    host.DB_FILE                        = db_path
+    host.LOG_DIR                        = log_dir
+    snapshot_mover.STAGING_SNAPSHOTS_DIR = staging_dir
+    snapshot_mover.ICLOUD_SNAPSHOTS_DIR  = icloud_dir
+    snapshot_mover.LOG_DIR               = log_dir
 
     if do_log and not os.path.isdir(log_dir):
         print(f'No log directory at {log_dir}', file=sys.stderr)
@@ -501,7 +502,7 @@ def cli(argv=None) -> int:
                 conn,
                 log_dir=log_dir,
                 icloud_dir=icloud_dir,
-                downloads_dir=downloads_dir,
+                staging_dir=staging_dir,
                 do_log=do_log, do_rehydrate=do_rehydrate,
                 truncate=args.truncate,
             )

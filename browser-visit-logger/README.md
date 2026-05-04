@@ -31,11 +31,22 @@ directly to avoid Chrome's mangled PDF viewer output). Each file is named
 from the click timestamp so the file's name is permanent and globally
 sortable.
 
-Snapshots land first in `~/Downloads/browser-visit-snapshots/`. A
-background mover then archives them into
+Chrome's downloads API forces every file under `~/Downloads`, so each
+snapshot lands first in `~/Downloads/browser-visit-snapshots/`. The
+native host (`host.py`) immediately relocates it to a non-Downloads
+staging dir at
+`~/Library/Application Support/browser-visit-logger/inbox/`. A
+background mover (`snapshot_mover.py`) then archives staged files into
 `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/`, makes them
 read-only, and (once the day has fully passed) writes a
 `MANIFEST.tsv` summarising the directory.
+
+The relocate hop exists because `~/Downloads` is TCC-protected on
+macOS: the launchd-spawned mover cannot read it, but `host.py` (spawned
+by Chrome via native messaging) inherits Chrome's TCC grant and can.
+Each `host.py` invocation also sweeps any files left in the Downloads
+dir by a prior crashed run, so stragglers self-heal on the next user
+action.
 
 ---
 
@@ -48,7 +59,8 @@ read-only, and (once the day has fully passed) writes a
 | `~/browser-visits-host.log` | Native host process log (rotated, 1 MiB × 3) |
 | `~/browser-visits-mover.log` | Snapshot mover process log (LaunchAgent stdout/stderr) |
 | `~/browser-visits-verifier.log` | Snapshot verifier process log (LaunchAgent stdout/stderr) |
-| `~/Downloads/browser-visit-snapshots/` | Snapshot staging dir (Chrome writes here) |
+| `~/Downloads/browser-visit-snapshots/` | Chrome's drop point (host.py clears it on each invocation) |
+| `~/Library/Application Support/browser-visit-logger/inbox/` | Snapshot staging dir (host.py moves files here from Downloads; mover reads from here) |
 | `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive: read-only snapshot files + read-only `MANIFEST.tsv` + read-only `browser-visits-<YYYY-MM-DD>.log` |
 
 All paths can be overridden via `BVL_*` environment variables — see
@@ -72,7 +84,7 @@ read_events / skimmed_events (
     url       TEXT NOT NULL,
     timestamp TEXT NOT NULL,                   -- when the user tagged
     filename  TEXT NOT NULL DEFAULT '',        -- snapshot basename
-    directory TEXT NOT NULL DEFAULT '<Downloads dir>',
+    directory TEXT NOT NULL DEFAULT '<staging dir>',
     PRIMARY KEY (url, timestamp)
 )
 
@@ -256,9 +268,10 @@ exclusive.
 
 **What it does each run:**
 
-1. **Move pass** — for every file in `~/Downloads/browser-visit-snapshots/`
-   matching the snapshot filename format and at least `MIN_AGE_SECONDS`
-   old: copy it to `<dest>/<YYYY-MM-DD>/`, chmod read-only, update the
+1. **Move pass** — for every file in
+   `~/Library/Application Support/browser-visit-logger/inbox/` matching
+   the snapshot filename format and at least `MIN_AGE_SECONDS` old:
+   copy it to `<dest>/<YYYY-MM-DD>/`, chmod read-only, update the
    `directory` column in `read_events`/`skimmed_events`, and
    `INSERT OR IGNORE` a `(date, sealed=0)` row into the `snapshots`
    table; then unlink the source. **Straggler handling:** if the
@@ -444,7 +457,7 @@ python3 reset.py -f
 python3 reset.py --log         # all ~/browser-visits-<date>.log files in BVL_LOG_DIR
 python3 reset.py --host-log    # host log + mover log
 python3 reset.py --db          # ~/browser-visits.db
-python3 reset.py --snapshots   # ~/Downloads/browser-visit-snapshots/
+python3 reset.py --snapshots   # staging dir + ~/Downloads/browser-visit-snapshots/
 python3 reset.py --icloud      # ~/Documents/browser-visit-logger/  (also wipes per-day logs sealed in iCloud)
 ```
 
@@ -477,8 +490,8 @@ archive.  Two phases run by default:
 2. **Filesystem rehydration** — iterates every `YYYY-MM-DD`
    subdirectory under the iCloud root, upserts a `snapshots` row
    (`sealed = 1` if `MANIFEST.tsv` exists), and updates each event
-   row's `directory` column from Downloads to the date subdir for
-   files that have already been moved.
+   row's `directory` column from the staging dir to the date subdir
+   for files that have already been moved.
 
 ```bash
 # Rebuild against the configured paths (DROPs and recreates
@@ -567,12 +580,11 @@ notification once the row qualifies:
   - `manifest_invalid` — `snapshot_verifier.py --record` found a
     sealed directory whose `MANIFEST.tsv` failed one or more checks.
     Auto-clears on the next successful verification.
-  - `invalid_filename` — a file in `~/Downloads/browser-visit-snapshots/`
-    or in a daily snapshot directory has a name that doesn't match the
-    canonical `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format.  The
-    Downloads file is left in place; date-dir files are excluded from
-    the manifest.  The row auto-clears when the user removes or
-    renames the file.
+  - `invalid_filename` — a file in the staging dir or in a daily
+    snapshot directory has a name that doesn't match the canonical
+    `<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>` format.  The staging file is
+    left in place; date-dir files are excluded from the manifest.  The
+    row auto-clears when the user removes or renames the file.
   - `orphan_file` — a conforming-named snapshot file in a daily
     directory has no matching `read_events` / `skimmed_events` row.
     The file is excluded from the manifest.  The row auto-clears when
@@ -625,7 +637,8 @@ env vars; env vars override defaults.
 | `BVL_MOVER_LOG` | `~/browser-visits-mover.log` | reset (mover writes via LaunchAgent stdout/stderr) |
 | `BVL_VERIFIER_LOG` | `~/browser-visits-verifier.log` | reset (verifier writes via LaunchAgent stdout/stderr) |
 | `BVL_DB_FILE` | `~/browser-visits.db` | host, mover, sealer, rebuilder, reset |
-| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, rebuilder, reset |
+| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host (relocate source), reset.  Where Chrome drops snapshots before host.py moves them to the staging dir. |
+| `BVL_STAGING_SNAPSHOTS_DIR` | `~/Library/Application Support/browser-visit-logger/inbox` | host (relocate dest, events row directory), mover (read source), rebuilder, reset |
 | `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer, rebuilder |
 | `BVL_MOVER_MIN_AGE_SECONDS` | `60` | mover |
 | `BVL_MOVER_ERROR_THRESHOLD` | `3` | mover (consecutive failures before persistent-error notification) |
