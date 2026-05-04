@@ -330,9 +330,9 @@ class TestDatabase(unittest.TestCase):
         self.assertIn('directory', self._event_cols(conn, 'skimmed_events'))
         conn.close()
 
-    def test_directory_column_defaults_to_downloads_dir(self):
+    def test_directory_column_defaults_to_staging_dir(self):
         # An ad-hoc INSERT (without specifying directory) should pick up the
-        # column's DEFAULT, which embeds DOWNLOADS_SNAPSHOTS_DIR at table
+        # column's DEFAULT, which embeds STAGING_SNAPSHOTS_DIR at table
         # creation time.
         conn = self._conn()
         host.insert_visit(conn, 'ts', 'https://example.com', 'Example')
@@ -345,7 +345,7 @@ class TestDatabase(unittest.TestCase):
             "SELECT directory FROM read_events WHERE url = ?", ('https://example.com',)
         ).fetchone()[0]
         conn.close()
-        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(directory, host.STAGING_SNAPSHOTS_DIR)
 
     def test_ensure_db_creates_timestamp_index(self):
         conn = self._conn()
@@ -499,7 +499,7 @@ class TestTagVisit(unittest.TestCase):
             "SELECT directory FROM read_events WHERE url = ?", ('https://example.com',)
         ).fetchone()[0]
         conn.close()
-        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(directory, host.STAGING_SNAPSHOTS_DIR)
 
     def test_tag_visit_read_increments_visits_read_counter(self):
         conn = self._conn()
@@ -586,7 +586,7 @@ class TestTagVisit(unittest.TestCase):
             "SELECT directory FROM skimmed_events WHERE url = ?", ('https://example.com',)
         ).fetchone()[0]
         conn.close()
-        self.assertEqual(directory, host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(directory, host.STAGING_SNAPSHOTS_DIR)
 
     def test_tag_visit_skimmed_increments_visits_skimmed_counter(self):
         conn = self._conn()
@@ -739,7 +739,7 @@ class TestQueryVisit(unittest.TestCase):
         self.assertEqual(result['read'], [
             {'timestamp': 'ts-read',
              'filename': 'abc.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': host.STAGING_SNAPSHOTS_DIR},
         ])
         self.assertEqual(result['skimmed'], [])       # not skimmed — empty list
 
@@ -754,9 +754,9 @@ class TestQueryVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(result['read'], [
             {'timestamp': '2026-01-01T10:00:00Z', 'filename': 'f1.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': host.STAGING_SNAPSHOTS_DIR},
             {'timestamp': '2026-01-02T10:00:00Z', 'filename': 'f2.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': host.STAGING_SNAPSHOTS_DIR},
         ])
 
     def test_query_visit_returns_all_skimmed_events_in_order(self):
@@ -770,9 +770,9 @@ class TestQueryVisit(unittest.TestCase):
         conn.close()
         self.assertEqual(result['skimmed'], [
             {'timestamp': '2026-01-01T10:00:00Z', 'filename': 's1.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': host.STAGING_SNAPSHOTS_DIR},
             {'timestamp': '2026-01-02T10:00:00Z', 'filename': 's2.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': host.STAGING_SNAPSHOTS_DIR},
         ])
 
     def test_query_visit_includes_basename_filename_in_read_events(self):
@@ -800,7 +800,7 @@ class TestQueryVisit(unittest.TestCase):
                        filename='browser-visit-snapshots/myfile.mhtml')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertEqual(result['read'][0]['directory'], host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(result['read'][0]['directory'], host.STAGING_SNAPSHOTS_DIR)
 
     def test_query_visit_includes_directory_in_skimmed_events(self):
         conn = self._conn()
@@ -809,7 +809,7 @@ class TestQueryVisit(unittest.TestCase):
                        filename='browser-visit-snapshots/myfile.pdf')
         result = host.query_visit(conn, 'https://example.com')
         conn.close()
-        self.assertEqual(result['skimmed'][0]['directory'], host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(result['skimmed'][0]['directory'], host.STAGING_SNAPSHOTS_DIR)
 
     def test_does_not_return_record_for_different_url(self):
         conn = self._conn()
@@ -1139,6 +1139,258 @@ class TestMain(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Downloads-to-staging sweep — verifies host.py escapes the TCC-protected
+# Downloads folder by relocating snapshots into a non-protected staging
+# dir before any DB / log writes, on every write invocation.
+# ---------------------------------------------------------------------------
+
+class TestSweepDownloadsToStaging(unittest.TestCase):
+    """Direct unit tests on _sweep_downloads_to_staging."""
+
+    def _patch_dirs(self, downloads, staging):
+        """Patch host's module-level path constants for one test."""
+        return (
+            patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', downloads),
+            patch.object(host, 'STAGING_SNAPSHOTS_DIR',   staging),
+        )
+
+    def test_moves_file_from_downloads_to_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            src = os.path.join(downloads, 'abc.mhtml')
+            Path(src).write_text('hello')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            self.assertFalse(os.path.exists(src))
+            self.assertTrue(os.path.exists(os.path.join(staging, 'abc.mhtml')))
+            self.assertEqual(
+                Path(staging, 'abc.mhtml').read_text(), 'hello')
+
+    def test_creates_staging_dir_if_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')   # NOT created
+            os.makedirs(downloads)
+            Path(downloads, 'abc.mhtml').write_text('x')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            self.assertTrue(os.path.isdir(staging))
+
+    def test_noop_when_downloads_dir_absent(self):
+        # The most common case: Chrome hasn't downloaded anything yet, so
+        # ~/Downloads/browser-visit-snapshots/ doesn't even exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'never-created')
+            staging   = os.path.join(tmp, 'staging')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            # Function must return without raising.  The staging dir is
+            # not pre-created in this branch (no work to do).
+            self.assertFalse(os.path.isdir(staging))
+
+    def test_overwrites_same_name_in_staging(self):
+        # Idempotent overwrite: a file already in staging with the same
+        # name (e.g. from a partial earlier sweep) is replaced — os.replace
+        # semantics, exercised explicitly here so a future regression
+        # to e.g. shutil.move (which would error) gets caught.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            os.makedirs(staging)
+            Path(downloads, 'abc.mhtml').write_text('new')
+            Path(staging,   'abc.mhtml').write_text('old')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            self.assertEqual(
+                Path(staging, 'abc.mhtml').read_text(), 'new')
+            self.assertFalse(os.path.exists(os.path.join(downloads, 'abc.mhtml')))
+
+    def test_skips_subdirectory_entries(self):
+        # os.replace on a directory would raise; the sweep uses
+        # os.path.isfile to filter.  Pin the contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(os.path.join(downloads, 'a-subdir'))
+            Path(downloads, 'abc.mhtml').write_text('x')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            # The regular file moved; the subdirectory was left alone.
+            self.assertTrue(os.path.isdir(os.path.join(downloads, 'a-subdir')))
+            self.assertTrue(os.path.exists(os.path.join(staging, 'abc.mhtml')))
+
+    def test_sweeps_unfiltered_filenames(self):
+        # The sweep does not filter by snapshot filename pattern — its
+        # job is to clear Downloads.  Non-conforming files become orphans
+        # in staging, which the mover surfaces via invalid_filename
+        # errors.  This pins the unfiltered contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            Path(downloads, 'random-notes.txt').write_text('x')
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                host._sweep_downloads_to_staging()
+            self.assertTrue(os.path.exists(os.path.join(staging, 'random-notes.txt')))
+
+    def test_listdir_failure_is_caught_and_logged(self):
+        # If listdir raises (TCC denial, transient I/O error) the sweep
+        # logs and returns without propagating — every host.py invocation
+        # would otherwise abort before the DB write.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                stack.enter_context(patch('os.listdir',
+                                          side_effect=OSError('permission denied')))
+                cm = stack.enter_context(
+                    self.assertLogs(host.logger, level='ERROR'))
+                host._sweep_downloads_to_staging()   # must not raise
+            self.assertTrue(any('could not list' in m for m in cm.output))
+
+    def test_per_file_failure_does_not_abort_whole_sweep(self):
+        # If os.replace fails on one file the rest still get a chance.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            Path(downloads, 'a.mhtml').write_text('x')
+            Path(downloads, 'b.mhtml').write_text('y')
+
+            real_replace = os.replace
+            def flaky_replace(src, dst):
+                if src.endswith('a.mhtml'):
+                    raise OSError('boom')
+                return real_replace(src, dst)
+
+            with contextlib.ExitStack() as stack:
+                for p in self._patch_dirs(downloads, staging):
+                    stack.enter_context(p)
+                stack.enter_context(patch('os.replace', side_effect=flaky_replace))
+                host._sweep_downloads_to_staging()
+            # b moved despite a's failure
+            self.assertTrue(os.path.exists(os.path.join(staging, 'b.mhtml')))
+
+
+class TestMainCallsSweep(unittest.TestCase):
+    """Verify host.main() actually invokes the sweep — both that tag
+    invocations move files and that query invocations don't."""
+
+    def _call_main_with_dirs(self, message, tmp, downloads, staging):
+        out_buf = io.BytesIO()
+        mock_stdout = MagicMock(); mock_stdout.buffer = out_buf
+        mock_stdin  = MagicMock(); mock_stdin.buffer  = io.BytesIO(_frame(message))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch('sys.stdin',  mock_stdin))
+            stack.enter_context(patch('sys.stdout', mock_stdout))
+            stack.enter_context(patch.object(host, 'LOG_DIR', tmp))
+            stack.enter_context(patch.object(host, 'DB_FILE',
+                                             os.path.join(tmp, 'visits.db')))
+            stack.enter_context(patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', downloads))
+            stack.enter_context(patch.object(host, 'STAGING_SNAPSHOTS_DIR',   staging))
+            host.main()
+        out_buf.seek(0)
+        return _unframe(out_buf.read())
+
+    def test_tag_invocation_relocates_pending_download(self):
+        # End-to-end wiring: a snapshot that Chrome has just dropped in
+        # Downloads must be in staging by the time main() returns.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            Path(downloads, 'abc.mhtml').write_text('snapshot')
+            resp = self._call_main_with_dirs(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Example', 'tag': 'read',
+                 'filename': 'browser-visit-snapshots/abc.mhtml'},
+                tmp, downloads, staging,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            self.assertFalse(os.path.exists(os.path.join(downloads, 'abc.mhtml')))
+            self.assertTrue(os.path.exists(os.path.join(staging, 'abc.mhtml')))
+
+    def test_query_invocation_does_not_sweep(self):
+        # The query path is read-only and must not move anything.  A
+        # background sweep on every query would race against an in-flight
+        # download whose native message hasn't arrived yet.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            Path(downloads, 'pending.mhtml').write_text('pending')
+            resp = self._call_main_with_dirs(
+                {'action': 'query', 'url': 'https://example.com'},
+                tmp, downloads, staging,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            self.assertTrue(os.path.exists(os.path.join(downloads, 'pending.mhtml')))
+            self.assertFalse(os.path.exists(os.path.join(staging, 'pending.mhtml')))
+
+    def test_orphaned_download_recovered_on_next_invocation(self):
+        # Motivating scenario: a prior host.py crash left a snapshot
+        # stranded in Downloads.  The next write invocation — even for
+        # an unrelated URL — sweeps it to staging where the launchd
+        # mover can reach it.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')
+            os.makedirs(downloads)
+            Path(downloads, 'orphan-from-prior-crash.mhtml').write_text('x')
+            resp = self._call_main_with_dirs(
+                {'timestamp': 'ts', 'url': 'https://other.com',
+                 'title': 'Unrelated visit'},
+                tmp, downloads, staging,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            self.assertTrue(os.path.exists(
+                os.path.join(staging, 'orphan-from-prior-crash.mhtml')))
+
+    def test_sweep_failure_does_not_abort_main(self):
+        # If the sweep can't operate (e.g. the staging path is a file
+        # rather than a dir, so os.makedirs fails) the rest of main() —
+        # DB write, log write, response — must still complete.  The
+        # sweep's internal best-effort handling is what enforces this;
+        # this test pins it end-to-end.
+        with tempfile.TemporaryDirectory() as tmp:
+            downloads = os.path.join(tmp, 'downloads')
+            staging   = os.path.join(tmp, 'staging')   # created as a *file*
+            os.makedirs(downloads)
+            Path(downloads, 'abc.mhtml').write_text('snapshot')
+            Path(staging).write_text('not a directory')
+
+            resp = self._call_main_with_dirs(
+                {'timestamp': 'ts', 'url': 'https://example.com',
+                 'title': 'Example'},
+                tmp, downloads, staging,
+            )
+            self.assertEqual(resp['status'], 'ok')
+            # DB write succeeded despite the broken staging path.
+            conn = sqlite3.connect(os.path.join(tmp, 'visits.db'))
+            n = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+            conn.close()
+        self.assertEqual(n, 1)
+
+
+# ---------------------------------------------------------------------------
 # Integration: run host.py as a subprocess (mirrors Chrome's usage)
 # ---------------------------------------------------------------------------
 
@@ -1150,6 +1402,10 @@ class TestIntegration(unittest.TestCase):
         env['BVL_LOG_DIR']  = tmp
         env['BVL_DB_FILE']  = os.path.join(tmp, 'visits.db')
         env['BVL_HOST_LOG'] = os.path.join(tmp, 'host.log')
+        # Isolate the snapshot dirs so the sweep doesn't touch the user's
+        # real ~/Downloads/browser-visit-snapshots or staging dir.
+        env['BVL_DOWNLOADS_SNAPSHOTS_DIR'] = os.path.join(tmp, 'downloads')
+        env['BVL_STAGING_SNAPSHOTS_DIR']   = os.path.join(tmp, 'staging')
 
         result = subprocess.run(
             [sys.executable, HOST_PY],
@@ -1607,8 +1863,9 @@ class TestIntegration(unittest.TestCase):
                 'SELECT filename, directory FROM read_events WHERE url = ?', (url,)
             ).fetchone()
             conn.close()
+            staging_dir = os.path.join(tmp, 'staging')
         self.assertEqual(row[0], 'abc.mhtml')
-        self.assertEqual(row[1], host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(row[1], staging_dir)
 
     def test_tag_message_stores_basename_filename_in_skimmed_events(self):
         url = 'https://example.com'
@@ -1623,8 +1880,9 @@ class TestIntegration(unittest.TestCase):
                 'SELECT filename, directory FROM skimmed_events WHERE url = ?', (url,)
             ).fetchone()
             conn.close()
+            staging_dir = os.path.join(tmp, 'staging')
         self.assertEqual(row[0], 'def.pdf')
-        self.assertEqual(row[1], host.DOWNLOADS_SNAPSHOTS_DIR)
+        self.assertEqual(row[1], staging_dir)
 
     def test_query_returns_filename_and_directory_in_read_event(self):
         url = 'https://example.com'
@@ -1635,9 +1893,10 @@ class TestIntegration(unittest.TestCase):
                 {'timestamp': 'ts-read', 'url': url, 'title': 'Example',
                  'tag': 'read', 'filename': 'browser-visit-snapshots/snap.mhtml'}, tmp)
             resp = self._invoke({'action': 'query', 'url': url}, tmp)
+            staging_dir = os.path.join(tmp, 'staging')
         self.assertEqual(resp['record']['read'], [
             {'timestamp': 'ts-read', 'filename': 'snap.mhtml',
-             'directory': host.DOWNLOADS_SNAPSHOTS_DIR},
+             'directory': staging_dir},
         ])
 
     def test_query_does_not_write_log(self):

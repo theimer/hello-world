@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
 snapshot_mover.py — Periodically archive snapshot files from the local
-Downloads folder to the iCloud-synced Documents folder, updating the
+staging directory to the iCloud-synced Documents folder, updating the
 SQLite database to point at the new location, and sealing each daily
 archive directory once its UTC date has fully passed.
 
 Designed to be run by a launchd LaunchAgent every N seconds (default 1 h);
 each invocation does one pass and exits.
+
+The staging dir is populated by host.py: Chrome saves each snapshot into
+~/Downloads (its downloads API forces files there), then host.py — which
+inherits Chrome's TCC grant for ~/Downloads — relocates the file into the
+staging dir.  This mover never reads ~/Downloads itself; doing so would
+fail under launchd because the launchd-spawned process has no TCC grant.
 
 Algorithm
 ---------
@@ -14,7 +20,7 @@ Algorithm
 2. Open the SQLite database.
 3. Ensure the `snapshots` table exists (one row per daily directory the
    mover has ever created; stores its sealed flag).
-4. Move pass — scan the Downloads directory for snapshot files:
+4. Move pass — scan the staging directory for snapshot files:
      For each file whose name matches the snapshot format
      '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' and whose mtime is at least
      MIN_AGE_SECONDS old:
@@ -23,7 +29,7 @@ Algorithm
        c. shutil.copy2(source, dest)          — preserves mtime; safe to repeat
        d. os.chmod(dest, 0o444)               — make archived copy read-only
        e. UPDATE {read,skimmed}_events SET directory = <date_subdir>
-          WHERE filename = <this file> AND directory = DOWNLOADS_SNAPSHOTS_DIR
+          WHERE filename = <this file> AND directory = STAGING_SNAPSHOTS_DIR
        f. INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (<date>, 0)
        g. commit()
        h. source.unlink()
@@ -48,7 +54,7 @@ Algorithm
 6. Close the DB.
 
 The filesystem scan (rather than a DB query) means that any file left in
-Downloads by a failed prior run is automatically retried — no special
+the staging dir by a failed prior run is automatically retried — no special
 "orphan sweep" is required.  Crash-safety analysis:
 
   Crash after (c) only:  source still present, dest exists → next run copies
@@ -66,12 +72,13 @@ record time:
 The date portion (first 10 characters) determines the iCloud date subdir:
     ICLOUD_SNAPSHOTS_DIR/2026-04-30/2026-04-30T14-35-22Z-abc123.mhtml
 
-Files in Downloads that do not match this format are silently skipped.
+Files in the staging dir that do not match this format are silently skipped.
 
 Configuration
 -------------
 DB_FILE                  — BVL_DB_FILE, default ~/browser-visits.db
-DOWNLOADS_SNAPSHOTS_DIR  — BVL_DOWNLOADS_SNAPSHOTS_DIR, default ~/Downloads/browser-visit-snapshots
+STAGING_SNAPSHOTS_DIR    — BVL_STAGING_SNAPSHOTS_DIR,
+                           default ~/Library/Application Support/browser-visit-logger/inbox
 ICLOUD_SNAPSHOTS_DIR     — BVL_ICLOUD_SNAPSHOTS_DIR,    default ~/Documents/browser-visit-logger/snapshots
 MIN_AGE_SECONDS          — BVL_MOVER_MIN_AGE_SECONDS,   default 60 (1 min)
 
@@ -113,9 +120,10 @@ import time
 
 HOME = os.path.expanduser('~')
 DB_FILE = os.environ.get('BVL_DB_FILE', os.path.join(HOME, 'browser-visits.db'))
-DOWNLOADS_SNAPSHOTS_DIR = os.environ.get(
-    'BVL_DOWNLOADS_SNAPSHOTS_DIR',
-    os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'),
+STAGING_SNAPSHOTS_DIR = os.environ.get(
+    'BVL_STAGING_SNAPSHOTS_DIR',
+    os.path.join(HOME, 'Library', 'Application Support',
+                 'browser-visit-logger', 'inbox'),
 )
 ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     'BVL_ICLOUD_SNAPSHOTS_DIR',
@@ -317,7 +325,7 @@ def _reconcile_dir_scoped_errors(conn, op, dir_path, current_strays):
     current_strays set — i.e. files the user has since renamed,
     removed, or otherwise resolved.  Used by:
 
-      - _move_pass with op='invalid_filename' on Downloads.
+      - _move_pass with op='invalid_filename' on the staging dir.
       - _build_manifest_rows with op='invalid_filename' on the date dir
         (non-conforming filenames excluded from the manifest).
       - _build_manifest_rows with op='orphan_file' on the date dir
@@ -362,7 +370,7 @@ def _is_immediate(op, exc):
          - 'invalid_filename' inside a date subdir runs once per
            successful seal of that dir; after sealed=1 the row is never
            re-visited.
-       (The Downloads-side 'invalid_filename' rows DO accumulate on each
+       (The staging-side 'invalid_filename' rows DO accumulate on each
        tick that re-encounters the file, but treating both as immediate
        keeps the classification simple and gets the user notified faster.)
     3. Catastrophic OSError errnos and DB integrity errors — the
@@ -476,18 +484,18 @@ _SNAPSHOT_FILENAME_RE = re.compile(
 
 
 def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
-    """Scan the Downloads directory and move every old-enough snapshot to iCloud.
+    """Scan the staging directory and move every old-enough snapshot to iCloud.
 
-    Uses the filesystem as the source of truth, so any file left in Downloads
-    by a failed prior run is automatically retried.
+    Uses the filesystem as the source of truth, so any file left in the
+    staging dir by a failed prior run is automatically retried.
     """
-    if not os.path.isdir(DOWNLOADS_SNAPSHOTS_DIR):
+    if not os.path.isdir(STAGING_SNAPSHOTS_DIR):
         return
 
     now = time.time()
     current_invalid = []   # paths flagged this pass; used to reconcile errors
-    for filename in os.listdir(DOWNLOADS_SNAPSHOTS_DIR):
-        source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, filename)
+    for filename in os.listdir(STAGING_SNAPSHOTS_DIR):
+        source = os.path.join(STAGING_SNAPSHOTS_DIR, filename)
         if not os.path.isfile(source):
             continue
 
@@ -495,7 +503,7 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
         if not m:
             logger.error(
                 'Skipping %s — does not match snapshot filename format; '
-                'leaving in Downloads', source,
+                'leaving in staging dir', source,
             )
             _try_record_error(
                 conn, 'invalid_filename', source,
@@ -512,10 +520,10 @@ def _move_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
         date_str = m.group(1)   # 'YYYY-MM-DD'
         _move_one(conn, source, filename, date_str, dry_run=dry_run)
 
-    # Auto-heal: clear invalid_filename rows for files in Downloads that
-    # the user has since renamed or removed.
+    # Auto-heal: clear invalid_filename rows for files in the staging dir
+    # that the user has since renamed or removed.
     _reconcile_dir_scoped_errors(
-        conn, 'invalid_filename', DOWNLOADS_SNAPSHOTS_DIR, current_invalid)
+        conn, 'invalid_filename', STAGING_SNAPSHOTS_DIR, current_invalid)
 
 
 def _move_one(
@@ -536,14 +544,14 @@ def _move_one(
         shutil.copy2(source, dest)
         # (c) Make the archived copy read-only.
         os.chmod(dest, 0o444)
-        # (d) Update DB rows that still record this file as living in Downloads.
+        # (d) Update DB rows that still record this file as living in staging.
         #     Rows already pointing to iCloud (from a prior partial run) are
         #     untouched by the WHERE clause — that's correct.
         for table in EVENTS_TABLES:
             conn.execute(
                 f"UPDATE {table} SET directory = ?"
                 f" WHERE filename = ? AND directory = ?",
-                (date_subdir, filename, DOWNLOADS_SNAPSHOTS_DIR),
+                (date_subdir, filename, STAGING_SNAPSHOTS_DIR),
             )
         # (e) Detect a "straggler": a file whose date maps to a directory
         #     whose snapshots row already says sealed=1.  We need to know
@@ -972,7 +980,7 @@ def main(dry_run: bool = False) -> None:
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog='snapshot_mover.py',
-        description='Move browser-snapshot files from the local Downloads dir '
+        description='Move browser-snapshot files from the local staging dir '
                     'to the iCloud-synced Documents archive.',
     )
     p.add_argument('--dry-run', action='store_true',
@@ -986,8 +994,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
                    help=f'override the persistent-error notification threshold '
                         f'(default {MOVER_ERROR_THRESHOLD})')
     p.add_argument('--source', metavar='DIR',
-                   help=f'override the source (Downloads) directory '
-                        f'(default {DOWNLOADS_SNAPSHOTS_DIR})')
+                   help=f'override the source (staging) directory '
+                        f'(default {STAGING_SNAPSHOTS_DIR})')
     p.add_argument('--dest', metavar='DIR',
                    help=f'override the destination (iCloud) directory '
                         f'(default {ICLOUD_SNAPSHOTS_DIR})')
@@ -1009,12 +1017,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 def _apply_args(args: argparse.Namespace) -> None:
     """Apply parsed CLI args to module-level constants and the logger."""
-    global DOWNLOADS_SNAPSHOTS_DIR, ICLOUD_SNAPSHOTS_DIR, DB_FILE
+    global STAGING_SNAPSHOTS_DIR, ICLOUD_SNAPSHOTS_DIR, DB_FILE
     global MIN_AGE_SECONDS, MOVER_ERROR_THRESHOLD
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     if args.source is not None:
-        DOWNLOADS_SNAPSHOTS_DIR = args.source
+        STAGING_SNAPSHOTS_DIR = args.source
     if args.dest is not None:
         ICLOUD_SNAPSHOTS_DIR = args.dest
     if args.db is not None:
