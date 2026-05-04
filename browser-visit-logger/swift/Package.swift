@@ -2,14 +2,24 @@
 //
 // Swift Package Manager manifest for the Browser Visit Logger native helpers.
 //
-// Right now this only contains BVLVerifier, a deliberately minimal target
-// whose sole purpose is to validate that a Swift Mach-O binary inside a
-// code-signed app bundle inherits TCC permissions the way Python scripts
-// don't.  Once that's confirmed end-to-end, this package grows to host
-// the full port — see the PR description for the migration plan.
+// Targets:
+//   BVLCore     — shared library: SQLite wrapper, schema, archive logic,
+//                 error tracking, snapshot filename parsing.
+//   BVLHost     — Chrome native-messaging host.  Bundle's executable is
+//                 a code-signed Mach-O so TCC attributes file accesses
+//                 to the bundle's identity (whereas a shell-script
+//                 entrypoint would lose attribution at exec time).
+//   BVLVerifier — daily LaunchAgent.  Currently a TCC-validation probe;
+//                 will absorb the verifier's tick logic in a follow-up.
 //
-// Build:    swift build -c release
-// Output:   .build/release/BVLVerifier  (Mach-O for the host architecture)
+// XCTest isn't available with the standalone Xcode Command Line Tools
+// install, so there's no .testTarget here.  Test coverage for the
+// ported logic comes from two complementary sources:
+//   1. The Python suite exercises the equivalent code paths via
+//      tests/test_*.py — same DB schema, same on-disk artifacts.
+//   2. install.sh end-to-end smoke-tests the BVLHost binary against
+//      a real Chrome native-messaging round-trip during the validation
+//      step.
 //
 import PackageDescription
 
@@ -19,8 +29,18 @@ let package = Package(
         .macOS(.v12),
     ],
     targets: [
+        .target(
+            name: "BVLCore",
+            path: "Sources/BVLCore"
+        ),
+        .executableTarget(
+            name: "BVLHost",
+            dependencies: ["BVLCore"],
+            path: "Sources/BVLHost"
+        ),
         .executableTarget(
             name: "BVLVerifier",
+            dependencies: ["BVLCore"],
             path: "Sources/BVLVerifier"
         ),
     ]
