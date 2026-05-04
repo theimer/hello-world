@@ -57,9 +57,9 @@ clicking Allow grants it for the lifetime of the app's signature.
 | `~/browser-visits.db` | SQLite database — `visits`, `read_events`, `skimmed_events`, `snapshots`, `mover_errors` |
 | `~/browser-visits-host.log` | Native host process log (rotated, 1 MiB × 3) |
 | `~/browser-visits-verifier.log` | Verifier LaunchAgent process log |
-| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerHost.app/` | Code-signed app bundle that wraps `host.py` for TCC attribution |
-| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerVerifier.app/` | Code-signed app bundle that wraps `snapshot_verifier.py` for TCC attribution |
-| `~/Downloads/browser-visit-snapshots/` | Chrome's drop point — host.py archives files away on every tag, verifier sweeps stragglers daily |
+| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerHost.app/` | Code-signed app bundle wrapping the Swift `BVLHost` Mach-O binary (Chrome's native-messaging host) |
+| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerVerifier.app/` | Code-signed app bundle wrapping the Swift `BVLVerifier` Mach-O binary (daily background agent) |
+| `~/Downloads/browser-visit-snapshots/` | Chrome's drop point — `BVLHost` archives files away on every tag, the verifier sweeps stragglers daily |
 | `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive: read-only snapshot files + read-only `MANIFEST.tsv` + read-only `browser-visits-<YYYY-MM-DD>.log` |
 
 All paths can be overridden via `BVL_*` environment variables — see
@@ -105,11 +105,11 @@ mover_errors (
 )
 ```
 
-The `visits` / `*_events` tables are owned by `host.py`; the `snapshots`
-and `mover_errors` tables are co-owned by `host.py` and the verifier.
-`host.py` INSERTs a `snapshots` row (`sealed=0`) on every write
+The `visits` / `*_events` tables are owned by `BVLHost`; the `snapshots`
+and `mover_errors` tables are co-owned by `BVLHost` and `BVLVerifier`.
+`BVLHost` INSERTs a `snapshots` row (`sealed=0`) on every write
 invocation (covers activity-only days), and the synchronous archive in
-`archive_for_tag` INSERTs one when a file lands in a new daily dir.
+`Archive.forTag` INSERTs one when a file lands in a new daily dir.
 The verifier's seal pass flips `sealed=1` once the day has fully
 passed.  The seal pass queries this table to find work — no
 filesystem rescan needed.  The `mover_errors` table tracks unresolved
@@ -138,16 +138,17 @@ bash install.sh
 
 1. Generates a stable RSA key pair (once) and pins the extension ID
    via the `key` field in `manifest.json`.
-2. On macOS, materializes two ad-hoc-signed `.app` bundles under
+2. On macOS, builds the Swift binaries (`swift build -c release`) and
+   materializes two ad-hoc-signed `.app` bundles under
    `~/Library/Application Support/browser-visit-logger/`:
-   - `BrowserVisitLoggerHost.app` wraps `native-host/host.py`.  The
-     Chrome native-messaging manifest's `path` points at this bundle's
-     executable, so the spawned process inherits the bundle's TCC
-     identity — Chrome doesn't pass its own TCC grants to native
-     messaging children, but a signed bundle gives the host its own
-     stable identity that the user can grant separately.
-   - `BrowserVisitLoggerVerifier.app` wraps
-     `native-host/snapshot_verifier.py`, with the same TCC reasoning.
+   - `BrowserVisitLoggerHost.app` wraps the `BVLHost` Mach-O binary
+     (Chrome's native-messaging host).  The Chrome native-messaging
+     manifest's `path` points at this bundle's executable, so the
+     spawned process IS the bundle's signed code — TCC attributes file
+     accesses to the bundle's identity, which the user can grant
+     Files & Folders / Full Disk Access in System Settings.
+   - `BrowserVisitLoggerVerifier.app` wraps the `BVLVerifier` Mach-O
+     binary (daily background agent) with the same TCC reasoning.
 3. Installs the Chrome native-messaging host manifest under each
    detected browser's `NativeMessagingHosts` directory, with `path`
    pointing at the host bundle.
@@ -228,20 +229,17 @@ All scripts live at the repo root or under `native-host/`.  They share
 the same `BVL_*` env-var conventions and accept overriding flags so
 they're safe to point at test data.
 
-The four user-facing Python scripts each have an executable Bash
-wrapper at the repo root for convenience — e.g.
-`./verify_snapshot_directory --show-errors` instead of
-`python3 native-host/snapshot_verifier.py --show-errors`.  Each
-wrapper forwards all arguments verbatim and intercepts `--help` / `-h`
-to print a one-line wrapper note before delegating to the Python
-script's own argparse `--help`.
+Three of the wrappers delegate to Python scripts; one (`verify_snapshot_directory`)
+delegates to the Swift `BVLVerifier` binary built under `swift/.build/release/`.
+Each wrapper forwards all arguments verbatim and intercepts `--help` / `-h`
+to print a one-line wrapper note before delegating.
 
-| Wrapper | Underlying script |
-|---------|-------------------|
-| `./seal_snapshot_directory` | `native-host/snapshot_sealer.py` |
-| `./verify_snapshot_directory` | `native-host/snapshot_verifier.py` |
-| `./reset_visits_data` | `reset.py` |
-| `./rebuild_visits_data` | `native-host/visits_rebuilder.py` |
+| Wrapper | Underlying tool |
+|---------|------------------|
+| `./seal_snapshot_directory`   | `native-host/snapshot_sealer.py` (Python) |
+| `./verify_snapshot_directory` | `swift/.build/release/BVLVerifier` (Swift Mach-O) |
+| `./reset_visits_data`         | `reset.py` (Python) |
+| `./rebuild_visits_data`       | `native-host/visits_rebuilder.py` (Python) |
 
 ### `install.sh`
 
@@ -253,28 +251,31 @@ LaunchAgent.
 bash install.sh
 ```
 
-### `native-host/host.py`
+### `swift/Sources/BVLHost/` (Mach-O binary)
 
-The native messaging host invoked by Chrome. **Don't run this directly**
+The native messaging host invoked by Chrome.  **Don't run this directly**
 — it speaks Chrome's framed-stdio protocol (4-byte length prefix +
-JSON), not a normal CLI. It's launched once per `sendNativeMessage` call.
+JSON), not a normal CLI.  Chrome launches the bundled binary
+once per `sendNativeMessage` call.  Reads the message, writes a per-day
+log line + DB row, archives the just-tagged snapshot synchronously
+from `~/Downloads/browser-visit-snapshots/` to its iCloud date subdir,
+chmods the destination 0o444, writes a result line, and exits.
+
+Built from `swift/Sources/BVLHost/main.swift` plus the shared
+`swift/Sources/BVLCore/` library (schema, DB, archive helpers, etc.).
+The compiled Mach-O lives at `swift/.build/release/BVLHost` after
+`swift build -c release` and is copied into
+`BrowserVisitLoggerHost.app/Contents/MacOS/BrowserVisitLoggerHost`
+during install.
 
 ### `native-host/snapshot_mover.py`
 
-**Library only.**  Used to be a standalone executable run hourly by a
-LaunchAgent; that role has been split:
-
-- The synchronous archive at tag time happens in `host.py` via
-  `snapshot_mover.archive_for_tag(conn, filename)`.  No age gate (the
-  Chrome download is known to be complete by the time the native
-  message arrives).  Failures are logged and recorded in
-  `mover_errors`; the next verifier tick's sweep retries.
-- The periodic sweep / seal / orphan-log-merge / escalate work happens
-  in the verifier (see below) via `snapshot_mover.sweep_pass`,
-  `seal_pass`, `orphan_log_merge_pass`, `escalate_errors`.
-- The CLI surface that used to live here (`--show-errors`,
-  `--clear-errors`, `--clear-error N`, `--dry-run`) has moved to
-  `snapshot_verifier.py`.
+**Library only**, retained as a Python helper for `snapshot_sealer.py`
+and `visits_rebuilder.py`.  The production move / seal / verify
+pipeline runs in Swift now (see `BVLHost` above and `BVLVerifier`
+below); this file's `_seal_directory`, `_ensure_snapshots_table`,
+manifest constants, and other utilities are still imported by the
+two surviving Python CLI tools and their tests.
 
 ### `native-host/snapshot_sealer.py`
 
@@ -329,14 +330,15 @@ Files in the directory with no matching DB row appear with empty
 metadata fields. Tabs / newlines / CRs in titles are sanitised to
 spaces.
 
-### `native-host/snapshot_verifier.py`
+### `swift/Sources/BVLVerifier/` (Mach-O binary)
 
-The sole background agent.  A daily LaunchAgent invokes it with
-`--quiet`; you can also run it by hand for ad-hoc maintenance.  Each
-default-mode tick (no operation flag) does, in order:
+The sole background agent.  A daily LaunchAgent invokes the bundled
+binary with `--quiet`; you can also run it by hand via
+`./verify_snapshot_directory`.  Each default-mode tick (no operation
+flag) does, in order:
 
 1. **Sweep** — scan `~/Downloads/browser-visit-snapshots/` for
-   stragglers (files left behind by a host.py crash between Chrome's
+   stragglers (files left behind by a `BVLHost` crash between Chrome's
    download and the synchronous archive).  Files at least
    `MIN_AGE_SECONDS` old are archived to `<dest>/<YYYY-MM-DD>/`
    (chmod `0o444`, events row updated).  Idempotent — interrupted runs
@@ -358,21 +360,21 @@ default-mode tick (no operation flag) does, in order:
 
 ```bash
 # Default — full tick (the canonical background-agent invocation)
-python3 native-host/snapshot_verifier.py
-python3 native-host/snapshot_verifier.py --quiet           # silence OK lines
-python3 native-host/snapshot_verifier.py --dry-run         # plan, don't write
+./verify_snapshot_directory
+./verify_snapshot_directory --quiet           # silence OK lines
+./verify_snapshot_directory --dry-run         # plan, don't write
 
 # Verify one directory by date or path (no sweep / seal / escalate)
-python3 native-host/snapshot_verifier.py --verify 2026-04-30
-python3 native-host/snapshot_verifier.py --verify /Users/.../snapshots/2026-04-30
+./verify_snapshot_directory --verify 2026-04-30
+./verify_snapshot_directory --verify /Users/.../snapshots/2026-04-30
 
 # Verify every sealed directory in the snapshots table
-python3 native-host/snapshot_verifier.py --verify-all
+./verify_snapshot_directory --verify-all
 
 # Inspect / clear pending mover_errors rows
-python3 native-host/snapshot_verifier.py --show-errors
-python3 native-host/snapshot_verifier.py --clear-errors
-python3 native-host/snapshot_verifier.py --clear-error 1
+./verify_snapshot_directory --show-errors
+./verify_snapshot_directory --clear-errors
+./verify_snapshot_directory --clear-error 1
 ```
 
 Flags:
@@ -516,17 +518,6 @@ orphan or malformed lines skipped during phase 1), 2 on an
 unexpected exception.  See [docs/rebuild-visits-from-log.md](docs/rebuild-visits-from-log.md)
 for the full design.
 
-### `point-to-worktree.py`
-
-Developer convenience. Repoints the installed native-host manifest at
-`host.py` inside a `.claude/worktrees/<branch>/` worktree so you can
-test pre-merge changes without re-running `install.sh`. Restart Chrome
-fully (Cmd-Q) for the change to take effect; `bash install.sh` reverts.
-
-```bash
-python3 point-to-worktree.py
-```
-
 ---
 
 ## When something goes wrong
@@ -665,20 +656,24 @@ browser-visit-logger/
 │   ├── manifest.json.template              # → manifest.json (built by install.sh)
 │   ├── popup.html
 │   └── popup.js
+├── swift/
+│   ├── Package.swift                       # SwiftPM manifest, no third-party deps
+│   ├── Sources/
+│   │   ├── BVLCore/                        # shared library (schema, DB, archive, verify, …)
+│   │   ├── BVLHost/                        # Chrome native-messaging host (Mach-O)
+│   │   └── BVLVerifier/                    # daily background agent (Mach-O)
+│   └── .build/release/                     # built binaries (after `swift build -c release`)
 ├── native-host/
-│   ├── host.py                             # Native messaging host (synchronous archive at tag time)
-│   ├── snapshot_mover.py                   # Library — archive_for_tag, sweep_pass, seal_pass, …
-│   ├── snapshot_sealer.py                  # Manual sealer CLI
-│   ├── snapshot_verifier.py                # Background agent + verify CLI + error-table CLI
+│   ├── snapshot_mover.py                   # Library used by sealer + rebuilder
+│   ├── snapshot_sealer.py                  # Manual sealer CLI (Python)
 │   ├── visits_rebuilder.py                 # DB rebuilder (log replay + FS rehydrate)
-│   ├── com.browser.visit.logger.json       # Host manifest (template-installed; path → host bundle)
+│   ├── com.browser.visit.logger.json       # Chrome native-messaging manifest template
 │   └── com.browser.visit.logger.snapshot_verifier.plist.template
 ├── tests/                                  # Python (pytest) + JS (jest)
-├── install.sh                              # Builds & signs both .app bundles
+├── install.sh                              # Builds Swift binaries, materializes & signs .app bundles
 ├── reset.py
-├── point-to-worktree.py
 ├── seal_snapshot_directory                 # Bash wrapper → snapshot_sealer.py
-├── verify_snapshot_directory               # Bash wrapper → snapshot_verifier.py
+├── verify_snapshot_directory               # Bash wrapper → swift/.build/release/BVLVerifier
 ├── reset_visits_data                       # Bash wrapper → reset.py
 ├── rebuild_visits_data                     # Bash wrapper → visits_rebuilder.py
 ├── package.json                            # JS test deps + jest config
@@ -689,8 +684,8 @@ On macOS, `install.sh` additionally materializes:
 
 ```
 ~/Library/Application Support/browser-visit-logger/
-├── BrowserVisitLoggerHost.app/             # Wraps host.py for TCC attribution
-└── BrowserVisitLoggerVerifier.app/         # Wraps snapshot_verifier.py for TCC attribution
+├── BrowserVisitLoggerHost.app/             # Wraps the BVLHost Mach-O (Chrome → host)
+└── BrowserVisitLoggerVerifier.app/         # Wraps the BVLVerifier Mach-O (launchd → tick)
 ```
 
 ---
