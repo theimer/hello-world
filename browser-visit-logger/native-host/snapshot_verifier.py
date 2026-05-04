@@ -352,6 +352,16 @@ def _apply_overrides(args):
 
 def cli(argv=None):
     args = _parse_args(argv)
+    # Configure root logging on entry so snapshot_mover's library logger
+    # (which has no handlers of its own) reaches stderr.  The verifier
+    # LaunchAgent's plist captures stderr to ~/browser-visits-verifier.log;
+    # interactive runs see the lines directly in the terminal.  This is a
+    # no-op when the root logger already has handlers (e.g. under pytest).
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+    )
     _apply_overrides(args)
 
     # Ensure the iCloud root exists before any operation that may write

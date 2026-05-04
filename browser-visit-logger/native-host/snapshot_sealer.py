@@ -95,6 +95,15 @@ def cli(argv=None) -> int:
     """Parse argv, apply overrides, seal one directory.  Returns an exit code."""
     args = _parse_args(argv)
 
+    # snapshot_mover is a library and doesn't configure logging itself;
+    # surface its log lines on stderr for interactive use.  No-op when
+    # the root logger already has handlers (e.g. under pytest).
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+    )
+
     if args.verbose:
         snapshot_mover.logger.setLevel(logging.DEBUG)
     if args.dest is not None:

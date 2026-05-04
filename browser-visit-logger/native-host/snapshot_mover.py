@@ -423,12 +423,16 @@ def _applescript_quote(s):
     """Escape a string for safe interpolation into AppleScript."""
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [snapshot_mover] %(message)s',
-)
+# Library: don't configure root logging at import time (bad practice —
+# would override callers' setup).  Just create the named logger and set
+# its level; messages propagate to whatever the application has wired
+# up.  Standalone callers (snapshot_sealer, snapshot_verifier) call
+# logging.basicConfig in their CLI entry points; host.py explicitly
+# attaches its host-log file handler to this logger so archive_for_tag
+# failures surface in ~/browser-visits-host.log instead of being
+# discarded with Chrome's stderr capture.
 logger = logging.getLogger('snapshot_mover')
+logger.setLevel(logging.INFO)
 
 # Matches the permanent snapshot filename format assigned by host.py:
 #   <YYYY-MM-DD>T<HH>-<MM>-<SS>Z-<hash>.<ext>

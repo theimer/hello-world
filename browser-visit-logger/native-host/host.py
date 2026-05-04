@@ -124,6 +124,12 @@ logger = logging.getLogger('bvl')
 logger.setLevel(logging.DEBUG)
 logger.addHandler(_handler)
 
+# Surface snapshot_mover's log lines (archive_for_tag warnings, _move_one
+# info/error) in the same host log.  Without this, Chrome discards
+# stderr from native messaging hosts and any archive failure would be
+# invisible.
+snapshot_mover.logger.addHandler(_handler)
+
 # ---------------------------------------------------------------------------
 # Native messaging I/O
 # ---------------------------------------------------------------------------
