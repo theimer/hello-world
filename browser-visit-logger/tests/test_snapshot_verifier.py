@@ -18,6 +18,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -458,7 +459,8 @@ class TestVerifierCli(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15'])
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--verify', '2024-01-15'])
         self.assertEqual(rc, 0)
         self.assertIn('OK', captured.getvalue())
 
@@ -470,7 +472,8 @@ class TestVerifierCli(_VerifierTestBase):
         self._seal('2024-01-15')
         captured = io.StringIO()
         with patch('sys.stdout', captured):
-            rc = snapshot_verifier.cli(['--db', self.db_file, date_subdir])
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--verify', date_subdir])
         self.assertEqual(rc, 0)
         self.assertIn('OK', captured.getvalue())
 
@@ -485,7 +488,8 @@ class TestVerifierCli(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '2024-01-15'])
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--verify', '2024-01-15'])
         self.assertEqual(rc, 1)
         self.assertIn('FAILED', captured.getvalue())
 
@@ -499,7 +503,7 @@ class TestVerifierCli(_VerifierTestBase):
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
                 '--db', self.db_file, '--dest', self.dest_dir,
-                '--quiet', '2024-01-15'])
+                '--quiet', '--verify', '2024-01-15'])
         self.assertEqual(rc, 0)
         self.assertEqual(captured.getvalue(), '')
 
@@ -514,33 +518,31 @@ class TestVerifierCli(_VerifierTestBase):
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
                 '--db', self.db_file, '--dest', self.dest_dir,
-                '--quiet', '2024-01-15'])
+                '--quiet', '--verify', '2024-01-15'])
         self.assertEqual(rc, 1)
         self.assertIn('FAILED', captured.getvalue())
 
     def test_missing_db_returns_one(self):
         rc = snapshot_verifier.cli([
             '--db', os.path.join(self.tmp.name, 'nope.db'),
-            '--dest', self.dest_dir, '2024-01-15'])
+            '--dest', self.dest_dir, '--verify', '2024-01-15'])
         self.assertEqual(rc, 1)
 
     def test_missing_target_returns_one(self):
         rc = snapshot_verifier.cli([
-            '--db', self.db_file, '--dest', self.dest_dir, '2024-12-31'])
+            '--db', self.db_file, '--dest', self.dest_dir,
+            '--verify', '2024-12-31'])
         self.assertEqual(rc, 1)
 
-    def test_no_arg_and_no_all_is_a_parse_error(self):
-        with self.assertRaises(SystemExit):
-            snapshot_verifier._parse_args(['--db', self.db_file])
-
-    def test_directory_combined_with_all_is_a_parse_error(self):
+    def test_verify_and_verify_all_are_mutually_exclusive(self):
         with self.assertRaises(SystemExit):
             snapshot_verifier._parse_args([
-                '--db', self.db_file, '--all', '2024-01-15'])
+                '--db', self.db_file,
+                '--verify-all', '--verify', '2024-01-15'])
 
     def test_verbose_sets_debug_log_level(self):
-        # verbose run with --all and no sealed dirs is a quick no-op
-        snapshot_verifier.cli(['--db', self.db_file, '-v', '--all'])
+        # verbose run with --verify-all and no sealed dirs is a quick no-op
+        snapshot_verifier.cli(['--db', self.db_file, '-v', '--verify-all'])
         self.assertEqual(snapshot_mover.logger.level, logging.DEBUG)
 
     def test_dest_override_is_applied(self):
@@ -563,7 +565,8 @@ class TestVerifierCli(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', alt_dest, date_str])
+                '--db', self.db_file, '--dest', alt_dest,
+                '--verify', date_str])
         self.assertEqual(rc, 0)
         self.assertIn('OK', captured.getvalue())
 
@@ -577,7 +580,7 @@ class TestVerifyAll(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '--all'])
+                '--db', self.db_file, '--dest', self.dest_dir, '--verify-all'])
         self.assertEqual(rc, 0)
         self.assertIn('No sealed directories', captured.getvalue())
 
@@ -586,7 +589,7 @@ class TestVerifyAll(_VerifierTestBase):
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
                 '--db', self.db_file, '--dest', self.dest_dir,
-                '--all', '--quiet'])
+                '--verify-all', '--quiet'])
         self.assertEqual(rc, 0)
         self.assertEqual(captured.getvalue(), '')
 
@@ -600,7 +603,7 @@ class TestVerifyAll(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '--all'])
+                '--db', self.db_file, '--dest', self.dest_dir, '--verify-all'])
         self.assertEqual(rc, 0)
         out = captured.getvalue()
         self.assertIn('2024-01-15', out)
@@ -623,7 +626,7 @@ class TestVerifyAll(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '--all'])
+                '--db', self.db_file, '--dest', self.dest_dir, '--verify-all'])
         self.assertEqual(rc, 1)
         self.assertIn('OK', captured.getvalue())
         self.assertIn('FAILED', captured.getvalue())
@@ -640,7 +643,7 @@ class TestVerifyAll(_VerifierTestBase):
         captured = io.StringIO()
         with patch('sys.stdout', captured):
             rc = snapshot_verifier.cli([
-                '--db', self.db_file, '--dest', self.dest_dir, '--all'])
+                '--db', self.db_file, '--dest', self.dest_dir, '--verify-all'])
         self.assertEqual(rc, 0)
         self.assertNotIn('2024-01-15', captured.getvalue())
 
@@ -669,7 +672,7 @@ class TestRecordIntegration(_VerifierTestBase):
         os.chmod(manifest, 0o444)
         snapshot_verifier.cli([
             '--db', self.db_file, '--dest', self.dest_dir,
-            '--quiet', '--record', '2024-01-15'])
+            '--quiet', '--record', '--verify', '2024-01-15'])
         rows = self._errors()
         self.assertEqual(len(rows), 1)
         op, target, message, immediate, _notified = rows[0]
@@ -693,7 +696,7 @@ class TestRecordIntegration(_VerifierTestBase):
         conn.close()
         snapshot_verifier.cli([
             '--db', self.db_file, '--dest', self.dest_dir,
-            '--quiet', '--record', '2024-01-15'])
+            '--quiet', '--record', '--verify', '2024-01-15'])
         self.assertEqual(self._errors(), [])
 
     def test_no_record_does_not_touch_mover_errors(self):
@@ -705,7 +708,7 @@ class TestRecordIntegration(_VerifierTestBase):
         os.chmod(manifest, 0o444)
         snapshot_verifier.cli([
             '--db', self.db_file, '--dest', self.dest_dir,
-            '--quiet', '2024-01-15'])
+            '--quiet', '--verify', '2024-01-15'])
         self.assertEqual(self._errors(), [])
 
     def test_record_drains_notification_queue_via_escalate(self):
@@ -721,7 +724,7 @@ class TestRecordIntegration(_VerifierTestBase):
         with patch.object(snapshot_mover, '_notify_user') as mock_notify:
             snapshot_verifier.cli([
                 '--db', self.db_file, '--dest', self.dest_dir,
-                '--quiet', '--record', '2024-01-15'])
+                '--quiet', '--record', '--verify', '2024-01-15'])
         mock_notify.assert_called_once()
         body = mock_notify.call_args[0][1]
         self.assertIn('manifest_invalid', body)
@@ -729,8 +732,8 @@ class TestRecordIntegration(_VerifierTestBase):
         self.assertEqual(self._errors()[0][4], 1)
 
     def test_no_record_does_not_call_escalate(self):
-        # Without --record, _escalate_errors must not run — the verifier
-        # behaves as a pure read-only check.
+        # Without --record, _escalate_errors must not run — --verify is a
+        # pure read-only check.
         date_subdir = self._seed_dir('2024-01-15')
         self._seal('2024-01-15')
         manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
@@ -741,7 +744,7 @@ class TestRecordIntegration(_VerifierTestBase):
              patch.object(snapshot_mover, '_escalate_errors') as mock_escalate:
             snapshot_verifier.cli([
                 '--db', self.db_file, '--dest', self.dest_dir,
-                '--quiet', '2024-01-15'])
+                '--quiet', '--verify', '2024-01-15'])
         mock_notify.assert_not_called()
         mock_escalate.assert_not_called()
 
@@ -760,7 +763,7 @@ class TestRecordIntegration(_VerifierTestBase):
         os.chmod(manifest, 0o444)
         snapshot_verifier.cli([
             '--db', self.db_file, '--dest', self.dest_dir,
-            '--quiet', '--record', '--all'])
+            '--quiet', '--record', '--verify-all'])
         rows = self._errors()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1],
@@ -790,6 +793,386 @@ class TestResolveTarget(unittest.TestCase):
     def test_relative_path_with_separator_used_verbatim(self):
         self.assertEqual(snapshot_verifier._resolve_target('rel/2024-01-15'),
                          'rel/2024-01-15')
+
+
+# ---------------------------------------------------------------------------
+# run_tick — the verifier's main entry point.  Exercises sweep + seal +
+# orphan-log-merge + verify + escalate together.
+# ---------------------------------------------------------------------------
+class TestRunTick(_VerifierTestBase):
+
+    def test_run_tick_calls_each_pass_in_order(self):
+        # Patch each sub-pass and assert they're invoked in the documented
+        # order.  Verification is the inner-most call so it goes through
+        # _verify_all_sealed, which we don't patch here — but with no
+        # sealed dirs it's a quick no-op.
+        conn = sqlite3.connect(self.db_file)
+        try:
+            with patch.object(snapshot_mover, 'sweep_pass') as sweep, \
+                 patch.object(snapshot_mover, 'seal_pass') as seal, \
+                 patch.object(snapshot_mover, 'orphan_log_merge_pass') as orphan, \
+                 patch.object(snapshot_mover, 'escalate_errors') as escalate:
+                snapshot_verifier.run_tick(
+                    conn, dry_run=False, record=True, quiet=True)
+        finally:
+            conn.close()
+        sweep.assert_called_once()
+        seal.assert_called_once()
+        orphan.assert_called_once()
+        escalate.assert_called_once()
+
+    def test_dry_run_skips_orphan_merge_and_escalate(self):
+        conn = sqlite3.connect(self.db_file)
+        try:
+            with patch.object(snapshot_mover, 'sweep_pass') as sweep, \
+                 patch.object(snapshot_mover, 'seal_pass') as seal, \
+                 patch.object(snapshot_mover, 'orphan_log_merge_pass') as orphan, \
+                 patch.object(snapshot_mover, 'escalate_errors') as escalate:
+                snapshot_verifier.run_tick(
+                    conn, dry_run=True, record=True, quiet=True)
+        finally:
+            conn.close()
+        sweep.assert_called_once_with(conn, dry_run=True)
+        seal.assert_called_once_with(conn, dry_run=True)
+        orphan.assert_not_called()
+        escalate.assert_not_called()
+
+    def test_run_tick_returns_true_when_no_sealed_dirs(self):
+        # No sealed directories at all — _verify_all_sealed returns True.
+        conn = sqlite3.connect(self.db_file)
+        try:
+            ok = snapshot_verifier.run_tick(
+                conn, dry_run=False, record=True, quiet=True)
+        finally:
+            conn.close()
+        self.assertTrue(ok)
+
+    def test_run_tick_returns_false_when_a_sealed_dir_fails_verification(self):
+        # Seal a dir, corrupt its manifest, run_tick should report failure.
+        date_subdir = self._seed_dir('2024-01-15')
+        self._seal('2024-01-15')
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        os.chmod(manifest, 0o644)
+        Path(manifest).write_text('BAD\n')
+        os.chmod(manifest, 0o444)
+        conn = sqlite3.connect(self.db_file)
+        try:
+            ok = snapshot_verifier.run_tick(
+                conn, dry_run=False, record=True, quiet=True)
+        finally:
+            conn.close()
+        self.assertFalse(ok)
+
+    def test_default_cli_invocation_runs_a_tick(self):
+        # No operation flag → cli() runs run_tick.  With no sealed dirs
+        # it should exit 0.
+        rc = snapshot_verifier.cli([
+            '--db', self.db_file, '--dest', self.dest_dir, '--quiet'])
+        self.assertEqual(rc, 0)
+
+    def test_default_cli_invocation_returns_one_when_verify_fails(self):
+        date_subdir = self._seed_dir('2024-01-15')
+        self._seal('2024-01-15')
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        os.chmod(manifest, 0o644)
+        Path(manifest).write_text('BAD\n')
+        os.chmod(manifest, 0o444)
+        rc = snapshot_verifier.cli([
+            '--db', self.db_file, '--dest', self.dest_dir, '--quiet'])
+        self.assertEqual(rc, 1)
+
+    def test_dry_run_cli_does_not_modify_db(self):
+        # Drop a snapshot file in Downloads with a past date; --dry-run
+        # tick should NOT move it or insert a snapshots row.
+        downloads = os.path.join(self.tmp.name, 'downloads')
+        os.makedirs(downloads)
+        prefixed = '2024-01-15T10-00-00Z-x.mhtml'
+        src = os.path.join(downloads, prefixed)
+        Path(src).write_bytes(b'data')
+        # Backdate so MIN_AGE_SECONDS gate is satisfied.
+        old = time.time() - 700
+        os.utime(src, (old, old))
+        rc = snapshot_verifier.cli([
+            '--db', self.db_file, '--dest', self.dest_dir,
+            '--source', downloads, '--quiet', '--dry-run'])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(src), 'dry-run must not move the file')
+        # snapshots table is untouched.
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute("SELECT COUNT(*) FROM snapshots").fetchall()
+        conn.close()
+        self.assertEqual(rows[0][0], 0)
+
+
+# ---------------------------------------------------------------------------
+# Error-table CLI ops — --show-errors / --clear-errors / --clear-error N.
+# Adopted from the deleted snapshot_mover CLI.
+# ---------------------------------------------------------------------------
+class TestErrorCli(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_file = os.path.join(self.tmp.name, 'visits.db')
+        self._saved_db = snapshot_mover.DB_FILE
+        self.addCleanup(lambda: setattr(snapshot_mover, 'DB_FILE', self._saved_db))
+        # Sandbox iCloud dir so cli's mkdir doesn't write to the real one.
+        self.dest_dir = os.path.join(self.tmp.name, 'icloud')
+        self._saved_dest = snapshot_mover.ICLOUD_SNAPSHOTS_DIR
+        self.addCleanup(
+            lambda: setattr(snapshot_mover, 'ICLOUD_SNAPSHOTS_DIR',
+                            self._saved_dest))
+
+    def _seed_errors(self, *triples):
+        snapshot_mover.DB_FILE = self.db_file
+        conn = sqlite3.connect(self.db_file)
+        snapshot_mover._ensure_mover_errors_table(conn)
+        for op, target, exc in triples:
+            snapshot_mover._record_error(conn, op, target, exc)
+        conn.close()
+
+    # --- mutual exclusivity ---
+
+    def test_show_and_clear_errors_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            snapshot_verifier._parse_args([
+                '--show-errors', '--clear-errors'])
+
+    def test_show_errors_and_verify_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            snapshot_verifier._parse_args([
+                '--show-errors', '--verify', '2024-01-15'])
+
+    # --- --show-errors ---
+
+    def test_show_errors_with_empty_table_prints_no_errors_message(self):
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--show-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('No pending mover errors', captured.getvalue())
+
+    def test_show_errors_lists_rows_with_index_and_metadata(self):
+        self._seed_errors(
+            ('move', '/path/a.mhtml', OSError('boom-a')),
+            ('seal', '/icloud/2024-01-15', OSError('boom-b')))
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--show-errors'])
+        out = captured.getvalue()
+        self.assertIn('[1]', out)
+        self.assertIn('[2]', out)
+        self.assertIn('move', out)
+        self.assertIn('/path/a.mhtml', out)
+        self.assertIn('boom-a', out)
+
+    def test_show_errors_includes_fix_hint_per_row(self):
+        self._seed_errors(('move', '/path/a.mhtml', OSError('x')))
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--show-errors'])
+        self.assertIn('fix:', captured.getvalue())
+
+    # --- --clear-errors ---
+
+    def test_clear_errors_with_empty_table_reports_zero(self):
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared 0', captured.getvalue())
+
+    def test_clear_errors_removes_all_rows(self):
+        self._seed_errors(
+            ('move', '/a', OSError('x')),
+            ('seal', '/b', OSError('y')))
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-errors'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared 2', captured.getvalue())
+        # Confirm the rows are gone.
+        conn = sqlite3.connect(self.db_file)
+        n = conn.execute("SELECT COUNT(*) FROM mover_errors").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 0)
+
+    def test_clear_errors_singular_phrasing_when_one_row(self):
+        self._seed_errors(('move', '/a', OSError('x')))
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-errors'])
+        self.assertIn('Cleared 1 error row.', captured.getvalue())
+
+    # --- --clear-error N ---
+
+    def test_clear_error_n_deletes_only_that_row(self):
+        self._seed_errors(
+            ('move', '/a', OSError('x')),
+            ('seal', '/b', OSError('y')))
+        # Note: ordering is by (first_seen ASC, key ASC) — both rows
+        # share the same first_seen so key 'move:/a' < 'seal:/b'.
+        captured = io.StringIO()
+        with patch('sys.stdout', captured):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-error', '1'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Cleared error [1]', captured.getvalue())
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation, target FROM mover_errors").fetchall()
+        conn.close()
+        self.assertEqual(rows, [('seal', '/b')])
+
+    def test_clear_error_with_empty_table_returns_nonzero(self):
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-error', '1'])
+        self.assertEqual(rc, 1)
+        self.assertIn('No pending mover errors', captured_err.getvalue())
+
+    def test_clear_error_out_of_range_returns_nonzero(self):
+        self._seed_errors(('move', '/a', OSError('x')))
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-error', '5'])
+        self.assertEqual(rc, 1)
+        self.assertIn('No error at index 5', captured_err.getvalue())
+
+    def test_clear_error_zero_index_returns_nonzero(self):
+        self._seed_errors(('move', '/a', OSError('x')))
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', self.dest_dir,
+                '--clear-error', '0'])
+        self.assertEqual(rc, 1)
+
+
+# ---------------------------------------------------------------------------
+# CLI top-level error handling and the --source / --min-age-seconds overrides.
+# ---------------------------------------------------------------------------
+class TestVerifierCliEdgeCases(_VerifierTestBase):
+
+    def test_source_and_min_age_overrides_are_applied(self):
+        # Drop a fresh-but-too-young file in a custom Downloads dir; with
+        # MIN_AGE_SECONDS=0 the sweep should pick it up despite the file
+        # being a few seconds old.  We assert on the sweep's outcome (file
+        # moved) rather than the cli rc, since the same tick also runs
+        # the seal+verify passes which can fail for orthogonal reasons
+        # (e.g. missing per-day log) — that's not what this test cares
+        # about.
+        downloads = os.path.join(self.tmp.name, 'custom-dl')
+        os.makedirs(downloads)
+        prefixed = '2024-01-15T10-00-00Z-x.mhtml'
+        Path(downloads, prefixed).write_bytes(b'data')
+        # Establish a backing visits row so the file isn't an orphan.
+        conn = sqlite3.connect(self.db_file)
+        host.insert_visit(conn, '2024-01-15T10:00:00Z', 'https://x.com', 'X')
+        conn.execute(
+            "INSERT INTO read_events (url, timestamp, filename, directory) "
+            "VALUES (?, ?, ?, ?)",
+            ('https://x.com', '2024-01-15T10:00:00Z', prefixed, downloads))
+        conn.commit()
+        conn.close()
+        # Don't assert on the rc — the seal/verify passes that run after
+        # the sweep can independently fail (no per-day log in LOG_DIR).
+        snapshot_verifier.cli([
+            '--db', self.db_file, '--dest', self.dest_dir,
+            '--source', downloads, '--min-age-seconds', '0', '--quiet'])
+        # File should have been swept to the iCloud date subdir.
+        self.assertFalse(
+            os.path.exists(os.path.join(downloads, prefixed)),
+            'expected the sweep to move the file')
+        self.assertTrue(
+            os.path.exists(os.path.join(self.dest_dir, '2024-01-15', prefixed)),
+            'expected the file at the iCloud destination')
+
+    def test_top_level_failure_records_and_reraises(self):
+        # Force a failure inside run_tick and verify the top-level catch
+        # records a top_level error and re-raises.
+        with patch.object(snapshot_verifier, 'run_tick',
+                          side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                snapshot_verifier.cli([
+                    '--db', self.db_file, '--dest', self.dest_dir,
+                    '--quiet'])
+        conn = sqlite3.connect(self.db_file)
+        rows = conn.execute(
+            "SELECT operation FROM mover_errors "
+            "WHERE operation = 'top_level'").fetchall()
+        conn.close()
+        self.assertEqual(rows, [('top_level',)])
+
+    def test_top_level_db_record_failure_falls_back_to_direct_notify(self):
+        # If both run_tick AND _record_error fail, the verifier should
+        # still attempt a direct notification.
+        with patch.object(snapshot_verifier, 'run_tick',
+                          side_effect=RuntimeError('outer')), \
+             patch.object(snapshot_mover, '_record_error',
+                          side_effect=sqlite3.DatabaseError('inner')), \
+             patch.object(snapshot_mover, '_notify_user') as mock_notify:
+            with self.assertRaises(RuntimeError):
+                snapshot_verifier.cli([
+                    '--db', self.db_file, '--dest', self.dest_dir,
+                    '--quiet'])
+        mock_notify.assert_called_once()
+        title, body = mock_notify.call_args[0]
+        self.assertIn('crashed', title.lower())
+
+    def test_missing_db_in_default_tick_returns_one(self):
+        rc = snapshot_verifier.cli([
+            '--db', os.path.join(self.tmp.name, 'nope.db'),
+            '--dest', self.dest_dir, '--quiet'])
+        self.assertEqual(rc, 1)
+
+    def test_iCloud_dir_creation_failure_returns_one(self):
+        # Pre-occupy the iCloud dir path with a regular file so makedirs
+        # fails with "file exists, not a directory".
+        bogus = os.path.join(self.tmp.name, 'icloud-as-file')
+        Path(bogus).write_text('not a directory')
+        captured_err = io.StringIO()
+        with patch('sys.stderr', captured_err):
+            rc = snapshot_verifier.cli([
+                '--db', self.db_file, '--dest', bogus, '--quiet'])
+        self.assertEqual(rc, 1)
+        self.assertIn('Could not create', captured_err.getvalue())
+
+    def test_verify_all_dry_run_is_a_logged_noop(self):
+        # _verify_all_sealed handles dry_run=True at the top by logging
+        # and returning True.  Reach it via run_tick.
+        date_subdir = self._seed_dir('2024-01-15', [
+            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
+             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
+        ])
+        self._seal('2024-01-15')
+        # Corrupt the manifest — but with --dry-run, verification is
+        # skipped, so the run still reports OK.
+        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
+        os.chmod(manifest, 0o644)
+        Path(manifest).write_text('BAD\n')
+        os.chmod(manifest, 0o444)
+        rc = snapshot_verifier.cli([
+            '--db', self.db_file, '--dest', self.dest_dir,
+            '--quiet', '--dry-run'])
+        self.assertEqual(rc, 0)
 
 
 if __name__ == '__main__':  # pragma: no cover

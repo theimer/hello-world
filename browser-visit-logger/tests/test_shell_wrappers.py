@@ -28,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # (wrapper_name, target_python_script_basename)
 WRAPPERS = [
-    ('move_snapshot',             'snapshot_mover.py'),
     ('seal_snapshot_directory',   'snapshot_sealer.py'),
     ('verify_snapshot_directory', 'snapshot_verifier.py'),
     ('reset_visits_data',         'reset.py'),
@@ -99,14 +98,14 @@ class TestWrapperHelp(unittest.TestCase):
 class TestWrapperForwarding(unittest.TestCase):
     """Spot-check that non-help arguments reach the underlying Python script."""
 
-    def test_move_snapshot_forwards_show_errors_against_temp_db(self):
-        # move_snapshot --db <path> --show-errors should reach the mover's
-        # CLI, which creates the DB on the fly and prints the empty-table
-        # message.
+    def test_verify_snapshot_directory_forwards_show_errors_against_temp_db(self):
+        # verify_snapshot_directory --db <path> --show-errors reaches the
+        # verifier's error-CLI op, which creates the DB on the fly and
+        # prints the empty-table message.
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, 'visits.db')
             result = subprocess.run(
-                [str(REPO_ROOT / 'move_snapshot'),
+                [str(REPO_ROOT / 'verify_snapshot_directory'),
                  '--db', db, '--show-errors'],
                 capture_output=True, text=True, timeout=10,
             )
@@ -135,9 +134,9 @@ class TestWrapperForwarding(unittest.TestCase):
                 (Path(date_dir) / 'MANIFEST.tsv').exists(),
                 'dry-run should not write a manifest')
 
-    def test_verify_snapshot_directory_forwards_all_against_empty_db(self):
-        # verify_snapshot_directory --all --quiet against a fresh DB with
-        # no sealed rows should exit 0 with empty stdout.
+    def test_verify_snapshot_directory_forwards_verify_all_against_empty_db(self):
+        # verify_snapshot_directory --verify-all --quiet against a fresh
+        # DB with no sealed rows exits 0 with empty stdout.
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, 'visits.db')
             Path(db).touch()
@@ -145,7 +144,7 @@ class TestWrapperForwarding(unittest.TestCase):
             os.makedirs(dest)
             result = subprocess.run(
                 [str(REPO_ROOT / 'verify_snapshot_directory'),
-                 '--db', db, '--dest', dest, '--all', '--quiet'],
+                 '--db', db, '--dest', dest, '--verify-all', '--quiet'],
                 capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0,

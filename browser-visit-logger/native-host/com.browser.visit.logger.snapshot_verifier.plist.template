@@ -1,21 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent for Browser Visit Logger snapshot verifier (anti-entropy).
+  LaunchAgent for Browser Visit Logger snapshot verifier.
 
-  install.sh fills in the VERIFIER_PATH and HOME placeholders and writes
+  install.sh fills in the VERIFIER_EXEC and HOME placeholders and writes
   the result to:
       ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist
   then loads it via `launchctl bootstrap`.
 
-  Each tick runs the verifier in record-and-quiet mode against every sealed
-  daily directory tracked in the snapshots table.  Failures are written to
-  the mover_errors table as op 'manifest_invalid' and surfaced to the user
-  via macOS Notification Center; on subsequent passes the row clears
-  automatically once verification succeeds again.
+  Each tick runs a full housekeeping pass:
+    1. sweep   — recover stragglers from ~/Downloads/browser-visit-snapshots/
+    2. seal    — write MANIFEST.tsv for completed UTC days, move per-day
+                 logs into the sealed dir
+    3. orphan-log-merge
+    4. verify  — re-check every sealed daily directory's manifest
+    5. escalate persistent / catastrophic mover_errors via Notification Center
 
-  StartInterval default is 604800 seconds (1 week).  Common alternative
-  values: 86400 (daily) or 2592000 (~monthly).  To change the cadence,
+  ProgramArguments points at the verifier app bundle's executable so
+  launchd-spawned ticks attribute to the bundle's TCC identity.  Chrome
+  / launchd otherwise can't read ~/Downloads on macOS.
+
+  StartInterval default is 86400 seconds (1 day).  Common alternative
+  values: 3600 (hourly) or 604800 (~weekly).  To change the cadence,
   edit the integer below and reload:
       launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_verifier
       launchctl bootstrap gui/$(id -u) <path/to/this/plist>
@@ -27,16 +33,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>{{VERIFIER_PATH}}</string>
+        <string>{{VERIFIER_EXEC}}</string>
         <string>--quiet</string>
-        <string>--record</string>
-        <string>--all</string>
     </array>
 
     <key>StartInterval</key>
-    <integer>604800</integer>
+    <integer>86400</integer>
 
     <key>RunAtLoad</key>
     <false/>

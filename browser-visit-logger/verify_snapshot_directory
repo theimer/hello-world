@@ -2,11 +2,13 @@
 # verify_snapshot_directory — convenience wrapper around
 # native-host/snapshot_verifier.py.
 #
-# Audits one (or every, with --all) sealed daily snapshot directory's
-# MANIFEST.tsv against the on-disk filesystem and the database.  All
-# arguments are forwarded verbatim to the underlying Python script;
-# --help is supported and produces both a brief wrapper note and the
-# script's full --help output.
+# Audits one (--verify <date>) or every (--verify-all) sealed daily
+# snapshot directory's MANIFEST.tsv against the on-disk filesystem and
+# the database.  With no operation flag the verifier runs a full tick
+# (sweep + seal + orphan-merge + verify + escalate).  All arguments are
+# forwarded verbatim to the underlying Python script; --help is supported
+# and produces both a brief wrapper note and the script's full --help
+# output.
 
 set -euo pipefail
 
@@ -19,11 +21,11 @@ for arg in "$@"; do
       cat <<'EOF'
 verify_snapshot_directory — wrapper around native-host/snapshot_verifier.py
 
-Audits one (or every, with --all) sealed daily snapshot directory's
-MANIFEST.tsv against the on-disk filesystem and the database.  All
-arguments are forwarded verbatim to the Python script.  Combine
---quiet --record --all for the canonical background-process invocation;
-omit --record for a side-effect-free terminal check.
+Audits one (--verify <date>) or every (--verify-all) sealed daily
+snapshot directory's MANIFEST.tsv against the on-disk filesystem and
+the database.  With no operation flag the verifier runs a full tick
+(sweep + seal + orphan-merge + verify + escalate).  All arguments are
+forwarded verbatim to the Python script.
 
 The remainder of this help is from the Python script:
 
