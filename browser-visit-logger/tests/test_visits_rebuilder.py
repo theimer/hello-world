@@ -619,7 +619,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
             conn = sqlite3.connect(db)
             try:
                 stats = vr.rehydrate_filesystem(
-                    conn, icloud, host.STAGING_SNAPSHOTS_DIR)
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
                 rows = dict(conn.execute(
                     'SELECT date, sealed FROM snapshots ORDER BY date'
                 ).fetchall())
@@ -644,7 +644,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
                            filename=good_unsealed)
             try:
                 stats = vr.rehydrate_filesystem(
-                    conn, icloud, host.STAGING_SNAPSHOTS_DIR)
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
                 read_dir = conn.execute(
                     'SELECT directory FROM read_events WHERE url = ?',
                     ('https://a.com',)
@@ -678,7 +678,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
             conn.commit()
             try:
                 vr.rehydrate_filesystem(
-                    conn, icloud, host.STAGING_SNAPSHOTS_DIR)
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
                 row = conn.execute(
                     'SELECT directory FROM read_events WHERE url = ?',
                     ('https://a.com',)
@@ -701,7 +701,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
             conn = sqlite3.connect(db)
             try:
                 stats = vr.rehydrate_filesystem(
-                    conn, icloud, host.STAGING_SNAPSHOTS_DIR)
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
                 rows = conn.execute(
                     'SELECT date FROM snapshots ORDER BY date'
                 ).fetchall()
@@ -717,7 +717,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
             try:
                 stats = vr.rehydrate_filesystem(
                     conn, os.path.join(tmp, 'no-such-icloud'),
-                    host.STAGING_SNAPSHOTS_DIR)
+                    host.DOWNLOADS_SNAPSHOTS_DIR)
                 n = conn.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0]
             finally:
                 conn.close()
@@ -741,7 +741,7 @@ class TestRehydrateFilesystem(unittest.TestCase):
             conn = sqlite3.connect(db)
             try:
                 stats = vr.rehydrate_filesystem(
-                    conn, icloud, host.STAGING_SNAPSHOTS_DIR)
+                    conn, icloud, host.DOWNLOADS_SNAPSHOTS_DIR)
             finally:
                 conn.close()
         # Log file is not counted as a file_without_events.
@@ -791,7 +791,7 @@ class _CLIBase(unittest.TestCase):
         # cli() mutates host.* and snapshot_mover.* globals; restore them so
         # one test doesn't pollute the next.
         saved = (
-            host.STAGING_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+            host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
             snapshot_mover.ICLOUD_SNAPSHOTS_DIR, snapshot_mover.LOG_DIR,
         )
         buf = io.StringIO()
@@ -799,7 +799,7 @@ class _CLIBase(unittest.TestCase):
             with redirect_stdout(buf):
                 rc = vr.cli(args)
         finally:
-            (host.STAGING_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+            (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
              snapshot_mover.ICLOUD_SNAPSHOTS_DIR, snapshot_mover.LOG_DIR) = saved
         return rc, buf.getvalue()
 
@@ -1036,7 +1036,7 @@ class TestEndToEnd(unittest.TestCase):
 
         with patch.object(host, 'LOG_DIR', log_dir), \
              patch.object(host, 'DB_FILE', db_path), \
-             patch.object(host, 'STAGING_SNAPSHOTS_DIR', src), \
+             patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', src), \
              patch.object(sys, 'stdin',  stdin), \
              patch.object(sys, 'stdout', stdout):
             host.main()
@@ -1099,13 +1099,13 @@ class TestEndToEnd(unittest.TestCase):
 
             # Run a mover + seal pass against these paths.
             saved = (
-                snapshot_mover.STAGING_SNAPSHOTS_DIR,
+                snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
                 snapshot_mover.LOG_DIR,
                 snapshot_mover.DB_FILE,
             )
             try:
-                snapshot_mover.STAGING_SNAPSHOTS_DIR = src
+                snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR = src
                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR    = dest
                 snapshot_mover.LOG_DIR                 = log_dir
                 snapshot_mover.DB_FILE                 = db
@@ -1117,7 +1117,7 @@ class TestEndToEnd(unittest.TestCase):
                 snapshot_mover._orphan_log_merge_pass(conn)
                 conn.close()
             finally:
-                (snapshot_mover.STAGING_SNAPSHOTS_DIR,
+                (snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
                  snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
                  snapshot_mover.LOG_DIR,
                  snapshot_mover.DB_FILE) = saved
@@ -1126,14 +1126,14 @@ class TestEndToEnd(unittest.TestCase):
             before = self._snapshot_tables(db)
             os.unlink(db)
 
-            saved2 = (host.STAGING_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+            saved2 = (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
                       snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
                       snapshot_mover.LOG_DIR)
             try:
                 rc = vr.cli(['--log-dir', log_dir, '--db', db,
                              '--source', src, '--dest', dest])
             finally:
-                (host.STAGING_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
+                (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
                  snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
                  snapshot_mover.LOG_DIR) = saved2
             self.assertEqual(rc, 0)
