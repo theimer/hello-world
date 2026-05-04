@@ -8,11 +8,7 @@ Files and directories managed:
   browser-visits-mover.log                 — snapshot mover process log   (BVL_MOVER_LOG)
   browser-visits-verifier.log              — snapshot verifier process log (BVL_VERIFIER_LOG)
   browser-visits.db                        — SQLite visit database        (BVL_DB_FILE)
-  ~/Library/Application Support/browser-visit-logger/inbox/  — local staging dir
-                                              (snapshots host.py has relocated out
-                                              of ~/Downloads, awaiting the mover)
-  ~/Downloads/browser-visit-snapshots/     — Chrome's drop point (host.py
-                                              normally clears it on each invocation)
+  ~/Downloads/browser-visit-snapshots/     — local snapshot staging dir
   ~/Documents/browser-visit-logger/        — iCloud-synced archive (snapshots and any
                                               other future data under this directory)
 
@@ -21,7 +17,7 @@ Usage:
     python reset.py --log           # reset only the per-day visit logs in BVL_LOG_DIR
     python reset.py --host-log      # reset only the host, mover, and verifier process logs
     python reset.py --db            # reset only the database
-    python reset.py --snapshots     # reset only the staging + Downloads snapshot dirs
+    python reset.py --snapshots     # reset only the local Downloads snapshots dir
     python reset.py --icloud        # reset only the iCloud archive directory
     python reset.py -f              # skip confirmation prompt
 
@@ -45,11 +41,8 @@ HOST_LOG     = os.environ.get('BVL_HOST_LOG',      os.path.join(HOME, 'browser-v
 MOVER_LOG    = os.environ.get('BVL_MOVER_LOG',     os.path.join(HOME, 'browser-visits-mover.log'))
 VERIFIER_LOG = os.environ.get('BVL_VERIFIER_LOG',  os.path.join(HOME, 'browser-visits-verifier.log'))
 DB_FILE      = os.environ.get('BVL_DB_FILE',       os.path.join(HOME, 'browser-visits.db'))
-DOWNLOADS_DIR = os.environ.get('BVL_DOWNLOADS_SNAPSHOTS_DIR',
-                               os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'))
-STAGING_DIR   = os.environ.get('BVL_STAGING_SNAPSHOTS_DIR',
-                               os.path.join(HOME, 'Library', 'Application Support',
-                                            'browser-visit-logger', 'inbox'))
+SNAP_DIR   = os.environ.get('BVL_DOWNLOADS_SNAPSHOTS_DIR',
+                            os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'))
 
 # Per-day visit logs follow `browser-visits-YYYY-MM-DD.log`.  Strict regex so
 # we don't accidentally match the host/mover/verifier process logs (which
@@ -93,7 +86,7 @@ def main() -> None:
     parser.add_argument('--host-log',  action='store_true', help='reset only the host, mover, and verifier process logs')
     parser.add_argument('--db',        action='store_true', help='reset only the database')
     parser.add_argument('--snapshots', action='store_true',
-                        help='reset only the local staging + Downloads snapshot directories')
+                        help='reset only the local Downloads snapshots directory')
     parser.add_argument('--icloud',    action='store_true',
                         help='reset only the iCloud archive directory')
     parser.add_argument('-f', '--force', action='store_true', help='skip confirmation prompt')
@@ -126,8 +119,7 @@ def main() -> None:
     if do_db:
         targets.append((DB_FILE,    'database',                        'file'))
     if do_snapshots:
-        targets.append((STAGING_DIR,   'staging snapshots directory',     'dir'))
-        targets.append((DOWNLOADS_DIR, 'Downloads snapshots directory',   'dir'))
+        targets.append((SNAP_DIR,   'Downloads snapshots directory',   'dir'))
     if do_icloud:
         targets.append((ICLOUD_DIR, 'iCloud archive directory',        'dir'))
 
