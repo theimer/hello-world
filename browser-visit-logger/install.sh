@@ -224,6 +224,54 @@ if [[ "$OS" == "Darwin" ]]; then
   build_app_bundle \
     "$VERIFIER_APP" "$VERIFIER_APP_BUNDLE_ID" "$VERIFIER_APP_NAME" \
     "$VERIFIER_PY_ABS"
+
+  # ---------------------------------------------------------------------
+  # Validation step (temporary): swap the verifier bundle's shell-script
+  # entrypoint for a code-signed Swift Mach-O binary.  The shell-script
+  # entrypoint hits /bin/bash → env → python3 on exec, which strips the
+  # bundle's TCC identity by the time os.listdir runs.  A Mach-O binary
+  # signed as part of the bundle is what TCC actually attributes against.
+  #
+  # The Swift binary here only does a TCC probe (listdir Downloads +
+  # Documents) and exits — it does NOT do sweep / seal / verify yet.
+  # While this is in place the verifier is in test mode.  Once we've
+  # confirmed the launchd-spawned binary inherits the bundle's TCC
+  # grant, the full Swift port replaces this minimal probe.
+  #
+  # If `swift` isn't available, fall through with the shell-script
+  # entrypoint (no validation, but no regression either).
+  # ---------------------------------------------------------------------
+  SWIFT_DIR="$SCRIPT_DIR/swift"
+  if [[ -d "$SWIFT_DIR" ]] && command -v swift >/dev/null 2>&1; then
+    info "Building Swift TCC-validation binary (this may take ~20 s on first run)..."
+    if ( cd "$SWIFT_DIR" && swift build -c release ) >/dev/null; then
+      SWIFT_BIN="$SWIFT_DIR/.build/release/BVLVerifier"
+      if [[ -x "$SWIFT_BIN" ]]; then
+        cp "$SWIFT_BIN" "$VERIFIER_APP/Contents/MacOS/$VERIFIER_APP_NAME"
+        codesign --force --deep --sign - "$VERIFIER_APP" 2>/dev/null
+        info "Verifier bundle now uses Swift Mach-O binary as entrypoint."
+        info "  ⚠️  bundle signature changed — any prior FDA / Files-and-"
+        info "      Folders grant for $VERIFIER_APP_NAME has been invalidated"
+        info "      and must be re-granted (see post-install instructions)."
+        SWIFT_VALIDATION=1
+      else
+        info "WARNING: swift build succeeded but $SWIFT_BIN not found; "
+        info "         leaving the shell-script entrypoint in place."
+        SWIFT_VALIDATION=0
+      fi
+    else
+      info "WARNING: swift build failed; leaving the shell-script "
+      info "         entrypoint in place.  Run 'cd swift && swift build' "
+      info "         manually to see the error."
+      SWIFT_VALIDATION=0
+    fi
+  else
+    info "Skipping Swift validation step — 'swift' not in PATH or "
+    info "swift/ directory missing.  Verifier will use the Python "
+    info "shell-script entrypoint."
+    SWIFT_VALIDATION=0
+  fi
+
   HOST_BUNDLE_EXEC="$HOST_APP/Contents/MacOS/$HOST_APP_NAME"
   VERIFIER_BUNDLE_EXEC="$VERIFIER_APP/Contents/MacOS/$VERIFIER_APP_NAME"
 else
@@ -232,6 +280,7 @@ else
   # script paths.
   HOST_BUNDLE_EXEC="$HOST_PY_ABS"
   VERIFIER_BUNDLE_EXEC="$VERIFIER_PY_ABS"
+  SWIFT_VALIDATION=0
 fi
 
 # ---------------------------------------------------------------------------
@@ -373,6 +422,63 @@ fi
 # ---------------------------------------------------------------------------
 # Step 10: Print next-step instructions
 # ---------------------------------------------------------------------------
+if [[ "${SWIFT_VALIDATION:-0}" -eq 1 ]]; then
+cat <<EOF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Browser Visit Logger — Swift TCC validation mode
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The verifier bundle's entrypoint is now a code-signed Swift binary
+that probes ~/Downloads and ~/Documents and exits.  The host bundle
+still runs the Python host.py.  The full Swift port doesn't happen
+until we've confirmed this binary inherits the bundle's TCC grant.
+
+To run the validation:
+
+  1. Open System Settings → Privacy & Security → Full Disk Access.
+
+     a. If "$VERIFIER_APP_NAME" is in the list, REMOVE it (the bundle
+        signature changed when the entrypoint was swapped, so the old
+        grant is bound to a stale identity that no longer matches).
+        Click the entry, then the "−" button.
+
+     b. Re-add it: click "+" and navigate to
+          $VERIFIER_APP
+        (drag from Finder also works.)
+
+     c. Toggle the new entry ON.
+
+  2. Force a verifier tick from the Terminal:
+
+       launchctl kickstart -k gui/\$(id -u)/$VERIFIER_PLIST_LABEL
+
+  3. Read the result:
+
+       cat ~/browser-visits-verifier.log
+
+     Look for a line matching one of:
+       [BVLVerifier-swift …] RESULT: Swift bundle has TCC for both …
+         → SUCCESS.  The bundle approach works.  Reply to confirm and
+           we'll proceed with the full Swift port.
+
+       [BVLVerifier-swift …] RESULT: at least one probe failed …
+         → FAILURE.  Even the Mach-O bundle doesn't get TCC.  We'll
+           pivot to changing Chrome's downloads dir or extension-side
+           byte streaming.
+
+While this is in place, the verifier is in test mode — no sweep, no
+seal, no manifest writes.  The host bundle is unaffected and will
+continue to attempt synchronous archive on every tag (it'll keep
+hitting EPERM until the full port lands, but that's expected).
+
+Extension ID    : $EXTENSION_ID
+Extension dir   : $EXTENSION_DIR
+Native host     : $HOST_BUNDLE_EXEC
+Verifier (test) : $VERIFIER_BUNDLE_EXEC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+else
 cat <<EOF
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -420,3 +526,4 @@ To run the verifier on demand:
 If Chrome shows a different extension ID, re-run this script to regenerate.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
+fi
