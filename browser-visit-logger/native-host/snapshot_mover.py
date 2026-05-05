@@ -1,60 +1,37 @@
 #!/usr/bin/env python3
 """
-snapshot_mover.py — Periodically archive snapshot files from the local
-Downloads folder to the iCloud-synced Documents folder, updating the
-SQLite database to point at the new location, and sealing each daily
-archive directory once its UTC date has fully passed.
+snapshot_mover.py — Library of snapshot-archive helpers shared between
+host.py (which archives one file at tag time) and snapshot_verifier.py
+(which periodically sweeps for stragglers, seals completed days, and
+verifies sealed manifests).
 
-Designed to be run by a launchd LaunchAgent every N seconds (default 1 h);
-each invocation does one pass and exits.
+This module is no longer a standalone executable.  It exposes:
 
-Algorithm
----------
-1. mkdir -p ICLOUD_SNAPSHOTS_DIR.
-2. Open the SQLite database.
-3. Ensure the `snapshots` table exists (one row per daily directory the
-   mover has ever created; stores its sealed flag).
-4. Move pass — scan the Downloads directory for snapshot files:
-     For each file whose name matches the snapshot format
-     '<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>' and whose mtime is at least
-     MIN_AGE_SECONDS old:
-       a. Derive the UTC date from the filename prefix.
-       b. mkdir -p ICLOUD_SNAPSHOTS_DIR/<YYYY-MM-DD>/
-       c. shutil.copy2(source, dest)          — preserves mtime; safe to repeat
-       d. os.chmod(dest, 0o444)               — make archived copy read-only
-       e. UPDATE {read,skimmed}_events SET directory = <date_subdir>
-          WHERE filename = <this file> AND directory = DOWNLOADS_SNAPSHOTS_DIR
-       f. INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (<date>, 0)
-       g. commit()
-       h. source.unlink()
-       i. Straggler handling — if the snapshots row for <date> was already
-          sealed=1 before step (f), the file is a straggler arriving after
-          the day was sealed.  Remove the existing read-only manifest and
-          rewrite it so it now includes the just-moved file.  The sealed
-          flag stays 1.
-5. Seal pass — DB-driven (no filesystem rescan):
-     SELECT date FROM snapshots WHERE sealed = 0 AND date < today_utc.
-     For each row:
-       a. Verify ICLOUD_SNAPSHOTS_DIR/<date>/ exists; warn and skip if not.
-       b. If MANIFEST.tsv already exists (recovery from a partial prior
-          seal that crashed between the file write and the DB update),
-          leave the file alone.
-          Otherwise: list every file in the directory, look up its row in
-          read_events / skimmed_events (joined with visits for the page
-          title), write a tab-delimited MANIFEST.tsv (header + one data
-          row per file: filename, tag, timestamp, url, title), and chmod
-          it 0o444.  Files with no DB row appear with empty metadata.
-       c. UPDATE snapshots SET sealed = 1 WHERE date = <date>.
-6. Close the DB.
+    archive_for_tag(conn, filename)
+        Synchronously archive a single snapshot the user just tagged:
+        copy from ~/Downloads/browser-visit-snapshots/ to the matching
+        iCloud date subdir, chmod read-only, update the events row's
+        directory column, insert the snapshots row.  Called by host.py
+        after the events row insert.
 
-The filesystem scan (rather than a DB query) means that any file left in
-Downloads by a failed prior run is automatically retried — no special
-"orphan sweep" is required.  Crash-safety analysis:
+    sweep_pass(conn, dry_run=False)
+        Scan ~/Downloads/browser-visit-snapshots/ for stragglers — files
+        left behind by a host.py crash between Chrome's download and the
+        archive.  Files at least MIN_AGE_SECONDS old are archived.
+        Called by the verifier.
 
-  Crash after (c) only:  source still present, dest exists → next run copies
-    again (copy2 overwrites safely), updates DB, unlinks.  ✓
-  Crash after (e)/(f):   source still present, DB already points to iCloud
-    → next run re-copies, UPDATE matches 0 rows (no-op), then unlinks.  ✓
+    seal_pass(conn, dry_run=False)
+        DB-driven: for every snapshots row where sealed=0 AND date<today,
+        write MANIFEST.tsv into the date subdir, move the per-day log
+        into the dir, flip sealed=1.  Called by the verifier.
+
+    orphan_log_merge_pass(conn)
+        Anti-entropy: scan LOG_DIR for past-day per-day logs and reconcile
+        them with their iCloud counterparts.  Called by the verifier.
+
+    escalate_errors(conn)
+        Walk currently-unresolved mover_errors rows and notify the user
+        about ones that warrant it.  Called by the verifier.
 
 Filename convention
 -------------------
@@ -66,7 +43,8 @@ record time:
 The date portion (first 10 characters) determines the iCloud date subdir:
     ICLOUD_SNAPSHOTS_DIR/2026-04-30/2026-04-30T14-35-22Z-abc123.mhtml
 
-Files in Downloads that do not match this format are silently skipped.
+Files in the source dir that do not match this format are skipped (and
+flagged as 'invalid_filename' errors so the user is notified).
 
 Configuration
 -------------
@@ -75,31 +53,16 @@ DOWNLOADS_SNAPSHOTS_DIR  — BVL_DOWNLOADS_SNAPSHOTS_DIR, default ~/Downloads/br
 ICLOUD_SNAPSHOTS_DIR     — BVL_ICLOUD_SNAPSHOTS_DIR,    default ~/Documents/browser-visit-logger/snapshots
 MIN_AGE_SECONDS          — BVL_MOVER_MIN_AGE_SECONDS,   default 60 (1 min)
 
-Logging is to stderr; the launchd plist routes stderr to a log file.
+Crash-safety
+------------
+File-copy idempotency means an interrupted run is recovered on the next:
 
-Manual invocation (for testing)
--------------------------------
-The script is run hourly by launchd in normal operation, but it can also
-be invoked from a terminal — useful for ad-hoc testing or one-off archive
-sweeps.
-
-    # do one pass with the configured defaults
-    python3 native-host/snapshot_mover.py
-
-    # show what would be moved without touching anything
-    python3 native-host/snapshot_mover.py --dry-run --verbose
-
-    # ignore the 1-minute age gate (move everything immediately)
-    python3 native-host/snapshot_mover.py --min-age-seconds 0
-
-    # operate on isolated paths (e.g. against a test DB)
-    python3 native-host/snapshot_mover.py \\
-        --db /tmp/test.db --source /tmp/src --dest /tmp/dst
-
-CLI flags override env vars, which override defaults.
+  Crash after copy2 only:  source still present, dest exists → next run
+    copies again (copy2 overwrites safely), updates DB, unlinks.  ✓
+  Crash after UPDATE/INSERT:  source still present, DB already points to
+    iCloud → next run re-copies, UPDATE matches 0 rows (no-op), unlinks.  ✓
 """
 
-import argparse
 import datetime
 import errno
 import logging
@@ -460,12 +423,16 @@ def _applescript_quote(s):
     """Escape a string for safe interpolation into AppleScript."""
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
-logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s [snapshot_mover] %(message)s',
-)
+# Library: don't configure root logging at import time (bad practice —
+# would override callers' setup).  Just create the named logger and set
+# its level; messages propagate to whatever the application has wired
+# up.  Standalone callers (snapshot_sealer, snapshot_verifier) call
+# logging.basicConfig in their CLI entry points; host.py explicitly
+# attaches its host-log file handler to this logger so archive_for_tag
+# failures surface in ~/browser-visits-host.log instead of being
+# discarded with Chrome's stderr capture.
 logger = logging.getLogger('snapshot_mover')
+logger.setLevel(logging.INFO)
 
 # Matches the permanent snapshot filename format assigned by host.py:
 #   <YYYY-MM-DD>T<HH>-<MM>-<SS>Z-<hash>.<ext>
@@ -916,16 +883,100 @@ def _lookup_event(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# High-level helpers — entry points for callers (host.py, verifier).
 # ---------------------------------------------------------------------------
 
-def main(dry_run: bool = False) -> None:
-    """Run a single mover pass against the current module-level constants.
+def archive_for_tag(conn: sqlite3.Connection, filename: str) -> None:
+    """Archive one snapshot file synchronously, called by host.py at tag time.
 
-    Wraps the body in a top-level catch so that any unexpected exception is
-    recorded as an `op='top_level'` row (immediate-category, so the user is
-    notified on the first occurrence) and surfaced via _escalate_errors,
-    *then* re-raised so launchd captures the traceback in the log.
+    `filename` is the path Chrome reported in the native message (typically
+    'browser-visit-snapshots/<YYYY-MM-DDTHH-MM-SSZ>-<hash>.<ext>',
+    relative to ~/Downloads).  Only the basename is used.
+
+    Best-effort: failures are logged and recorded in mover_errors so the
+    next sweep pass retries.  The events row is assumed to have been
+    written already (with directory=DOWNLOADS_SNAPSHOTS_DIR); this call's
+    UPDATE flips it to the iCloud date subdir on success.
+
+    No age gate: host.py is invoked by Chrome only after the download
+    finished, so we know the file is complete.
+    """
+    basename = os.path.basename(filename)
+    if not basename:
+        return
+    source = os.path.join(DOWNLOADS_SNAPSHOTS_DIR, basename)
+    m = _SNAPSHOT_FILENAME_RE.match(basename)
+    if not m:
+        logger.error(
+            'archive_for_tag: %s does not match snapshot filename format',
+            source)
+        _try_record_error(
+            conn, 'invalid_filename', source,
+            ValueError('filename does not match snapshot format'))
+        return
+    if not os.path.isfile(source):
+        # File missing at the expected location.  Could be a Chrome
+        # rename race, an aborted download, or already-swept.  No-op;
+        # the next sweep pass handles it if the file shows up later.
+        logger.warning(
+            'archive_for_tag: source %s not present; skipping', source)
+        return
+    date_str = m.group(1)
+    _move_one(conn, source, basename, date_str)
+
+
+def sweep_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
+    """Sweep ~/Downloads/browser-visit-snapshots/ for stragglers.
+
+    Public alias for the move pass — the verifier runs this on every
+    tick to recover any files left behind by a host.py crash between
+    Chrome's download and the synchronous archive.  MIN_AGE_SECONDS
+    gate ensures we don't move a file Chrome is still writing.
+    """
+    _move_pass(conn, dry_run=dry_run)
+
+
+def seal_pass(conn: sqlite3.Connection, dry_run: bool = False) -> None:
+    """Seal completed days.  Public alias for the seal pass."""
+    _seal_pass(conn, dry_run=dry_run)
+
+
+def orphan_log_merge_pass(conn: sqlite3.Connection) -> None:
+    """Anti-entropy on per-day log files.  Public alias."""
+    _orphan_log_merge_pass(conn)
+
+
+def escalate_errors(conn: sqlite3.Connection) -> None:
+    """Notify user about persistent / catastrophic mover_errors rows.
+    Public alias."""
+    _escalate_errors(conn)
+
+
+def fetch_pending_errors(conn):
+    """SELECT all mover_errors rows, ordered for stable indexing.
+
+    Used by the verifier's --show-errors / --clear-error CLI operations.
+    """
+    return conn.execute(
+        "SELECT key, operation, target, message, attempts, "
+        "       first_seen, last_seen, notified "
+        "FROM mover_errors "
+        "ORDER BY first_seen ASC, key ASC"
+    ).fetchall()
+
+
+def main(dry_run: bool = False) -> None:
+    """Open the DB and run sweep + seal + orphan-log-merge + escalate, in order.
+
+    This is a library convenience used by tests that want to exercise
+    the integrated pass without going through snapshot_verifier.run_tick
+    (which additionally verifies sealed manifests).  Production code
+    paths use snapshot_verifier.run_tick or call the individual passes
+    directly.
+
+    Wraps the body in a top-level catch so any unexpected exception is
+    recorded as op='top_level' (immediate-category, surfaced via
+    _escalate_errors) and then re-raised.
     """
     conn = None
     try:
@@ -942,8 +993,6 @@ def main(dry_run: bool = False) -> None:
             _orphan_log_merge_pass(conn)
         _escalate_errors(conn)
     except Exception as exc:
-        # Top-level: best-effort record + escalate, then fall back to a
-        # direct notification if the DB path is broken, then re-raise.
         try:
             if conn is None:
                 conn = sqlite3.connect(DB_FILE)
@@ -963,163 +1012,3 @@ def main(dry_run: bool = False) -> None:
     finally:
         if conn is not None:
             conn.close()
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point — for manual / testing invocation
-# ---------------------------------------------------------------------------
-
-def _parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog='snapshot_mover.py',
-        description='Move browser-snapshot files from the local Downloads dir '
-                    'to the iCloud-synced Documents archive.',
-    )
-    p.add_argument('--dry-run', action='store_true',
-                   help='report what would happen without touching files or the DB')
-    p.add_argument('-v', '--verbose', action='store_true',
-                   help='enable DEBUG logging')
-    p.add_argument('--min-age-seconds', type=int, metavar='N',
-                   help=f'override the file-age threshold '
-                        f'(default {MIN_AGE_SECONDS}s)')
-    p.add_argument('--error-threshold', type=int, metavar='N',
-                   help=f'override the persistent-error notification threshold '
-                        f'(default {MOVER_ERROR_THRESHOLD})')
-    p.add_argument('--source', metavar='DIR',
-                   help=f'override the source (Downloads) directory '
-                        f'(default {DOWNLOADS_SNAPSHOTS_DIR})')
-    p.add_argument('--dest', metavar='DIR',
-                   help=f'override the destination (iCloud) directory '
-                        f'(default {ICLOUD_SNAPSHOTS_DIR})')
-    p.add_argument('--db', metavar='FILE',
-                   help=f'override the SQLite database path '
-                        f'(default {DB_FILE})')
-    # Error-table inspection / acknowledgement.  Mutually exclusive with
-    # each other; specifying any of them skips the move/seal pass.
-    g = p.add_mutually_exclusive_group()
-    g.add_argument('--show-errors', action='store_true',
-                   help='print the pending mover_errors table rows and exit')
-    g.add_argument('--clear-errors', action='store_true',
-                   help='delete every row from mover_errors and exit')
-    g.add_argument('--clear-error', type=int, metavar='N',
-                   help='delete the Nth row (1-indexed, matching '
-                        '--show-errors order) from mover_errors and exit')
-    return p.parse_args(argv)
-
-
-def _apply_args(args: argparse.Namespace) -> None:
-    """Apply parsed CLI args to module-level constants and the logger."""
-    global DOWNLOADS_SNAPSHOTS_DIR, ICLOUD_SNAPSHOTS_DIR, DB_FILE
-    global MIN_AGE_SECONDS, MOVER_ERROR_THRESHOLD
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    if args.source is not None:
-        DOWNLOADS_SNAPSHOTS_DIR = args.source
-    if args.dest is not None:
-        ICLOUD_SNAPSHOTS_DIR = args.dest
-    if args.db is not None:
-        DB_FILE = args.db
-    if args.min_age_seconds is not None:
-        MIN_AGE_SECONDS = args.min_age_seconds
-    if args.error_threshold is not None:
-        MOVER_ERROR_THRESHOLD = args.error_threshold
-
-
-def cli(argv=None) -> int:
-    """Parse argv, apply overrides, run one mover pass (or one error CLI op).
-
-    Returns the process exit code (0 on success, non-zero on user-visible
-    error CLI failures such as out-of-range --clear-error).
-    """
-    args = _parse_args(argv)
-    _apply_args(args)
-    if args.show_errors:
-        return _cli_show_errors()
-    if args.clear_errors:
-        return _cli_clear_errors()
-    if args.clear_error is not None:
-        return _cli_clear_error(args.clear_error)
-    main(dry_run=args.dry_run)
-    return 0
-
-
-def _open_errors_conn():
-    """Open the DB and ensure the mover_errors table exists.  The error CLI
-    flags create the DB if missing — handy for users who haven't yet
-    triggered any mover activity."""
-    conn = sqlite3.connect(DB_FILE)
-    _ensure_mover_errors_table(conn)
-    return conn
-
-
-def _fetch_pending_errors(conn):
-    """SELECT all rows ordered for stable indexing."""
-    return conn.execute(
-        "SELECT key, operation, target, message, attempts, "
-        "       first_seen, last_seen, notified "
-        "FROM mover_errors "
-        "ORDER BY first_seen ASC, key ASC"
-    ).fetchall()
-
-
-def _cli_show_errors() -> int:
-    conn = _open_errors_conn()
-    try:
-        rows = _fetch_pending_errors(conn)
-    finally:
-        conn.close()
-    if not rows:
-        print('No pending mover errors.')
-        return 0
-    print(f'Pending mover errors ({len(rows)}):')
-    print()
-    for i, (_key, op, target, message, attempts, first_seen,
-            last_seen, notified) in enumerate(rows, start=1):
-        target_repr = target or '(no target)'
-        print(f'  [{i}] {op}: {target_repr}')
-        print(f'      attempts: {attempts} '
-              f'(since {first_seen}, last {last_seen})')
-        print(f'      error:    {message}')
-        hint = _FIX_HINTS.get(op)
-        if hint:
-            print(f'      fix:      {hint}')
-        print(f'      notified: {"yes" if notified else "no"}')
-        print()
-    return 0
-
-
-def _cli_clear_errors() -> int:
-    conn = _open_errors_conn()
-    try:
-        cursor = conn.execute("DELETE FROM mover_errors")
-        conn.commit()
-        n = cursor.rowcount
-    finally:
-        conn.close()
-    print(f'Cleared {n} error row{"" if n == 1 else "s"}.')
-    return 0
-
-
-def _cli_clear_error(n: int) -> int:
-    conn = _open_errors_conn()
-    try:
-        rows = _fetch_pending_errors(conn)
-        if not rows:
-            print('No pending mover errors to clear.', file=sys.stderr)
-            return 1
-        if n < 1 or n > len(rows):
-            print(f'No error at index {n} (table has {len(rows)} row'
-                  f'{"" if len(rows) == 1 else "s"}).',
-                  file=sys.stderr)
-            return 1
-        key, op, target = rows[n - 1][0], rows[n - 1][1], rows[n - 1][2]
-        conn.execute("DELETE FROM mover_errors WHERE key = ?", (key,))
-        conn.commit()
-    finally:
-        conn.close()
-    print(f'Cleared error [{n}]: {op}: {target or "(no target)"}')
-    return 0
-
-
-if __name__ == '__main__':  # pragma: no cover
-    sys.exit(cli())

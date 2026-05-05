@@ -22,11 +22,13 @@ Tag action (from popup.js / background.js):
       auto-log hasn't fired yet), then update of_interest, read, or skimmed;
       append 4-field TSV line.
       For "read" and "skimmed": Chrome saves a snapshot and sends its filename
-      (Chrome's relative path under ~/Downloads). This host normalizes the
-      filename to its basename and records both the basename and the parent
-      directory (initially the Downloads snapshots dir). A separate periodic
-      mover (snapshot_mover.py) later copies the file to the iCloud directory
-      and updates the directory column in place.
+      (Chrome's relative path under ~/Downloads). After inserting the events
+      row (initially with directory = ~/Downloads/browser-visit-snapshots/),
+      this host *synchronously* archives the file into the matching iCloud
+      date subdir via snapshot_mover.archive_for_tag, which updates the
+      events row's directory column in the same transaction.  If the archive
+      fails, the events row is left pointing at Downloads and the periodic
+      verifier sweep will retry on its next tick.
 
 Schema
 ------
@@ -64,8 +66,18 @@ Log file layout
 ---------------
 The visit log is split per UTC day: <LOG_DIR>/browser-visits-<YYYY-MM-DD>.log.
 Each invocation pins its date at start (so action+result lines stay together
-even across midnight UTC).  The sealer (snapshot_mover.py) moves each day's
-log into the matching iCloud snapshot directory once the day is complete.
+even across midnight UTC).  The verifier later moves each day's log into
+the matching iCloud snapshot directory once the day is complete.
+
+TCC / app bundle
+----------------
+host.py runs inside a code-signed app bundle (BrowserVisitLoggerHost.app)
+so it has its own stable TCC identity.  The user grants the app
+Files & Folders → Downloads access (and ~/Documents access) once on
+first run; from then on the synchronous archive in archive_for_tag can
+read Downloads and write the iCloud-synced Documents subdir.  Without
+the bundle, Chrome-spawned native messaging hosts run with no TCC grant
+and every Downloads access fails with EPERM.
 """
 
 import datetime
@@ -77,6 +89,8 @@ import struct
 import sys
 import uuid
 from logging.handlers import RotatingFileHandler
+
+import snapshot_mover
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +123,12 @@ _handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger('bvl')
 logger.setLevel(logging.DEBUG)
 logger.addHandler(_handler)
+
+# Surface snapshot_mover's log lines (archive_for_tag warnings, _move_one
+# info/error) in the same host log.  Without this, Chrome discards
+# stderr from native messaging hosts and any archive failure would be
+# invisible.
+snapshot_mover.logger.addHandler(_handler)
 
 # ---------------------------------------------------------------------------
 # Native messaging I/O
@@ -420,9 +440,18 @@ def main() -> None:
     # background auto-log hasn't finished writing yet.  Also INSERT OR IGNORE a
     # snapshots row for today so the seal pass picks up activity-only days
     # uniformly with snapshot-bearing days.
+    #
+    # For read/skimmed tags with a filename, the events row is inserted first
+    # (pointing at the Downloads dir), then snapshot_mover.archive_for_tag
+    # synchronously copies the file to the iCloud date subdir and UPDATEs
+    # the events row's directory column.  Doing the archive on the host
+    # process means we benefit from the bundle's TCC grant; doing it after
+    # the events insert means a mid-archive crash leaves a recoverable
+    # state (file in Downloads, events row points there, sweep retries).
     try:
         conn = sqlite3.connect(DB_FILE)
         ensure_db(conn)
+        snapshot_mover._ensure_mover_errors_table(conn)
         conn.execute(
             "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
             (today_iso,),
@@ -431,6 +460,8 @@ def main() -> None:
         insert_visit(conn, timestamp, url, title)
         if tag:
             tag_visit(conn, url, tag, timestamp, filename)
+            if tag in ('read', 'skimmed') and filename:
+                snapshot_mover.archive_for_tag(conn, filename)
         conn.close()
     except Exception as exc:
         logger.error('SQLite write failed: %s', exc)

@@ -31,11 +31,21 @@ directly to avoid Chrome's mangled PDF viewer output). Each file is named
 from the click timestamp so the file's name is permanent and globally
 sortable.
 
-Snapshots land first in `~/Downloads/browser-visit-snapshots/`. A
-background mover then archives them into
-`~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/`, makes them
-read-only, and (once the day has fully passed) writes a
-`MANIFEST.tsv` summarising the directory.
+Snapshots land first in `~/Downloads/browser-visit-snapshots/` (Chrome's
+downloads API forces files there).  The native messaging host then
+archives them *synchronously* — same invocation as the tag write — into
+`~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` and chmods
+them read-only.  A daily `snapshot_verifier` LaunchAgent later writes a
+`MANIFEST.tsv` summarising each completed day, moves that day's per-day
+log into the sealed directory, and re-checks already-sealed days for
+drift.
+
+Both processes run inside ad-hoc-signed `.app` bundles so they have
+stable TCC identities — macOS' Privacy & Security framework grants
+~/Downloads and ~/Documents access to apps, not to bare `python3`
+invocations.  The first time you tag a page (and the first time the
+verifier ticks) macOS asks for the relevant Files & Folders permission;
+clicking Allow grants it for the lifetime of the app's signature.
 
 ---
 
@@ -46,9 +56,10 @@ read-only, and (once the day has fully passed) writes a
 | `~/browser-visits-<YYYY-MM-DD>.log` | Per-day TSV append-only log of every visit and tag action.  One file per UTC day; the sealer collects each completed day's log into the matching iCloud sealed dir |
 | `~/browser-visits.db` | SQLite database — `visits`, `read_events`, `skimmed_events`, `snapshots`, `mover_errors` |
 | `~/browser-visits-host.log` | Native host process log (rotated, 1 MiB × 3) |
-| `~/browser-visits-mover.log` | Snapshot mover process log (LaunchAgent stdout/stderr) |
-| `~/browser-visits-verifier.log` | Snapshot verifier process log (LaunchAgent stdout/stderr) |
-| `~/Downloads/browser-visit-snapshots/` | Snapshot staging dir (Chrome writes here) |
+| `~/browser-visits-verifier.log` | Verifier LaunchAgent process log |
+| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerHost.app/` | Code-signed app bundle that wraps `host.py` for TCC attribution |
+| `~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerVerifier.app/` | Code-signed app bundle that wraps `snapshot_verifier.py` for TCC attribution |
+| `~/Downloads/browser-visit-snapshots/` | Chrome's drop point — host.py archives files away on every tag, verifier sweeps stragglers daily |
 | `~/Documents/browser-visit-logger/snapshots/<YYYY-MM-DD>/` | Sealed daily archive: read-only snapshot files + read-only `MANIFEST.tsv` + read-only `browser-visits-<YYYY-MM-DD>.log` |
 
 All paths can be overridden via `BVL_*` environment variables — see
@@ -95,22 +106,27 @@ mover_errors (
 ```
 
 The `visits` / `*_events` tables are owned by `host.py`; the `snapshots`
-and `mover_errors` tables are owned by the mover and sealer. The mover
-INSERTs a `snapshots` row (`sealed=0`) the first time it places a file
-in a new daily directory; the seal pass and the manual sealer flip
-`sealed=1`. The seal pass queries this table to find work — no
-filesystem rescan needed. The `mover_errors` table tracks unresolved
-mover failures so they can be surfaced to the user — see
+and `mover_errors` tables are co-owned by `host.py` and the verifier.
+`host.py` INSERTs a `snapshots` row (`sealed=0`) on every write
+invocation (covers activity-only days), and the synchronous archive in
+`archive_for_tag` INSERTs one when a file lands in a new daily dir.
+The verifier's seal pass flips `sealed=1` once the day has fully
+passed.  The seal pass queries this table to find work — no
+filesystem rescan needed.  The `mover_errors` table tracks unresolved
+failures from any of the passes (move / seal / rewrite_manifest /
+manifest_invalid / orphan_file / invalid_filename / top_level) so they
+can be surfaced to the user — see
 [When something goes wrong](#when-something-goes-wrong).
 
 ---
 
 ## Installation
 
-Tested on macOS with Chrome / Chrome Canary / Chromium. Linux works for
-the extension and host but not the LaunchAgent-driven mover.
+Tested on macOS with Chrome / Chrome Canary / Chromium.  Linux works
+for the extension and host but not the LaunchAgent-driven verifier.
 
-**Requirements:** `python3` ≥ 3.9, `openssl`.
+**Requirements:** `python3` ≥ 3.9, `openssl`.  On macOS, `codesign`
+(always available with the Xcode Command Line Tools).
 
 ```bash
 git clone <repo>
@@ -118,20 +134,33 @@ cd browser-visit-logger
 bash install.sh
 ```
 
-`install.sh` is idempotent. It:
+`install.sh` is idempotent.  It:
 
-1. Generates a stable RSA key pair (once) and pins the extension ID via
-   the `key` field in `manifest.json`.
-2. Installs the native-messaging host manifest under Chrome's
-   `NativeMessagingHosts` directory.
-3. On macOS, installs and bootstraps two LaunchAgents:
-   - `com.browser.visit.logger.snapshot_mover` (`StartInterval = 3600`s,
-     hourly) — runs the move + seal pass.
-   - `com.browser.visit.logger.snapshot_verifier` (`StartInterval =
-     604800`s, weekly) — anti-entropy: re-checks every sealed
-     directory's manifest against disk + DB; failures escalate
-     immediately via Notification Center.
-4. Prints the extension ID and where to load the unpacked extension.
+1. Generates a stable RSA key pair (once) and pins the extension ID
+   via the `key` field in `manifest.json`.
+2. On macOS, materializes two ad-hoc-signed `.app` bundles under
+   `~/Library/Application Support/browser-visit-logger/`:
+   - `BrowserVisitLoggerHost.app` wraps `native-host/host.py`.  The
+     Chrome native-messaging manifest's `path` points at this bundle's
+     executable, so the spawned process inherits the bundle's TCC
+     identity — Chrome doesn't pass its own TCC grants to native
+     messaging children, but a signed bundle gives the host its own
+     stable identity that the user can grant separately.
+   - `BrowserVisitLoggerVerifier.app` wraps
+     `native-host/snapshot_verifier.py`, with the same TCC reasoning.
+3. Installs the Chrome native-messaging host manifest under each
+   detected browser's `NativeMessagingHosts` directory, with `path`
+   pointing at the host bundle.
+4. Cleans up any previous-generation `snapshot_mover` LaunchAgent
+   (it's been folded into the host and the verifier).
+5. Installs the verifier LaunchAgent
+   (`com.browser.visit.logger.snapshot_verifier`,
+   `StartInterval = 86400`s = daily) pointing at the verifier
+   bundle's executable.
+6. Kicks the verifier once interactively so its first `~/Downloads`
+   read triggers the macOS Files & Folders prompt while you're at
+   the keyboard.
+7. Prints the extension ID and where to load the unpacked extension.
 
 After it finishes:
 
@@ -139,21 +168,36 @@ After it finishes:
 2. **Load unpacked** → select the `extension/` directory.
 3. The extension ID Chrome displays should match the one printed by
    the installer.
-4. Visit any page, then verify with:
+4. **Tag any page once** (★ / ✓ / ~) — macOS will prompt for
+   "BrowserVisitLoggerHost would like to access files in your
+   Downloads folder.  Allow / Don't Allow."  Click Allow.  The same
+   prompt may already have appeared for `BrowserVisitLoggerVerifier`
+   from step 6.
+5. Verify with:
    ```bash
    tail ~/browser-visits-$(date -u +%Y-%m-%d).log
    sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY timestamp DESC LIMIT 10;"
    ```
 
-### Changing the mover cadence (macOS)
+If you ever miss a TCC prompt and the host or verifier silently fails
+EPERM on `~/Downloads`, you can grant it manually in
+**System Settings → Privacy & Security → Files and Folders** (or
+**Full Disk Access** for a broader grant).  The bundles' identities
+are stable across `install.sh` re-runs as long as the wrapped script
+contents don't change.
 
-Edit `StartInterval` in `~/Library/LaunchAgents/com.browser.visit.logger.snapshot_mover.plist`,
+### Changing the verifier cadence (macOS)
+
+Edit `StartInterval` in `~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist`,
 then reload:
 
 ```bash
-launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_mover
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_mover.plist
+launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_verifier
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist
 ```
+
+Common values: `3600` (hourly), `86400` (daily, the default),
+`604800` (weekly).
 
 ---
 
@@ -180,20 +224,20 @@ itself, on failure it shows the error and re-enables the buttons.
 
 ## CLI scripts
 
-All scripts live at the repo root or under `native-host/`. They share
+All scripts live at the repo root or under `native-host/`.  They share
 the same `BVL_*` env-var conventions and accept overriding flags so
 they're safe to point at test data.
 
-The five user-facing Python scripts each have an executable Bash
-wrapper at the repo root for convenience — e.g. `./move_snapshot
---show-errors` instead of `python3 native-host/snapshot_mover.py
---show-errors`. Each wrapper forwards all arguments verbatim and
-intercepts `--help` / `-h` to print a one-line wrapper note before
-delegating to the Python script's own argparse `--help`.
+The four user-facing Python scripts each have an executable Bash
+wrapper at the repo root for convenience — e.g.
+`./verify_snapshot_directory --show-errors` instead of
+`python3 native-host/snapshot_verifier.py --show-errors`.  Each
+wrapper forwards all arguments verbatim and intercepts `--help` / `-h`
+to print a one-line wrapper note before delegating to the Python
+script's own argparse `--help`.
 
 | Wrapper | Underlying script |
 |---------|-------------------|
-| `./move_snapshot` | `native-host/snapshot_mover.py` |
 | `./seal_snapshot_directory` | `native-host/snapshot_sealer.py` |
 | `./verify_snapshot_directory` | `native-host/snapshot_verifier.py` |
 | `./reset_visits_data` | `reset.py` |
@@ -217,77 +261,20 @@ JSON), not a normal CLI. It's launched once per `sendNativeMessage` call.
 
 ### `native-host/snapshot_mover.py`
 
-The periodic archiver. The LaunchAgent runs it hourly; you can also
-invoke it by hand for ad-hoc runs or testing. Each invocation does one
-move pass + one seal pass, then exits.
+**Library only.**  Used to be a standalone executable run hourly by a
+LaunchAgent; that role has been split:
 
-```bash
-# Default run (uses configured paths)
-python3 native-host/snapshot_mover.py
-
-# Show what would happen without touching files or the DB
-python3 native-host/snapshot_mover.py --dry-run --verbose
-
-# Move every file regardless of age (default threshold is 60 s)
-python3 native-host/snapshot_mover.py --min-age-seconds 0
-
-# Operate on isolated paths (useful in tests / experiments)
-python3 native-host/snapshot_mover.py \
-    --db /tmp/test.db --source /tmp/src --dest /tmp/dst
-```
-
-Flags:
-
-| Flag | Effect |
-|------|--------|
-| `--dry-run` | Log intentions but don't write or modify anything |
-| `-v`, `--verbose` | DEBUG log level |
-| `--min-age-seconds N` | Override the file-age threshold (default 60) |
-| `--error-threshold N` | Override the persistent-error notification threshold (default 3) |
-| `--source DIR` | Override `BVL_DOWNLOADS_SNAPSHOTS_DIR` |
-| `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
-| `--db FILE` | Override `BVL_DB_FILE` |
-| `--show-errors` | Print pending mover errors and exit (skips the move/seal pass) |
-| `--clear-errors` | Wipe every row from the `mover_errors` table and exit |
-| `--clear-error N` | Delete the Nth row (1-indexed, matching `--show-errors` order) and exit |
-
-`--show-errors`, `--clear-errors`, and `--clear-error N` are mutually
-exclusive.
-
-**What it does each run:**
-
-1. **Move pass** — for every file in `~/Downloads/browser-visit-snapshots/`
-   matching the snapshot filename format and at least `MIN_AGE_SECONDS`
-   old: copy it to `<dest>/<YYYY-MM-DD>/`, chmod read-only, update the
-   `directory` column in `read_events`/`skimmed_events`, and
-   `INSERT OR IGNORE` a `(date, sealed=0)` row into the `snapshots`
-   table; then unlink the source. **Straggler handling:** if the
-   destination day's `snapshots` row was already `sealed=1`, the
-   existing read-only `MANIFEST.tsv` is removed and rewritten to
-   include the just-moved file (sealed flag stays 1, manifest stays
-   `0o444`). Crash-safe and idempotent — interrupted runs are
-   recovered on the next tick.
-2. **Seal pass** — DB-driven, no filesystem rescan. Queries
-   `snapshots WHERE sealed = 0 AND date < today_utc`. For each row:
-   creates `<dest>/<YYYY-MM-DD>/` if it doesn't yet exist (covers
-   activity-only days where host wrote a per-day log but no snapshot
-   files landed), writes a tab-delimited `MANIFEST.tsv` enumerating
-   the directory's contents and chmods it `0o444`, **moves
-   `<BVL_LOG_DIR>/browser-visits-<date>.log` into the dir and chmods
-   it `0o444`**, then flips `sealed = 1`.  If the manifest write or
-   log move fails, the row stays at `sealed=0` and the next tick
-   retries.
-3. **Orphan-log merge pass** — anti-entropy for the rare case where a
-   host invocation in flight at seal time leaves a result line in
-   `<BVL_LOG_DIR>` after the seal already moved its action half into
-   iCloud.  Each tick the mover scans `BVL_LOG_DIR` for past-day
-   `browser-visits-<date>.log` files; for any whose iCloud
-   counterpart already exists, the orphan is appended into the iCloud
-   copy (chmod 0o644 → append → chmod 0o444) and the orphan is
-   deleted.  For any whose iCloud counterpart doesn't exist (host
-   crashed mid-startup before it could insert the snapshots row),
-   `INSERT OR IGNORE INTO snapshots (date, sealed=0)` so the next
-   normal seal pass picks it up.
+- The synchronous archive at tag time happens in `host.py` via
+  `snapshot_mover.archive_for_tag(conn, filename)`.  No age gate (the
+  Chrome download is known to be complete by the time the native
+  message arrives).  Failures are logged and recorded in
+  `mover_errors`; the next verifier tick's sweep retries.
+- The periodic sweep / seal / orphan-log-merge / escalate work happens
+  in the verifier (see below) via `snapshot_mover.sweep_pass`,
+  `seal_pass`, `orphan_log_merge_pass`, `escalate_errors`.
+- The CLI surface that used to live here (`--show-errors`,
+  `--clear-errors`, `--clear-error N`, `--dry-run`) has moved to
+  `snapshot_verifier.py`.
 
 ### `native-host/snapshot_sealer.py`
 
@@ -344,97 +331,104 @@ spaces.
 
 ### `native-host/snapshot_verifier.py`
 
-Checks that a sealed daily directory's `MANIFEST.tsv` is correct and
-consistent with the database. Designed to be invoked from either a
-terminal (ad-hoc auditing) or a background process (a periodic
-LaunchAgent / cron job).
+The sole background agent.  A daily LaunchAgent invokes it with
+`--quiet`; you can also run it by hand for ad-hoc maintenance.  Each
+default-mode tick (no operation flag) does, in order:
+
+1. **Sweep** — scan `~/Downloads/browser-visit-snapshots/` for
+   stragglers (files left behind by a host.py crash between Chrome's
+   download and the synchronous archive).  Files at least
+   `MIN_AGE_SECONDS` old are archived to `<dest>/<YYYY-MM-DD>/`
+   (chmod `0o444`, events row updated).  Idempotent — interrupted runs
+   recover on the next tick.
+2. **Seal** — DB-driven (no filesystem rescan).  For every snapshots
+   row where `sealed=0 AND date<today_utc`: write `MANIFEST.tsv`,
+   move that day's per-day log into the dir, flip `sealed=1`.  If
+   anything fails, the row stays at `sealed=0` and retries next tick.
+3. **Orphan-log merge** — reconcile per-day logs left in `BVL_LOG_DIR`
+   with their iCloud counterparts (race orphans, lost-snapshots-row
+   recovery).
+4. **Verify** — for every `sealed=1` directory, check the manifest
+   against disk + DB (10 invariants, listed below).  Failures record a
+   `manifest_invalid` row in `mover_errors`; subsequent successes
+   clear it.
+5. **Escalate** — drain pending `mover_errors` rows that have crossed
+   the threshold or are immediate-class; pop a Notification Center
+   banner.
 
 ```bash
-# Verify by date (resolved under ICLOUD_SNAPSHOTS_DIR)
-python3 native-host/snapshot_verifier.py 2026-04-30
+# Default — full tick (the canonical background-agent invocation)
+python3 native-host/snapshot_verifier.py
+python3 native-host/snapshot_verifier.py --quiet           # silence OK lines
+python3 native-host/snapshot_verifier.py --dry-run         # plan, don't write
 
-# Verify by absolute or relative path
-python3 native-host/snapshot_verifier.py /Users/me/.../snapshots/2026-04-30
+# Verify one directory by date or path (no sweep / seal / escalate)
+python3 native-host/snapshot_verifier.py --verify 2026-04-30
+python3 native-host/snapshot_verifier.py --verify /Users/.../snapshots/2026-04-30
 
 # Verify every sealed directory in the snapshots table
-python3 native-host/snapshot_verifier.py --all
+python3 native-host/snapshot_verifier.py --verify-all
 
-# Background mode: silent on success, record failures into mover_errors
-# so they surface via the standard notification pipeline
-python3 native-host/snapshot_verifier.py --quiet --record --all
+# Inspect / clear pending mover_errors rows
+python3 native-host/snapshot_verifier.py --show-errors
+python3 native-host/snapshot_verifier.py --clear-errors
+python3 native-host/snapshot_verifier.py --clear-error 1
 ```
 
 Flags:
 
 | Flag | Effect |
 |------|--------|
-| (positional `directory`) | Date or path to verify |
-| `--all` | Verify every `sealed=1` row in the `snapshots` table (mutually exclusive with the positional) |
-| `--quiet` | Print only failure summaries — suitable for background invocation |
-| `--record` | UPSERT each failure into `mover_errors` as op `manifest_invalid` (and clear the row on subsequent success) |
-| `-v`, `--verbose` | DEBUG log level |
-| `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR` |
-| `--db FILE` | Override `BVL_DB_FILE` |
+| `--verify DIR_OR_DATE` | Verify one directory; skip sweep/seal/escalate.  Mutually exclusive with the others. |
+| `--verify-all` | Verify every `sealed=1` row in the `snapshots` table; skip sweep/seal/escalate. |
+| `--show-errors` | Print pending `mover_errors` and exit. |
+| `--clear-errors` | Delete every `mover_errors` row and exit. |
+| `--clear-error N` | Delete the Nth row (1-indexed, `--show-errors` order) and exit. |
+| `--dry-run` | Plan a tick without writing files or the DB. |
+| `--quiet` | Print only failure summaries — for background invocation. |
+| `--record` | (For `--verify` / `--verify-all`) UPSERT failures into `mover_errors`.  Default-mode ticks always record. |
+| `-v`, `--verbose` | DEBUG log level. |
+| `--source DIR` | Override `BVL_DOWNLOADS_SNAPSHOTS_DIR`. |
+| `--dest DIR` | Override `BVL_ICLOUD_SNAPSHOTS_DIR`. |
+| `--db FILE` | Override `BVL_DB_FILE`. |
+| `--min-age-seconds N` | Override the sweep age threshold (default 60). |
 
-Checks performed against each target directory:
+Verification checks (per directory):
 
 1. `MANIFEST.tsv` exists.
 2. Manifest is read-only (mode `0o444`).
 3. First line is the canonical header.
 4. Every data row has exactly 5 tab-delimited columns; no duplicate filenames.
-5. **Every file in the directory** (other than `MANIFEST.tsv` itself)
-   has a conforming snapshot filename — non-conforming files are
-   flagged whether or not they appear in the manifest.
+5. **Every file in the directory** (other than `MANIFEST.tsv` and the
+   per-day log) has a conforming snapshot filename — non-conforming
+   files are flagged whether or not they appear in the manifest.
 6. The set of conforming snapshot files in the directory equals the
    set of filenames listed in the manifest.
 7. **Every manifest row has a corresponding events row in the DB**, and
-   its `(tag, timestamp, url, title)` matches. Orphan rows (manifest
-   entries with no DB backing) are always invalid.
+   its `(tag, timestamp, url, title)` matches.  Orphan rows are
+   always invalid.
 8. **Every conforming file in the directory has an events row in the
-   DB.** Orphan files are always invalid, even when correctly excluded
-   from the manifest.
+   DB.**  Orphan files are always invalid, even when correctly
+   excluded from the manifest.
+9. The per-day log file is present, a regular file, mode `0o444`.
 
-Exit codes: `0` if every directory verified passes; `1` if any
-directory fails verification, if the target doesn't exist, or on
+Exit codes: `0` if every sealed directory passes; `1` if any
+directory fails verification, if a target doesn't exist, or on
 argument errors.
 
-**Anti-entropy schedule (macOS, installed by `install.sh`)**
+**LaunchAgent (macOS, installed by `install.sh`)**
 
-`install.sh` registers a second LaunchAgent —
-`com.browser.visit.logger.snapshot_verifier` — that invokes
-`snapshot_verifier.py --quiet --record --all` on a configurable
-`StartInterval` (default `604800` seconds = **1 week**).  Each tick:
-
-- Audits every `sealed=1` row in the `snapshots` table.
-- Records failures into `mover_errors` as op `manifest_invalid`
-  (immediate-class, so notification fires on first occurrence).
-- Clears `manifest_invalid` rows for directories that re-pass.
-- Drains the notification queue via `_escalate_errors`, so any
-  finding (and any other unread mover_errors row past its
-  threshold) reaches the user immediately — no waiting for the
-  next mover tick.
-
+`install.sh` registers `com.browser.visit.logger.snapshot_verifier`,
+which invokes the verifier bundle's executable with `--quiet` on a
+configurable `StartInterval` (default `86400` seconds = **1 day**).
 Logs land in `~/browser-visits-verifier.log`.
-
-To change the cadence, edit `StartInterval` in
-`~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist`
-and reload:
-
-```bash
-launchctl bootout   gui/$(id -u)/com.browser.visit.logger.snapshot_verifier
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.browser.visit.logger.snapshot_verifier.plist
-```
-
-Common values: `86400` (daily), `604800` (weekly, default),
-`2592000` (~monthly).  To audit on demand without waiting for the
-next tick, just run the script directly with `--all`.
 
 ### `reset.py`
 
 Wipes local data the extension produced. Asks for confirmation by default.
 
 ```bash
-# Reset everything (per-day visit logs, host log, mover log, DB, both snapshot dirs)
+# Reset everything (per-day visit logs, host log, verifier log, DB, snapshot dirs)
 python3 reset.py
 
 # Skip confirmation
@@ -442,7 +436,7 @@ python3 reset.py -f
 
 # Reset one thing only
 python3 reset.py --log         # all ~/browser-visits-<date>.log files in BVL_LOG_DIR
-python3 reset.py --host-log    # host log + mover log
+python3 reset.py --host-log    # host log + verifier log
 python3 reset.py --db          # ~/browser-visits.db
 python3 reset.py --snapshots   # ~/Downloads/browser-visit-snapshots/
 python3 reset.py --icloud      # ~/Documents/browser-visit-logger/  (also wipes per-day logs sealed in iCloud)
@@ -537,22 +531,24 @@ python3 point-to-worktree.py
 
 ## When something goes wrong
 
-The mover catches `(OSError, sqlite3.Error)` from each per-file move,
-per-directory seal, and per-directory straggler-rewrite, and logs to
-`~/browser-visits-mover.log` (captured by the LaunchAgent's stdout/stderr).
-Transient failures (one bad tick) clear themselves on the next successful
-attempt; the user never sees them.
+Both `host.py` (synchronous archive at tag time) and the verifier
+(periodic sweep / seal / verify) catch `(OSError, sqlite3.Error)` from
+each per-file move, per-directory seal, and per-directory
+straggler-rewrite.  Transient failures (one bad tick) clear themselves
+on the next successful attempt; the user never sees them.
 
-For everything else, the mover writes a row into the `mover_errors`
-table keyed by `<operation>:<target>` and escalates it to a macOS
-notification once the row qualifies:
+For everything else, the failing pass writes a row into the
+`mover_errors` table keyed by `<operation>:<target>` and the verifier's
+escalation pass surfaces it as a macOS notification once the row
+qualifies:
 
 - **Persistent failure**: the same `(operation, target)` has failed
-  `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3, configurable
-  via env var or `--error-threshold N`). One notification per streak.
-  Used for ops whose natural retry loop re-attempts the same target
-  every tick:
+  `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3).  One
+  notification per streak.  Used for ops whose natural retry loop
+  re-attempts the same target on subsequent ticks:
   - `move` — `_move_one` failure (copy/chmod/UPDATE/INSERT/unlink).
+    Triggered by either `host.py`'s synchronous archive or the
+    verifier's sweep pass.
   - `seal` — `_seal_directory` failure (manifest write/chmod/DB update).
   - `missing_directory` — the `snapshots` table has a row for a date
     whose on-disk directory has been deleted.  The row auto-clears
@@ -561,11 +557,12 @@ notification once the row qualifies:
   of attempts.  Used for ops whose retry loop won't re-encounter the
   same target on subsequent ticks (so threshold-based escalation
   would never fire), and for catastrophic conditions:
-  - `top_level` — uncaught exception in `main()`.
+  - `top_level` — uncaught exception in the verifier or in
+    `snapshot_mover.main()`.
   - `rewrite_manifest` — straggler-rewrite failure (only triggered by
-    a fresh straggler arriving in the same dir).
-  - `manifest_invalid` — `snapshot_verifier.py --record` found a
-    sealed directory whose `MANIFEST.tsv` failed one or more checks.
+    a fresh straggler arriving in a sealed dir).
+  - `manifest_invalid` — the verifier's verify pass found a sealed
+    directory whose `MANIFEST.tsv` failed one or more checks.
     Auto-clears on the next successful verification.
   - `invalid_filename` — a file in `~/Downloads/browser-visit-snapshots/`
     or in a daily snapshot directory has a name that doesn't match the
@@ -592,24 +589,34 @@ A row stays in the table until the underlying problem is resolved.
 Three paths clear it:
 
 1. **Automatic** — the next successful run of the same operation
-   `_clear_error`s the row. For `invalid_filename` and
+   `_clear_error`s the row.  For `invalid_filename` and
    `missing_directory`, a directory-scoped reconcile additionally
-   clears rows whose target file/dir no longer exists. Most users
+   clears rows whose target file/dir no longer exists.  Most users
    never need to touch the table.
-2. **Manual, all rows** — `python3 native-host/snapshot_mover.py
-   --clear-errors`. Use after acknowledging a batch of stale rows.
-3. **Manual, one row** — `python3 native-host/snapshot_mover.py
-   --clear-error N`, where `N` is the index from `--show-errors`.
+2. **Manual, all rows** — `./verify_snapshot_directory --clear-errors`.
+   Use after acknowledging a batch of stale rows.
+3. **Manual, one row** — `./verify_snapshot_directory --clear-error N`,
+   where `N` is the index from `--show-errors`.
 
-To inspect: `python3 native-host/snapshot_mover.py --show-errors`.
-Skips the move/seal pass and prints a numbered list of currently
-pending errors with `attempts`, `first_seen`, `last_seen`, message,
-and whether the user has been notified.
+To inspect: `./verify_snapshot_directory --show-errors`.  Prints a
+numbered list of currently pending errors with `attempts`, `first_seen`,
+`last_seen`, message, and whether the user has been notified.
 
 If macOS Notification Center can't be reached (`osascript` missing,
-non-Darwin platform), the mover falls back to creating
+non-Darwin platform), the verifier falls back to creating
 `~/browser-visits-mover-needs-attention` so the user can spot it via
 shell or Finder.
+
+### TCC denials
+
+If `host.py` or the verifier hit `[Errno 1] Operation not permitted`
+on `~/Downloads/browser-visit-snapshots/`, macOS' Privacy & Security
+framework hasn't granted the relevant `.app` bundle access yet.
+Either re-run `bash install.sh` (it kicks the verifier interactively
+to trigger a prompt) or grant the bundle manually in
+**System Settings → Privacy & Security → Files and Folders** under
+"Downloads Folder" / "Documents Folder", or **Full Disk Access** for
+a broader grant.
 
 ---
 
@@ -620,15 +627,14 @@ env vars; env vars override defaults.
 
 | Variable | Default | Used by |
 |----------|---------|---------|
-| `BVL_LOG_DIR` | `~` | host, mover (orphan-merge + log move during seal), sealer, rebuilder, reset.  The directory holding per-day `browser-visits-<UTC-date>.log` files. |
+| `BVL_LOG_DIR` | `~` | host, verifier (orphan-merge + log move during seal), sealer, rebuilder, reset.  The directory holding per-day `browser-visits-<UTC-date>.log` files. |
 | `BVL_HOST_LOG` | `~/browser-visits-host.log` | host, reset |
-| `BVL_MOVER_LOG` | `~/browser-visits-mover.log` | reset (mover writes via LaunchAgent stdout/stderr) |
 | `BVL_VERIFIER_LOG` | `~/browser-visits-verifier.log` | reset (verifier writes via LaunchAgent stdout/stderr) |
-| `BVL_DB_FILE` | `~/browser-visits.db` | host, mover, sealer, rebuilder, reset |
-| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host, mover, rebuilder, reset |
-| `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, mover, sealer, rebuilder |
-| `BVL_MOVER_MIN_AGE_SECONDS` | `60` | mover |
-| `BVL_MOVER_ERROR_THRESHOLD` | `3` | mover (consecutive failures before persistent-error notification) |
+| `BVL_DB_FILE` | `~/browser-visits.db` | host, verifier, sealer, rebuilder, reset |
+| `BVL_DOWNLOADS_SNAPSHOTS_DIR` | `~/Downloads/browser-visit-snapshots` | host (synchronous archive source), verifier (sweep source), reset |
+| `BVL_ICLOUD_SNAPSHOTS_DIR` | `~/Documents/browser-visit-logger/snapshots` | host, verifier, sealer, rebuilder |
+| `BVL_MOVER_MIN_AGE_SECONDS` | `60` | verifier (sweep age threshold) |
+| `BVL_MOVER_ERROR_THRESHOLD` | `3` | verifier (consecutive failures before persistent-error notification) |
 
 ---
 
@@ -660,25 +666,31 @@ browser-visit-logger/
 │   ├── popup.html
 │   └── popup.js
 ├── native-host/
-│   ├── host.py                             # Native messaging host
-│   ├── snapshot_mover.py                   # Periodic archiver (mover + seal)
+│   ├── host.py                             # Native messaging host (synchronous archive at tag time)
+│   ├── snapshot_mover.py                   # Library — archive_for_tag, sweep_pass, seal_pass, …
 │   ├── snapshot_sealer.py                  # Manual sealer CLI
-│   ├── snapshot_verifier.py                # Manifest verifier CLI
+│   ├── snapshot_verifier.py                # Background agent + verify CLI + error-table CLI
 │   ├── visits_rebuilder.py                 # DB rebuilder (log replay + FS rehydrate)
-│   ├── com.browser.visit.logger.json       # Host manifest (template-installed)
-│   ├── com.browser.visit.logger.snapshot_mover.plist.template
+│   ├── com.browser.visit.logger.json       # Host manifest (template-installed; path → host bundle)
 │   └── com.browser.visit.logger.snapshot_verifier.plist.template
 ├── tests/                                  # Python (pytest) + JS (jest)
-├── install.sh
+├── install.sh                              # Builds & signs both .app bundles
 ├── reset.py
 ├── point-to-worktree.py
-├── move_snapshot                           # Bash wrapper → snapshot_mover.py
 ├── seal_snapshot_directory                 # Bash wrapper → snapshot_sealer.py
 ├── verify_snapshot_directory               # Bash wrapper → snapshot_verifier.py
 ├── reset_visits_data                       # Bash wrapper → reset.py
 ├── rebuild_visits_data                     # Bash wrapper → visits_rebuilder.py
 ├── package.json                            # JS test deps + jest config
 └── requirements-test.txt                   # Python test deps
+```
+
+On macOS, `install.sh` additionally materializes:
+
+```
+~/Library/Application Support/browser-visit-logger/
+├── BrowserVisitLoggerHost.app/             # Wraps host.py for TCC attribution
+└── BrowserVisitLoggerVerifier.app/         # Wraps snapshot_verifier.py for TCC attribution
 ```
 
 ---
