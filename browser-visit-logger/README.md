@@ -537,9 +537,9 @@ qualifies:
   `BVL_MOVER_ERROR_THRESHOLD` times in a row (default 3).  One
   notification per streak.  Used for ops whose natural retry loop
   re-attempts the same target on subsequent ticks:
-  - `move` — `_move_one` failure (copy/chmod/UPDATE/INSERT/unlink).
-    Triggered by either `host.py`'s synchronous archive or the
-    verifier's sweep pass.
+  - `move` — per-file archive failure (copy/chmod/UPDATE/INSERT/unlink).
+    Triggered by either `BVLHost`'s synchronous archive at tag time or
+    the verifier's sweep pass.
   - `seal` — `_seal_directory` failure (manifest write/chmod/DB update).
   - `missing_directory` — the `snapshots` table has a row for a date
     whose on-disk directory has been deleted.  The row auto-clears
@@ -548,8 +548,7 @@ qualifies:
   of attempts.  Used for ops whose retry loop won't re-encounter the
   same target on subsequent ticks (so threshold-based escalation
   would never fire), and for catastrophic conditions:
-  - `top_level` — uncaught exception in the verifier or in
-    `snapshot_mover.main()`.
+  - `top_level` — uncaught exception in `BVLHost` or `BVLVerifier`.
   - `rewrite_manifest` — straggler-rewrite failure (only triggered by
     a fresh straggler arriving in a sealed dir).
   - `manifest_invalid` — the verifier's verify pass found a sealed
@@ -644,7 +643,7 @@ npm install
 npm test -- --coverage
 ```
 
-The full suite is 190 Python + 94 JS tests, with 100% line/branch
+The full suite is 165 Python + 94 JS tests, with 100% line/branch
 coverage on every shipped module.
 
 ### Project layout
@@ -664,7 +663,8 @@ browser-visit-logger/
 │   │   └── BVLVerifier/                    # daily background agent (Mach-O)
 │   └── .build/release/                     # built binaries (after `swift build -c release`)
 ├── native-host/
-│   ├── snapshot_mover.py                   # Library used by sealer + rebuilder
+│   ├── host.py                             # DB helpers used by the rebuilder
+│   ├── snapshot_mover.py                   # Seal / orphan-merge helpers used by sealer
 │   ├── snapshot_sealer.py                  # Manual sealer CLI (Python)
 │   ├── visits_rebuilder.py                 # DB rebuilder (log replay + FS rehydrate)
 │   ├── com.browser.visit.logger.json       # Chrome native-messaging manifest template
