@@ -82,6 +82,7 @@ function setupButtons(tab) {
           showStatus('Error: ' + chrome.runtime.lastError.message);
           document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
         } else if (response && response.status === 'ok') {
+          chrome.runtime.sendMessage({ type: 'refresh-icon', tabId: tab.id, url: tab.url });
           window.close();
         } else {
           showStatus(response && response.message ? response.message : 'Write failed — check host log.');

@@ -13,11 +13,18 @@
 // ---------------------------------------------------------------------------
 // Chrome API mocks (declared once; cleared/reset before each test)
 // ---------------------------------------------------------------------------
+// Visit-log / tag-write native messages.
 const mockSendNativeMessage = jest.fn();
+// Icon-refresh query messages ({ action: 'query', url }).  Routed
+// separately so existing visit-log assertions aren't perturbed by
+// the icon refresh that fires on every navigation.
+const mockQueryNativeMessage = jest.fn();
 const mockTabsGet           = jest.fn();
 const addNavListener        = jest.fn();
 const addTabUpdateListener  = jest.fn();
+const addTabActivatedListener = jest.fn();
 const addMessageListener    = jest.fn();
+const mockSetIcon           = jest.fn((_arg, cb) => { if (cb) cb(); });
 
 // Snapshot-related mocks
 const mockSaveAsMHTML       = jest.fn();
@@ -67,9 +74,32 @@ function buildChromeMock() {
     },
   };
 
+  // Minimal OffscreenCanvas stub — background.js draws a colored circle into
+  // it and reads back ImageData; tests only care that getImageData returns a
+  // truthy value tagged with the chosen fill color.
+  global.OffscreenCanvas = jest.fn((width, height) => {
+    let lastFill = null;
+    return {
+      width, height,
+      getContext: () => ({
+        set fillStyle(c) { lastFill = c; },
+        get fillStyle()   { return lastFill; },
+        beginPath: () => {},
+        arc:       () => {},
+        fill:      () => {},
+        getImageData: (_x, _y, w, h) => ({ width: w, height: h, color: lastFill }),
+      }),
+    };
+  });
+
   global.chrome = {
     runtime: {
-      sendNativeMessage: mockSendNativeMessage,
+      sendNativeMessage: (host, msg, cb) => (
+        msg && msg.action === 'query'
+          ? mockQueryNativeMessage(host, msg, cb)
+          : mockSendNativeMessage(host, msg, cb)
+      ),
+      sendMessage:       jest.fn(),
       lastError: null,
       onMessage: { addListener: addMessageListener },
     },
@@ -77,8 +107,12 @@ function buildChromeMock() {
       onCompleted: { addListener: addNavListener },
     },
     tabs: {
-      get:       mockTabsGet,
-      onUpdated: { addListener: addTabUpdateListener },
+      get:         mockTabsGet,
+      onUpdated:   { addListener: addTabUpdateListener },
+      onActivated: { addListener: addTabActivatedListener },
+    },
+    action: {
+      setIcon: mockSetIcon,
     },
     pageCapture: {
       saveAsMHTML: mockSaveAsMHTML,
@@ -94,19 +128,22 @@ function buildChromeMock() {
 // Load a fresh copy of background.js before every test
 // (jest.resetModules() clears the module cache so pendingVisits starts empty)
 // ---------------------------------------------------------------------------
-let navHandler, tabUpdateHandler, messageHandler;
+let navHandler, tabUpdateHandler, tabActivatedHandler, messageHandler;
 
 beforeEach(() => {
   jest.useFakeTimers();
 
   // Clear mock state from previous test
   mockSendNativeMessage.mockClear();
+  mockQueryNativeMessage.mockClear();
   mockTabsGet.mockClear();
   addNavListener.mockClear();
   addTabUpdateListener.mockClear();
+  addTabActivatedListener.mockClear();
   addMessageListener.mockClear();
   mockSaveAsMHTML.mockClear();
   mockDownloadsDownload.mockClear();
+  mockSetIcon.mockClear();
   mockDownloadsOnChanged.addListener.mockClear();
   mockDownloadsOnChanged.removeListener.mockClear();
   onChangedListeners.length = 0;
@@ -119,9 +156,10 @@ beforeEach(() => {
   jest.resetModules();
   require('../extension/background');
 
-  navHandler       = addNavListener.mock.calls[0][0];
-  tabUpdateHandler = addTabUpdateListener.mock.calls[0][0];
-  messageHandler   = addMessageListener.mock.calls[0][0];
+  navHandler          = addNavListener.mock.calls[0][0];
+  tabUpdateHandler    = addTabUpdateListener.mock.calls[0][0];
+  tabActivatedHandler = addTabActivatedListener.mock.calls[0][0];
+  messageHandler      = addMessageListener.mock.calls[0][0];
 });
 
 afterEach(() => {
@@ -790,5 +828,217 @@ describe('tag-and-snapshot message handler', () => {
     expect(sendResponse).not.toHaveBeenCalled();
     // The listener should still be registered (not removed)
     expect(mockDownloadsOnChanged.removeListener).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Address-bar icon coloring
+//
+// The OffscreenCanvas mock tags getImageData() output with the fillStyle so
+// these tests can assert "what color did setIcon receive?" without needing a
+// real canvas implementation.
+// ---------------------------------------------------------------------------
+describe('address-bar icon coloring', () => {
+  const URL = 'https://example.com/';
+
+  // Color literals must match background.js.
+  const GRAY   = '#9e9e9e';
+  const ORANGE = '#ff9800';
+  const YELLOW = '#ffeb3b';
+  const GREEN  = '#4caf50';
+
+  function lastIconColor() {
+    const calls = mockSetIcon.mock.calls;
+    if (calls.length === 0) return null;
+    const { imageData } = calls[calls.length - 1][0];
+    // Both sizes always carry the same fill — read either.
+    return imageData[16].color;
+  }
+
+  function lastIconTabId() {
+    const calls = mockSetIcon.mock.calls;
+    return calls[calls.length - 1][0].tabId;
+  }
+
+  function respondWith(record) {
+    mockQueryNativeMessage.mockImplementation((_host, _msg, cb) =>
+      cb({ status: 'ok', record }),
+    );
+  }
+
+  describe('listener registration', () => {
+    test('registers a tabs.onActivated listener', () => {
+      expect(addTabActivatedListener).toHaveBeenCalledTimes(1);
+      expect(typeof tabActivatedHandler).toBe('function');
+    });
+  });
+
+  describe('pickIconColor priority (via tabs.onActivated)', () => {
+    beforeEach(() => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+    });
+
+    test('null record → gray', () => {
+      respondWith(null);
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(GRAY);
+      expect(lastIconTabId()).toBe(7);
+    });
+
+    test('empty record → gray', () => {
+      respondWith({ read: [], skimmed: [], of_interest: null });
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(GRAY);
+    });
+
+    test('of_interest only → orange', () => {
+      respondWith({ read: [], skimmed: [], of_interest: '1' });
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(ORANGE);
+    });
+
+    test('skimmed (no read) → yellow', () => {
+      respondWith({ read: [], skimmed: [{ timestamp: 't' }], of_interest: '1' });
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(YELLOW);
+    });
+
+    test('read present → green (overrides skimmed and of_interest)', () => {
+      respondWith({
+        read:        [{ timestamp: 't' }],
+        skimmed:     [{ timestamp: 't' }],
+        of_interest: '1',
+      });
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(GREEN);
+    });
+
+    test('record missing read/skimmed arrays falls through to gray', () => {
+      respondWith({ of_interest: null });
+      tabActivatedHandler({ tabId: 7 });
+      expect(lastIconColor()).toBe(GRAY);
+    });
+  });
+
+  describe('refresh fallbacks (gray)', () => {
+    test('non-http URL → gray, no native query', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: 'chrome://newtab/' }));
+      tabActivatedHandler({ tabId: 9 });
+      expect(mockQueryNativeMessage).not.toHaveBeenCalled();
+      expect(lastIconColor()).toBe(GRAY);
+    });
+
+    test('empty URL → gray, no native query', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: '' }));
+      tabActivatedHandler({ tabId: 9 });
+      expect(mockQueryNativeMessage).not.toHaveBeenCalled();
+      expect(lastIconColor()).toBe(GRAY);
+    });
+
+    test('native query lastError → gray', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      mockQueryNativeMessage.mockImplementation((_host, _msg, cb) => {
+        global.chrome.runtime.lastError = { message: 'host crashed' };
+        cb(undefined);
+        global.chrome.runtime.lastError = null;
+      });
+      tabActivatedHandler({ tabId: 9 });
+      expect(lastIconColor()).toBe(GRAY);
+    });
+
+    test('native response with non-ok status → gray', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      mockQueryNativeMessage.mockImplementation((_h, _m, cb) =>
+        cb({ status: 'error', message: 'db locked' }),
+      );
+      tabActivatedHandler({ tabId: 9 });
+      expect(lastIconColor()).toBe(GRAY);
+    });
+  });
+
+  describe('tabs.onActivated guards', () => {
+    test('tabs.get lastError → no setIcon call', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => {
+        global.chrome.runtime.lastError = { message: 'No tab with id' };
+        cb(null);
+        global.chrome.runtime.lastError = null;
+      });
+      tabActivatedHandler({ tabId: 99 });
+      expect(mockSetIcon).not.toHaveBeenCalled();
+    });
+
+    test('tabs.get null tab without lastError → no setIcon call', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb(null));
+      tabActivatedHandler({ tabId: 99 });
+      expect(mockSetIcon).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('webNavigation.onCompleted refreshes the icon', () => {
+    test('http navigation triggers a query and a setIcon for that tabId', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ title: 'Example Domain' }));
+      respondWith({ read: [{ timestamp: 't' }], skimmed: [], of_interest: null });
+
+      navHandler({ frameId: 0, tabId: 3, url: URL });
+
+      expect(mockQueryNativeMessage).toHaveBeenCalledWith(
+        'com.browser.visit.logger',
+        { action: 'query', url: URL },
+        expect.any(Function),
+      );
+      expect(lastIconColor()).toBe(GREEN);
+      expect(lastIconTabId()).toBe(3);
+    });
+
+    test('iframe navigation does not refresh the icon', () => {
+      navHandler({ frameId: 1, tabId: 3, url: URL });
+      expect(mockSetIcon).not.toHaveBeenCalled();
+      expect(mockQueryNativeMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('refresh-icon message from popup', () => {
+    test('triggers a query + setIcon for the supplied tab', () => {
+      respondWith({ read: [], skimmed: [{ timestamp: 't' }], of_interest: null });
+      messageHandler({ type: 'refresh-icon', tabId: 12, url: URL }, {}, jest.fn());
+      expect(mockQueryNativeMessage).toHaveBeenCalledTimes(1);
+      expect(lastIconColor()).toBe(YELLOW);
+      expect(lastIconTabId()).toBe(12);
+    });
+
+    test('returns false (synchronous handler, no async response)', () => {
+      respondWith(null);
+      const result = messageHandler({ type: 'refresh-icon', tabId: 1, url: URL }, {}, jest.fn());
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('icon image data caching', () => {
+    test('reusing the same color does not redraw the canvas', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      respondWith({ read: [{ timestamp: 't' }], skimmed: [], of_interest: null });
+
+      tabActivatedHandler({ tabId: 1 });
+      const drawsAfterFirst = global.OffscreenCanvas.mock.calls.length;
+      tabActivatedHandler({ tabId: 2 });
+      const drawsAfterSecond = global.OffscreenCanvas.mock.calls.length;
+
+      // First call drew once per ICON_SIZES; second call (same green) is cached.
+      expect(drawsAfterFirst).toBeGreaterThan(0);
+      expect(drawsAfterSecond).toBe(drawsAfterFirst);
+    });
+  });
+
+  describe('setIcon callback swallows lastError', () => {
+    test('lastError after setIcon does not throw', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      respondWith(null);
+      mockSetIcon.mockImplementation((_arg, cb) => {
+        global.chrome.runtime.lastError = { message: 'No tab with id 7' };
+        cb();
+        global.chrome.runtime.lastError = null;
+      });
+      expect(() => tabActivatedHandler({ tabId: 7 })).not.toThrow();
+    });
   });
 });
