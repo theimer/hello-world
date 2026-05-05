@@ -1,26 +1,28 @@
 """
-Unit tests for native-host/snapshot_mover.py.
+Unit tests for the Python helpers in native-host/snapshot_mover.py.
 
-Each test sets up an isolated triplet of (source_dir, dest_dir, db_file)
-under a temporary directory, then patches both `host` and `snapshot_mover`
-module-level constants to point at it.
+After the Swift port these helpers are imported only by
+snapshot_sealer.py and visits_rebuilder.py.  This module covers them
+in three layers:
 
-The mover scans the Downloads filesystem rather than querying the DB, so
-tests create source files with the permanent datetime-prefixed filename that
-host.py would have assigned at record time.
-
-Run with:
-    cd browser-visit-logger
-    pytest tests/test_snapshot_mover.py -v
+  1. Bare schema / utility tests (TestTodayUtc, TestSnapshotsTable
+     Schema, TestMoverErrorsSchema) for in-memory smoke coverage.
+  2. Direct tests for the error-tracking helpers (TestErrorRecording)
+     — _record_error, _clear_error, _try_*, _is_immediate,
+     _reconcile_dir_scoped_errors — reachable from the sealer
+     transitively via _build_manifest_rows.
+  3. Direct tests for the seal helpers (TestBuildManifestRows,
+     TestWriteManifestFile, TestSealDirectoryFailurePath,
+     TestOrphanLogMergePass) — exercised through the sealer in its
+     own test module, but covered here for branches the sealer's
+     happy path doesn't reach (orphan files, non-conforming
+     filenames, race-orphan log merges, etc.).
 """
 import datetime
 import errno
-import io
-import logging
 import os
 import sqlite3
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -46,1182 +48,6 @@ def _snap(iso_ts: str, orig_basename: str) -> str:
     date_part, time_rest = iso_ts.split('T', 1)
     time_part = time_rest[:8].replace(':', '-')
     return f'{date_part}T{time_part}Z-{orig_basename}'
-
-
-# ---------------------------------------------------------------------------
-# Base test case — isolated paths + DB initialised via host.ensure_db
-# ---------------------------------------------------------------------------
-class _MoverTestBase(unittest.TestCase):
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-
-        self.source_dir = os.path.join(self.tmp.name, 'downloads')
-        self.dest_dir   = os.path.join(self.tmp.name, 'icloud')
-        self.log_dir    = os.path.join(self.tmp.name, 'logs')
-        self.db_file    = os.path.join(self.tmp.name, 'visits.db')
-        os.makedirs(self.source_dir)
-        os.makedirs(self.log_dir)
-        # dest_dir intentionally NOT created — main() should create the root
-
-        for module, attrs in (
-            (host,            {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
-                               'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
-                               'LOG_DIR':                 self.log_dir,
-                               'DB_FILE':                 self.db_file}),
-            (snapshot_mover,  {'DOWNLOADS_SNAPSHOTS_DIR': self.source_dir,
-                               'ICLOUD_SNAPSHOTS_DIR':    self.dest_dir,
-                               'LOG_DIR':                 self.log_dir,
-                               'DB_FILE':                 self.db_file}),
-        ):
-            for name, value in attrs.items():
-                p = patch.object(module, name, value)
-                p.start()
-                self.addCleanup(p.stop)
-
-        conn = sqlite3.connect(self.db_file)
-        host.ensure_db(conn)
-        snapshot_mover._ensure_snapshots_table(conn)
-        snapshot_mover._ensure_mover_errors_table(conn)
-        conn.close()
-
-        # Silence _notify_user so tests that incidentally trigger
-        # escalation don't actually fire osascript on macOS.  Tests that
-        # want to assert on notification calls re-patch in their body —
-        # patch.object's stack semantics hide this outer mock for the
-        # duration of the inner with block.
-        p = patch.object(snapshot_mover, '_notify_user')
-        p.start()
-        self.addCleanup(p.stop)
-
-    # -- helpers --
-
-    def _make_event(self, table, url, iso_timestamp, orig_basename,
-                    content=b'data', age_seconds=0, create_source=True):
-        """Insert a visit + event row and (optionally) create the source file.
-
-        The source file is created with the permanent datetime-prefixed name
-        that background.js assigns at download time (computed via _snap).
-
-        Returns the source file path if create_source=True, else None.
-        """
-        # Compute the permanent datetime-prefixed basename.
-        prefixed = _snap(iso_timestamp, orig_basename)
-
-        conn = sqlite3.connect(self.db_file)
-        host.insert_visit(conn, 'ts-visit', url, 'Title')
-        # Pass prefixed name directly — _insert_event stores os.path.basename,
-        # which is a no-op since prefixed has no directory component.
-        host._insert_event(conn, table, url, iso_timestamp,
-                           table.replace('_events', ''), prefixed)
-        conn.close()
-
-        if create_source:
-            path = os.path.join(self.source_dir, prefixed)
-            Path(path).write_bytes(content)
-            if age_seconds > 0:
-                mtime = time.time() - age_seconds
-                os.utime(path, (mtime, mtime))
-            return path
-        return None
-
-    def _dest_info(self, prefixed_basename):
-        """Return (date_subdir, dest_filename) for a datetime-prefixed snapshot.
-
-        The filename is unchanged by the move; only the directory differs.
-        """
-        date_str = prefixed_basename[:10]   # 'YYYY-MM-DD'
-        return os.path.join(self.dest_dir, date_str), prefixed_basename
-
-    def _row(self, table, url):
-        """Return the (filename, directory) DB row for url in table."""
-        conn = sqlite3.connect(self.db_file)
-        row = conn.execute(
-            f"SELECT filename, directory FROM {table} WHERE url = ?", (url,)
-        ).fetchone()
-        conn.close()
-        return row
-
-
-# ---------------------------------------------------------------------------
-# Happy path
-# ---------------------------------------------------------------------------
-class TestMovePass(_MoverTestBase):
-
-    def test_dest_placed_in_utc_date_subdir(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
-
-    def test_old_file_source_is_deleted(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
-
-    def test_old_file_db_directory_updated(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        row = self._row('read_events', 'https://a.com')
-        self.assertEqual(row[0], prefixed)       # filename unchanged
-        self.assertEqual(row[1], date_subdir)    # directory updated
-
-    def test_old_file_preserves_content(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         content=b'snapshot bytes', age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        moved = Path(date_subdir, prefixed).read_bytes()
-        self.assertEqual(moved, b'snapshot bytes')
-
-    def test_moved_file_is_read_only(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        mode = os.stat(os.path.join(date_subdir, prefixed)).st_mode & 0o777
-        self.assertEqual(mode, 0o444)
-
-    def test_new_file_is_not_moved(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=30)    # well under the 1 min threshold
-        snapshot_mover.main()
-        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(os.listdir(self.dest_dir), [])
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-    def test_processes_both_read_and_skimmed_event_tables(self):
-        pf_r = _snap(ISO_TS1, 'r.mhtml')
-        pf_s = _snap(ISO_TS2, 's.mhtml')
-        self._make_event('read_events',    'https://r.com', ISO_TS1, 'r.mhtml',
-                         age_seconds=700)
-        self._make_event('skimmed_events', 'https://s.com', ISO_TS2, 's.mhtml',
-                         age_seconds=700)
-        ds_r, _ = self._dest_info(pf_r)
-        ds_s, _ = self._dest_info(pf_s)
-        snapshot_mover.main()
-        self.assertTrue(os.path.exists(os.path.join(ds_r, pf_r)))
-        self.assertTrue(os.path.exists(os.path.join(ds_s, pf_s)))
-        self.assertEqual(self._row('read_events',    'https://r.com'), (pf_r, ds_r))
-        self.assertEqual(self._row('skimmed_events', 'https://s.com'), (pf_s, ds_s))
-
-    def test_files_on_different_days_go_to_different_subdirs(self):
-        pf1 = _snap(ISO_TS1, 'a.mhtml')  # 2024-01-15
-        pf3 = _snap(ISO_TS3, 'b.mhtml')  # 2024-01-16
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        self._make_event('read_events', 'https://b.com', ISO_TS3, 'b.mhtml',
-                         age_seconds=700)
-        ds1, _ = self._dest_info(pf1)
-        ds3, _ = self._dest_info(pf3)
-        snapshot_mover.main()
-        self.assertNotEqual(ds1, ds3)
-        self.assertTrue(os.path.exists(os.path.join(ds1, pf1)))
-        self.assertTrue(os.path.exists(os.path.join(ds3, pf3)))
-
-    def test_moves_file_even_without_db_row(self):
-        # A file in Downloads with no corresponding DB row (e.g., the host.py
-        # message was lost) should still be moved to clean up Downloads.
-        prefixed = _snap(ISO_TS1, 'no-db-row.mhtml')
-        src = os.path.join(self.source_dir, prefixed)
-        Path(src).write_bytes(b'data')
-        mtime = time.time() - 700
-        os.utime(src, (mtime, mtime))
-
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-
-        self.assertFalse(os.path.exists(src))
-        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
-
-    def test_move_pass_inserts_snapshots_row_for_new_date(self):
-        # Moving a file into a new daily directory should also INSERT OR IGNORE
-        # a row into the snapshots table so the seal pass can find it later.
-        # Drive _move_pass directly (rather than main()) so the seal pass
-        # doesn't immediately flip sealed=0 to 1 in the same call.
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-            row = conn.execute(
-                "SELECT date, sealed FROM snapshots WHERE date = ?",
-                (ISO_TS1[:10],),
-            ).fetchone()
-        finally:
-            conn.close()
-        self.assertEqual(row, (ISO_TS1[:10], 0))
-
-    def test_move_pass_does_not_duplicate_snapshots_row(self):
-        # Two files for the same UTC date should yield exactly one snapshots
-        # row (PRIMARY KEY + INSERT OR IGNORE).
-        self._make_event('read_events',    'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        self._make_event('skimmed_events', 'https://b.com', ISO_TS2, 'b.mhtml',
-                         age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-            count = conn.execute(
-                "SELECT COUNT(*) FROM snapshots WHERE date = ?", (ISO_TS1[:10],)
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        self.assertEqual(count, 1)
-
-    def test_straggler_rewrites_manifest_to_include_new_file(self):
-        # Pre-condition: a sealed daily dir on disk + DB, with one prior file
-        # and a manifest listing only that file.
-        date_str = ISO_TS1[:10]
-        date_subdir = os.path.join(self.dest_dir, date_str)
-        os.makedirs(date_subdir)
-        pre_existing = _snap(ISO_TS1, 'old.mhtml')
-        Path(date_subdir, pre_existing).write_bytes(b'old')
-        os.chmod(os.path.join(date_subdir, pre_existing), 0o444)
-
-        conn = sqlite3.connect(self.db_file)
-        host.insert_visit(conn, 'ts-visit', 'https://old.com', 'Old Page')
-        conn.execute(
-            "INSERT INTO read_events (url, timestamp, filename, directory) "
-            "VALUES (?, ?, ?, ?)",
-            ('https://old.com', ISO_TS1, pre_existing, date_subdir),
-        )
-        manifest_path = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
-        Path(manifest_path).write_text(
-            'filename\ttag\ttimestamp\turl\ttitle\n'
-            f'{pre_existing}\tread\t{ISO_TS1}\thttps://old.com\tOld Page\n',
-            encoding='utf-8',
-        )
-        os.chmod(manifest_path, 0o444)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)", (date_str,))
-        conn.commit()
-        conn.close()
-
-        # A straggler shows up in Downloads with a date prefix matching the
-        # already-sealed day.
-        self._make_event('read_events', 'https://new.com', ISO_TS1, 'new.mhtml',
-                         age_seconds=700)
-
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-        finally:
-            conn.close()
-
-        new_filename = _snap(ISO_TS1, 'new.mhtml')
-        # Both files are present in the date dir.
-        self.assertTrue(os.path.exists(os.path.join(date_subdir, pre_existing)))
-        self.assertTrue(os.path.exists(os.path.join(date_subdir, new_filename)))
-        # Manifest now lists the new file in addition to the old one.
-        manifest = Path(manifest_path).read_text(encoding='utf-8')
-        self.assertIn(pre_existing, manifest)
-        self.assertIn(new_filename, manifest)
-        # Manifest stayed read-only after the rewrite.
-        self.assertEqual(os.stat(manifest_path).st_mode & 0o777, 0o444)
-        # Sealed flag is still 1 — the day stays sealed, just with a fresh
-        # manifest reflecting the new file.
-        conn = sqlite3.connect(self.db_file)
-        sealed = conn.execute(
-            "SELECT sealed FROM snapshots WHERE date = ?", (date_str,)
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(sealed, 1)
-
-    def test_non_straggler_move_does_not_write_manifest(self):
-        # When the snapshots row is sealed=0 (or absent), the move pass
-        # must not pre-emptively create a manifest — that's the seal pass's job.
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-        finally:
-            conn.close()
-        manifest = os.path.join(self.dest_dir, ISO_TS1[:10],
-                                snapshot_mover.MANIFEST_FILENAME)
-        self.assertFalse(os.path.exists(manifest))
-
-    def test_straggler_rewrite_failure_is_logged_and_does_not_undo_move(self):
-        # If rewriting the manifest fails (e.g. disk full), the file move
-        # has already committed and must stay; only an ERROR log is emitted.
-        date_str = ISO_TS1[:10]
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)", (date_str,))
-        conn.commit()
-        conn.close()
-
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-
-        with patch.object(snapshot_mover, '_write_manifest_file',
-                          side_effect=OSError('disk full')), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover._move_pass(conn)
-            finally:
-                conn.close()
-
-        self.assertTrue(any('Failed to rewrite' in m for m in cm.output))
-        moved = os.path.join(self.dest_dir, date_str, _snap(ISO_TS1, 'a.mhtml'))
-        self.assertTrue(os.path.exists(moved))
-
-    def test_move_pass_preserves_sealed_flag_on_late_arrival(self):
-        # If a late file arrives for an already-sealed day, INSERT OR IGNORE
-        # must not flip sealed=1 back to 0.
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
-            (ISO_TS1[:10],),
-        )
-        conn.commit()
-        conn.close()
-
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'late.mhtml',
-                         age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-            sealed = conn.execute(
-                "SELECT sealed FROM snapshots WHERE date = ?", (ISO_TS1[:10],)
-            ).fetchone()[0]
-        finally:
-            conn.close()
-        self.assertEqual(sealed, 1)
-
-
-# ---------------------------------------------------------------------------
-# Idempotency / retry of partial failures
-# ---------------------------------------------------------------------------
-class TestIdempotency(_MoverTestBase):
-
-    def test_running_twice_is_a_noop_after_success(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        snapshot_mover.main()   # source gone — nothing left in Downloads
-        self.assertTrue(os.path.exists(os.path.join(date_subdir, prefixed)))
-        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(self._row('read_events', 'https://a.com'),
-                         (prefixed, date_subdir))
-
-    def test_retry_cleans_up_source_when_db_already_says_icloud(self):
-        # Simulate: prior run did copy + DB update but crashed before unlinking.
-        # Source still in Downloads; DB already says iCloud.
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-
-        # Manually update DB to say iCloud (as if a prior run had done it).
-        conn = sqlite3.connect(self.db_file)
-        conn.execute("UPDATE read_events SET directory = ? WHERE url = ?",
-                     (date_subdir, 'https://a.com'))
-        conn.commit()
-        conn.close()
-
-        snapshot_mover.main()
-
-        # Source should be cleaned up; DB is unchanged (already correct).
-        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(self._row('read_events', 'https://a.com'),
-                         (prefixed, date_subdir))
-
-    def test_retry_recovers_from_crash_between_copy_and_db_update(self):
-        # Source exists, dest already exists (from prior copy), DB still says Downloads.
-        # Next run should overwrite the dest (safe, same data), update DB, unlink source.
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-
-        # Pre-create the dest (as if a prior run had already copied it).
-        os.makedirs(date_subdir)
-        Path(date_subdir, prefixed).write_bytes(b'old-copy')
-        # chmod read-only from prior run; copy2 (which re-writes) should still work.
-        os.chmod(os.path.join(date_subdir, prefixed), 0o444)
-        # Restore write access so copy2 can overwrite (iCloud permissions vary in prod)
-        os.chmod(os.path.join(date_subdir, prefixed), 0o644)
-
-        snapshot_mover.main()
-
-        self.assertFalse(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(self._row('read_events', 'https://a.com'),
-                         (prefixed, date_subdir))
-
-    def test_skips_file_with_unrecognized_name_format(self):
-        # Files whose names don't match the snapshot format are left in
-        # Downloads (not moved), ERROR-logged, and recorded as an
-        # 'invalid_filename' mover_errors row so the user is notified.
-        stray = os.path.join(self.source_dir, 'random-file.mhtml')
-        Path(stray).write_bytes(b'x')
-        mtime = time.time() - 700
-        os.utime(stray, (mtime, mtime))
-
-        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-
-        self.assertTrue(os.path.exists(stray))
-        self.assertEqual(os.listdir(self.dest_dir), [])
-        self.assertTrue(any('does not match snapshot filename format'
-                            in m for m in cm.output))
-        conn = sqlite3.connect(self.db_file)
-        row = conn.execute(
-            "SELECT operation, target FROM mover_errors "
-            "WHERE operation = 'invalid_filename'"
-        ).fetchone()
-        conn.close()
-        self.assertEqual(row, ('invalid_filename', stray))
-
-    def test_move_pass_clears_invalid_filename_error_when_stray_removed(self):
-        # Pre-seed an invalid_filename row for a path that no longer exists
-        # in Downloads.  The move-pass reconcile should clear it.
-        gone = os.path.join(self.source_dir, 'never-existed.mhtml')
-        conn = sqlite3.connect(self.db_file)
-        snapshot_mover._record_error(
-            conn, 'invalid_filename', gone,
-            ValueError('synthetic'))
-        conn.close()
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-
-        snapshot_mover.main()   # source_dir empty, gone is not present
-
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'invalid_filename'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_skips_subdirectory_entries_in_downloads(self):
-        os.makedirs(os.path.join(self.source_dir, 'subdir'))
-        snapshot_mover.main()
-        self.assertEqual(os.listdir(self.dest_dir), [])
-
-
-# ---------------------------------------------------------------------------
-# Edge / error paths
-# ---------------------------------------------------------------------------
-class TestEdgeCases(_MoverTestBase):
-
-    def test_creates_icloud_root_directory_if_absent(self):
-        self.assertFalse(os.path.isdir(self.dest_dir))
-        snapshot_mover.main()
-        self.assertTrue(os.path.isdir(self.dest_dir))
-
-    def test_creates_date_subdir_for_moved_file(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-        date_subdir, _ = self._dest_info(prefixed)
-        snapshot_mover.main()
-        self.assertTrue(os.path.isdir(date_subdir))
-
-    def test_no_db_file_is_a_noop(self):
-        os.remove(self.db_file)
-        snapshot_mover.main()   # should not raise
-        self.assertTrue(os.path.isdir(self.dest_dir))
-
-    def test_downloads_dir_absent_is_a_noop(self):
-        os.rmdir(self.source_dir)   # empty, safe to remove
-        snapshot_mover.main()       # should not raise
-        self.assertTrue(os.path.isdir(self.dest_dir))
-
-    def test_copy_failure_leaves_source_in_downloads(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-
-        with patch('shutil.copy2', side_effect=OSError('disk full')), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-
-        self.assertTrue(any('Failed to move' in m for m in cm.output))
-        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-
-# ---------------------------------------------------------------------------
-# Dry-run mode
-# ---------------------------------------------------------------------------
-class TestDryRun(_MoverTestBase):
-
-    def test_dry_run_does_not_copy_unlink_or_update(self):
-        prefixed = _snap(ISO_TS1, 'a.mhtml')
-        self._make_event('read_events', 'https://a.com', ISO_TS1, 'a.mhtml',
-                         age_seconds=700)
-
-        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
-            snapshot_mover.main(dry_run=True)
-
-        self.assertTrue(any('[dry-run] would move' in m for m in cm.output))
-        # Source untouched, no date subdirs, DB unchanged.
-        self.assertTrue(os.path.exists(os.path.join(self.source_dir, prefixed)))
-        self.assertEqual(os.listdir(self.dest_dir), [])
-        self.assertEqual(self._row('read_events', 'https://a.com')[1], self.source_dir)
-
-
-# ---------------------------------------------------------------------------
-# Seal pass — write read-only MANIFEST.tsv into finished daily directories
-# ---------------------------------------------------------------------------
-class TestSealPass(_MoverTestBase):
-    """Tests for the automatic seal pass invoked by main()."""
-
-    # All tests in this class pin "today" to a fixed UTC date so that the
-    # date-comparison logic is deterministic.  Sealable dirs are dated before
-    # this; "today or future" dirs are dated on or after this.
-    TODAY = datetime.date(2024, 1, 20)
-
-    def setUp(self):
-        super().setUp()
-        p = patch.object(snapshot_mover, '_today_utc', return_value=self.TODAY)
-        p.start()
-        self.addCleanup(p.stop)
-
-    # -- helpers --
-
-    def _seed_dir(self, date_str, files=(), seed_snapshots_row=True, sealed=0):
-        """Create dest_dir/<date_str>/ on disk and (by default) insert a
-        matching row into the snapshots table.
-
-        files is an iterable of (filename, table, url, ts, title) tuples.
-        Pass table=None to leave a file with no DB row.  Returns the absolute
-        path of the seeded date subdir.
-
-        seed_snapshots_row=False simulates a directory that exists on disk
-        but isn't tracked by the table (e.g. a directory imported from
-        elsewhere); the auto seal pass should never touch it.
-        """
-        date_subdir = os.path.join(self.dest_dir, date_str)
-        os.makedirs(date_subdir, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            if seed_snapshots_row:
-                conn.execute(
-                    "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, ?)",
-                    (date_str, sealed),
-                )
-                conn.commit()
-            for filename, table, url, ts, title in files:
-                Path(date_subdir, filename).write_bytes(b'data')
-                if table is None:
-                    continue
-                host.insert_visit(conn, ts, url, title)
-                conn.execute(
-                    f"INSERT INTO {table} (url, timestamp, filename, directory) "
-                    f"VALUES (?, ?, ?, ?)",
-                    (url, ts, filename, date_subdir),
-                )
-                conn.commit()
-        finally:
-            conn.close()
-        return date_subdir
-
-    def _snapshots_row(self, date_str):
-        """Return the (date, sealed) row for date_str, or None."""
-        conn = sqlite3.connect(self.db_file)
-        try:
-            return conn.execute(
-                "SELECT date, sealed FROM snapshots WHERE date = ?",
-                (date_str,),
-            ).fetchone()
-        finally:
-            conn.close()
-
-    def _read_manifest(self, date_str):
-        return Path(self.dest_dir, date_str,
-                    snapshot_mover.MANIFEST_FILENAME).read_text(encoding='utf-8')
-
-    # -- tests --
-
-    def test_creates_manifest_for_past_date_subdir(self):
-        date_subdir = self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        self.assertTrue(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_does_not_seal_today(self):
-        date_subdir = self._seed_dir('2024-01-20')
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_does_not_seal_future_date(self):
-        date_subdir = self._seed_dir('2024-02-01')
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_manifest_is_read_only(self):
-        date_subdir = self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
-        mode = os.stat(manifest).st_mode & 0o777
-        self.assertEqual(mode, 0o444)
-
-    def test_manifest_starts_with_header_row(self):
-        self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        first_line = self._read_manifest('2024-01-15').split('\n', 1)[0]
-        self.assertEqual(first_line, 'filename\ttag\ttimestamp\turl\ttitle')
-
-    def test_manifest_lists_every_snapshot_file(self):
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
-             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
-            ('2024-01-15T11-00-00Z-b.mhtml', 'skimmed_events',
-             'https://b.com', '2024-01-15T11:00:00Z', 'B'),
-        ])
-        snapshot_mover.main()
-        lines = self._read_manifest('2024-01-15').splitlines()
-        # Header + 2 data rows
-        self.assertEqual(len(lines), 3)
-
-    def test_manifest_rows_in_filename_order(self):
-        # Filenames sort chronologically thanks to the datetime prefix —
-        # the manifest order should follow.
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T11-00-00Z-late.mhtml',  'read_events',
-             'https://late.com',  '2024-01-15T11:00:00Z', 'L'),
-            ('2024-01-15T09-00-00Z-early.mhtml', 'read_events',
-             'https://early.com', '2024-01-15T09:00:00Z', 'E'),
-        ])
-        snapshot_mover.main()
-        lines = self._read_manifest('2024-01-15').splitlines()
-        self.assertIn('early.mhtml', lines[1])
-        self.assertIn('late.mhtml',  lines[2])
-
-    def test_manifest_includes_url_and_title_from_visits(self):
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
-             'https://example.com', '2024-01-15T10:00:00Z', 'Example Page'),
-        ])
-        snapshot_mover.main()
-        manifest = self._read_manifest('2024-01-15')
-        self.assertIn('https://example.com', manifest)
-        self.assertIn('Example Page', manifest)
-
-    def test_manifest_distinguishes_read_and_skimmed_tags(self):
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-r.mhtml', 'read_events',
-             'https://r.com', '2024-01-15T10:00:00Z', 'R'),
-            ('2024-01-15T11-00-00Z-s.mhtml', 'skimmed_events',
-             'https://s.com', '2024-01-15T11:00:00Z', 'S'),
-        ])
-        snapshot_mover.main()
-        manifest = self._read_manifest('2024-01-15')
-        for line in manifest.splitlines()[1:]:
-            fields = line.split('\t')
-            if 'r.mhtml' in fields[0]:
-                self.assertEqual(fields[1], 'read')
-            elif 's.mhtml' in fields[0]:
-                self.assertEqual(fields[1], 'skimmed')
-
-    def test_manifest_excludes_orphan_files_and_records_orphan_error(self):
-        # A conforming snapshot file with no events row is an orphan.
-        # Per the "correct sealed directory" invariant, orphans must
-        # NOT appear in the manifest — the mover excludes them and
-        # records an 'orphan_file' mover_errors row instead.
-        date_subdir = self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-orphan.mhtml', None, None, None, None),
-        ])
-        snapshot_mover.main()
-        lines = self._read_manifest('2024-01-15').splitlines()
-        # Header only — orphan excluded.
-        self.assertEqual(lines, ['filename\ttag\ttimestamp\turl\ttitle'])
-        conn = sqlite3.connect(self.db_file)
-        row = conn.execute(
-            "SELECT operation, target FROM mover_errors "
-            "WHERE operation = 'orphan_file'"
-        ).fetchone()
-        conn.close()
-        expected_target = os.path.join(
-            date_subdir, '2024-01-15T10-00-00Z-orphan.mhtml')
-        self.assertEqual(row, ('orphan_file', expected_target))
-
-    def test_manifest_clears_orphan_file_error_when_events_row_appears(self):
-        # Pre-seed an orphan_file error, then add the missing events row
-        # and re-run main().  Reconcile should clear the error.
-        date_str = '2024-01-15'
-        date_subdir = self._seed_dir(date_str, [
-            ('2024-01-15T10-00-00Z-x.mhtml', None, None, None, None),
-        ])
-        orphan_path = os.path.join(date_subdir, '2024-01-15T10-00-00Z-x.mhtml')
-        conn = sqlite3.connect(self.db_file)
-        snapshot_mover._record_error(
-            conn, 'orphan_file', orphan_path,
-            ValueError('previous orphan'))
-        # Now add the missing events row so the file is no longer an orphan.
-        host.insert_visit(conn, '2024-01-15T10:00:00Z', 'https://x.com', 'X')
-        conn.execute(
-            "INSERT INTO read_events (url, timestamp, filename, directory) "
-            "VALUES (?, ?, ?, ?)",
-            ('https://x.com', '2024-01-15T10:00:00Z',
-             '2024-01-15T10-00-00Z-x.mhtml', date_subdir),
-        )
-        conn.commit()
-        conn.close()
-
-        snapshot_mover.main()
-
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'orphan_file'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_recovery_rewrites_existing_manifest_and_marks_sealed(self):
-        # Crash-recovery branch: a prior run wrote the manifest but didn't
-        # update the DB.  The manifest may be partial / truncated, so the
-        # seal pass *always* rewrites it — and then flips sealed=1.
-        date_subdir = self._seed_dir('2024-01-15')
-        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
-        Path(manifest).write_text('truncated-or-stale\n', encoding='utf-8')
-        snapshot_mover.main()
-        # Manifest replaced with a freshly-written one (header line at top).
-        contents = Path(manifest).read_text(encoding='utf-8')
-        self.assertNotEqual(contents, 'truncated-or-stale\n')
-        self.assertTrue(contents.startswith('filename\ttag\ttimestamp\turl\ttitle\n'))
-        # DB row was flipped to sealed.
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
-
-    def test_seal_processes_multiple_past_directories(self):
-        d1 = self._seed_dir('2024-01-10')
-        d2 = self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        for d in (d1, d2):
-            self.assertTrue(os.path.exists(
-                os.path.join(d, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_dry_run_does_not_write_manifest(self):
-        date_subdir = self._seed_dir('2024-01-15')
-        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
-            snapshot_mover.main(dry_run=True)
-        self.assertTrue(any('[dry-run] would seal' in m for m in cm.output))
-        self.assertFalse(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_manifest_sanitises_tabs_and_newlines_in_title(self):
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
-             'https://a.com', '2024-01-15T10:00:00Z', 'Has\ttab and\nnewline'),
-        ])
-        snapshot_mover.main()
-        manifest = self._read_manifest('2024-01-15')
-        # Three replaced characters: \t and \n become spaces, not preserved.
-        self.assertNotIn('\ttab', manifest)
-        self.assertNotIn('and\n', manifest.replace('newline\n', ''))
-        self.assertIn('Has tab and newline', manifest)
-
-    def test_manifest_for_empty_directory_has_only_header(self):
-        # No snapshot files in the dir — manifest contains just the header row.
-        self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        self.assertEqual(self._read_manifest('2024-01-15'),
-                         'filename\ttag\ttimestamp\turl\ttitle\n')
-
-    def test_manifest_excludes_itself_from_listing(self):
-        # Seed a dir, run once → manifest written.  Seed *another* dir on a
-        # different past date and rerun: the first dir's manifest must not
-        # appear as a row in the second dir's manifest (different dirs anyway,
-        # but this test verifies MANIFEST.tsv is excluded from a dir's own
-        # file list).  Simulate by pre-creating MANIFEST.tsv-named non-snapshot
-        # would be wrong; instead, verify the manifest doesn't list itself by
-        # checking no row's filename is MANIFEST.tsv.
-        self._seed_dir('2024-01-15', [
-            ('2024-01-15T10-00-00Z-a.mhtml', 'read_events',
-             'https://a.com', '2024-01-15T10:00:00Z', 'A'),
-        ])
-        snapshot_mover.main()
-        manifest = self._read_manifest('2024-01-15')
-        self.assertNotIn('MANIFEST.tsv', manifest)
-
-    def test_seal_handles_oserror_writing_manifest(self):
-        # If writing the manifest fails, log an error but don't propagate.
-        self._seed_dir('2024-01-15')
-        with patch('builtins.open', side_effect=OSError('disk full')), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-        self.assertTrue(any('Failed to seal' in m for m in cm.output))
-
-    # ----------------------------------------------------------------------
-    # snapshots-table behaviour
-    # ----------------------------------------------------------------------
-
-    def test_seal_pass_marks_db_row_sealed(self):
-        self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
-
-    def test_seal_pass_skips_already_sealed_rows(self):
-        # An already-sealed row should be left alone — no manifest is created
-        # (no file write attempted) and the DB row stays sealed=1.
-        date_subdir = self._seed_dir('2024-01-15', sealed=1)
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
-
-    def test_seal_pass_does_not_touch_directories_not_in_snapshots_table(self):
-        # A directory that exists on disk but has no snapshots-table row is
-        # never sealed by the auto pass — the table is the source of truth.
-        date_subdir = self._seed_dir('2024-01-15', seed_snapshots_row=False)
-        snapshot_mover.main()
-        self.assertFalse(os.path.exists(
-            os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)))
-
-    def test_seal_pass_creates_dir_for_activity_only_day(self):
-        # Insert a snapshots row for a past date with no on-disk dir yet
-        # (the activity-only-day case: host inserted the row but the move
-        # pass never created a dir because no snapshot files landed).
-        # The seal pass creates the dir, writes a header-only MANIFEST,
-        # and flips sealed=1.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", ('2024-01-15',))
-        conn.commit()
-        conn.close()
-
-        snapshot_mover.main()
-
-        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
-        manifest = os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME)
-        self.assertTrue(os.path.isdir(date_subdir))
-        self.assertTrue(os.path.exists(manifest))
-        # Header-only manifest (no snapshot files for the day).
-        lines = Path(manifest).read_text().splitlines()
-        self.assertEqual(lines, ['\t'.join(snapshot_mover._MANIFEST_HEADER)])
-        # Row flipped to sealed=1, no missing_directory error recorded.
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
-        conn = sqlite3.connect(self.db_file)
-        n = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'missing_directory'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(n, 0)
-
-    def test_seal_pass_clears_missing_directory_error_when_dir_reappears(self):
-        # Pre-seed a missing_directory error for a date whose dir has now
-        # been re-created.  The next seal pass should clear the error row.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        date_subdir = self._seed_dir('2024-01-15')   # also creates snapshots row
-        conn = sqlite3.connect(self.db_file)
-        snapshot_mover._record_error(
-            conn, 'missing_directory', date_subdir,
-            FileNotFoundError('previous miss'))
-        conn.close()
-
-        snapshot_mover.main()
-
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'missing_directory'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_manifest_excludes_files_with_invalid_filename_format(self):
-        # Seed a directory with one conforming file (with an events row) and
-        # one non-conforming file.  The manifest should list only the
-        # conforming one; the other should produce an ERROR log + an
-        # 'invalid_filename' mover_errors row.
-        date_str = '2024-01-15'
-        date_subdir = os.path.join(self.dest_dir, date_str)
-        os.makedirs(date_subdir)
-        good = '2024-01-15T10-00-00Z-good.mhtml'
-        bad = 'random-non-snapshot.txt'
-        Path(date_subdir, good).write_bytes(b'g')
-        Path(date_subdir, bad).write_bytes(b'b')
-        conn = sqlite3.connect(self.db_file)
-        host.insert_visit(conn, '2024-01-15T10:00:00Z', 'https://g.com', 'Good')
-        conn.execute(
-            "INSERT INTO read_events (url, timestamp, filename, directory) "
-            "VALUES (?, ?, ?, ?)",
-            ('https://g.com', '2024-01-15T10:00:00Z', good, date_subdir),
-        )
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)", (date_str,))
-        conn.commit()
-        conn.close()
-
-        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover.main()
-
-        # Manifest excludes the bad file.
-        manifest = self._read_manifest(date_str)
-        self.assertIn(good, manifest)
-        self.assertNotIn(bad, manifest)
-        # ERROR was logged for the bad file.
-        self.assertTrue(any(bad in m and 'snapshot filename format' in m
-                            for m in cm.output))
-        # mover_errors row recorded for the bad file.
-        bad_path = os.path.join(date_subdir, bad)
-        conn = sqlite3.connect(self.db_file)
-        row = conn.execute(
-            "SELECT operation, target FROM mover_errors "
-            "WHERE operation = 'invalid_filename'"
-        ).fetchone()
-        conn.close()
-        self.assertEqual(row, ('invalid_filename', bad_path))
-
-    def test_manifest_clears_invalid_filename_error_when_stray_removed(self):
-        # Pre-seed an invalid_filename row for a non-existent file under
-        # date_subdir.  After a manifest rebuild, the reconcile step should
-        # clear it.
-        date_str = '2024-01-15'
-        date_subdir = self._seed_dir(date_str)
-        gone = os.path.join(date_subdir, 'random-non-snapshot.txt')
-        conn = sqlite3.connect(self.db_file)
-        snapshot_mover._record_error(
-            conn, 'invalid_filename', gone,
-            ValueError('synthetic'))
-        conn.close()
-
-        snapshot_mover.main()
-
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'invalid_filename'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_seal_pass_with_empty_snapshots_table_is_noop(self):
-        # No rows → no work, no errors, no manifest writes.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        snapshot_mover.main()  # must not raise
-        self.assertEqual(os.listdir(self.dest_dir), [])
-
-    # -- per-day log move during seal --
-
-    def _write_log(self, date_str, content='line\n'):
-        """Drop a per-day log file into the test's LOG_DIR for date_str."""
-        path = os.path.join(self.log_dir,
-                            snapshot_mover._log_filename_for(date_str))
-        Path(path).write_text(content, encoding='utf-8')
-        return path
-
-    def test_seal_moves_per_day_log_into_sealed_dir_chmod_0o444(self):
-        date_subdir = self._seed_dir('2024-01-15')
-        log_src = self._write_log('2024-01-15', 'action-line\nresult-line\n')
-        snapshot_mover.main()
-        log_dst = os.path.join(date_subdir,
-                               snapshot_mover._log_filename_for('2024-01-15'))
-        self.assertFalse(os.path.exists(log_src))
-        self.assertTrue(os.path.exists(log_dst))
-        self.assertEqual(Path(log_dst).read_text(), 'action-line\nresult-line\n')
-        self.assertEqual(os.stat(log_dst).st_mode & 0o777, 0o444)
-
-    def test_seal_with_no_log_in_log_dir_succeeds_silently(self):
-        # No per-day log for the date — the seal still succeeds, just
-        # without a log file inside the sealed dir.
-        date_subdir = self._seed_dir('2024-01-15')
-        snapshot_mover.main()
-        files = sorted(os.listdir(date_subdir))
-        self.assertNotIn(snapshot_mover._log_filename_for('2024-01-15'), files)
-        self.assertIn(snapshot_mover.MANIFEST_FILENAME, files)
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 1))
-
-    def test_seal_records_seal_error_when_log_move_fails(self):
-        # Force a failure by making the destination dir un-writable AFTER
-        # _write_manifest_file has already written the manifest into it.
-        # We patch shutil.move to raise so the manifest write succeeds but
-        # the log move fails — the row should remain unsealed.
-        date_subdir = self._seed_dir('2024-01-15')
-        self._write_log('2024-01-15')
-        with patch('shutil.move', side_effect=OSError('boom')):
-            snapshot_mover.main()
-        # Row stays unsealed because log move failed.
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
-        # mover_errors row recorded.
-        conn = sqlite3.connect(self.db_file)
-        n = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors "
-            "WHERE operation = 'seal' AND target = ?",
-            (date_subdir,),
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(n, 1)
-
-    # -- orphan-log merge pass --
-
-    def test_orphan_merge_appends_orphan_into_sealed_log(self):
-        # Race: pre-seed a sealed dir with a log file containing the action,
-        # then drop a same-named log file into LOG_DIR containing the result.
-        # Orphan-merge should append + chmod 0o444 + delete the orphan.
-        date_subdir = self._seed_dir('2024-01-15', sealed=1)
-        # Pre-existing sealed log in iCloud (contains the action half).
-        sealed_log = os.path.join(date_subdir,
-                                  snapshot_mover._log_filename_for('2024-01-15'))
-        Path(sealed_log).write_text('uuid\taction\n', encoding='utf-8')
-        os.chmod(sealed_log, 0o444)
-        # Manifest already present so the day stays sealed=1.
-        Path(date_subdir, snapshot_mover.MANIFEST_FILENAME).write_text(
-            '\t'.join(snapshot_mover._MANIFEST_HEADER) + '\n',
-            encoding='utf-8',
-        )
-        os.chmod(os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME),
-                 0o444)
-        # Race orphan in LOG_DIR (the result half).
-        orphan = self._write_log('2024-01-15', 'uuid\tsuccess\n')
-
-        snapshot_mover.main()
-
-        self.assertFalse(os.path.exists(orphan))
-        merged = Path(sealed_log).read_text()
-        self.assertEqual(merged, 'uuid\taction\nuuid\tsuccess\n')
-        self.assertEqual(os.stat(sealed_log).st_mode & 0o777, 0o444)
-
-    def test_orphan_merge_backfills_snapshots_row_when_no_icloud_log(self):
-        # Past-day log exists in LOG_DIR with no iCloud counterpart and no
-        # snapshots row.  The orphan-merge pass should INSERT OR IGNORE the
-        # snapshots row at sealed=0 so the next normal seal pass picks it up.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        self._write_log('2024-01-10', 'uuid\taction\nuuid\tsuccess\n')
-
-        snapshot_mover.main()
-
-        # Row was backfilled AND immediately sealed (the same main() call
-        # runs the seal pass right before the orphan-merge — in the
-        # backfill case the merge runs in a *future* mover tick.  But
-        # main()'s order is move → seal → orphan-merge, so the backfill's
-        # row will be picked up on the NEXT tick.  Either way the row
-        # exists by the end of this main() call.)
-        self.assertIsNotNone(self._snapshots_row('2024-01-10'))
-        # Run main() again so the seal pass actually processes the row.
-        snapshot_mover.main()
-        date_subdir = os.path.join(self.dest_dir, '2024-01-10')
-        sealed_log = os.path.join(date_subdir,
-                                  snapshot_mover._log_filename_for('2024-01-10'))
-        self.assertTrue(os.path.exists(sealed_log))
-        self.assertEqual(self._snapshots_row('2024-01-10'), ('2024-01-10', 1))
-
-    def test_orphan_merge_leaves_today_log_alone(self):
-        # Today's log is still being written by host invocations; the
-        # orphan-merge pass must not touch it.
-        today_iso = self.TODAY.isoformat()
-        today_log = self._write_log(today_iso, 'uuid\taction\n')
-        snapshot_mover.main()
-        self.assertTrue(os.path.exists(today_log))
-        # And no snapshots row was created for today — only past dates
-        # are eligible for backfill.
-        self.assertIsNone(self._snapshots_row(today_iso))
-
-    def test_orphan_merge_is_idempotent_with_no_orphans(self):
-        # No log files in LOG_DIR → orphan-merge is a noop.  Run main()
-        # twice; nothing should change between the two snapshots.
-        snapshot_mover.main()
-        snapshot_mover.main()  # second pass also a noop, no errors
-        self.assertEqual(os.listdir(self.log_dir), [])
-
-    def test_orphan_merge_returns_early_when_log_dir_missing(self):
-        # If LOG_DIR doesn't exist (e.g. user nuked it manually), the
-        # orphan-merge pass should return without raising.
-        import shutil
-        shutil.rmtree(self.log_dir)
-        snapshot_mover.main()  # must not raise
-        self.assertFalse(os.path.isdir(self.log_dir))
-
-    def test_orphan_merge_records_seal_error_when_merge_fails(self):
-        # Pre-seed both halves of a race (iCloud log + LOG_DIR orphan).
-        # Make the iCloud log unwritable so the merge's chmod+append
-        # fails; the orphan-merge pass should record a seal:<dir>
-        # mover_error.
-        date_subdir = self._seed_dir('2024-01-15', sealed=1)
-        Path(date_subdir, snapshot_mover.MANIFEST_FILENAME).write_text(
-            '\t'.join(snapshot_mover._MANIFEST_HEADER) + '\n')
-        os.chmod(os.path.join(date_subdir, snapshot_mover.MANIFEST_FILENAME),
-                 0o444)
-        sealed_log = os.path.join(date_subdir,
-                                  snapshot_mover._log_filename_for('2024-01-15'))
-        Path(sealed_log).write_text('uuid\taction\n')
-        os.chmod(sealed_log, 0o444)
-        self._write_log('2024-01-15', 'uuid\tsuccess\n')
-
-        with patch('shutil.move'):  # stub so seal pass log-move is no-op
-            with patch('builtins.open', side_effect=OSError('boom')):
-                snapshot_mover.main()
-
-        conn = sqlite3.connect(self.db_file)
-        n = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors "
-            "WHERE operation = 'seal' AND target = ?", (date_subdir,),
-        ).fetchone()[0]
-        conn.close()
-        self.assertGreaterEqual(n, 1)
-
-    def test_seal_pass_dry_run_logs_would_create_for_activity_only_day(self):
-        # Insert a snapshots row for a past date with no on-disk dir.
-        # In dry-run, _seal_pass should log the would-create line and not
-        # actually create the directory.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
-            ('2024-01-15',))
-        conn.commit()
-        conn.close()
-        with self.assertLogs(snapshot_mover.logger, level='INFO') as cm:
-            snapshot_mover.main(dry_run=True)
-        self.assertTrue(any('would create' in m for m in cm.output))
-        self.assertFalse(os.path.isdir(os.path.join(self.dest_dir, '2024-01-15')))
-
-    def test_seal_pass_records_seal_error_when_dir_creation_fails(self):
-        # Force os.makedirs to raise OSError when the seal pass tries to
-        # create the date dir.  The pass should record a seal:<dir>
-        # mover_error and continue.
-        os.makedirs(self.dest_dir, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute(
-            "INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
-            ('2024-01-15',))
-        conn.commit()
-        conn.close()
-
-        real_makedirs = os.makedirs
-
-        def boom_for_date_dir(path, *args, **kwargs):
-            if path.endswith('2024-01-15'):
-                raise OSError('disk full')
-            return real_makedirs(path, *args, **kwargs)
-
-        with patch('os.makedirs', side_effect=boom_for_date_dir):
-            snapshot_mover.main()
-
-        conn = sqlite3.connect(self.db_file)
-        rows = conn.execute(
-            "SELECT operation, target FROM mover_errors "
-            "WHERE operation = 'seal'"
-        ).fetchall()
-        conn.close()
-        self.assertEqual(rows,
-                         [('seal', os.path.join(self.dest_dir, '2024-01-15'))])
-        # snapshots row stays unsealed.
-        self.assertEqual(self._snapshots_row('2024-01-15'), ('2024-01-15', 0))
-
 
 class TestTodayUtc(unittest.TestCase):
     """Cover the real _today_utc() (TestSealPass mocks it everywhere else)."""
@@ -1497,603 +323,215 @@ class TestErrorRecording(unittest.TestCase):
         self.assertTrue(any('Could not clear' in m for m in cm.output))
 
 
-class TestEscalation(unittest.TestCase):
-    """Tests for _escalate_errors — when does it notify, when doesn't it?"""
+# ---------------------------------------------------------------------------
+# Direct exercise of the seal helpers used by snapshot_sealer.py.
+#
+# The classes below cover branches that the sealer's own happy-path
+# tests don't reach:
+#   - _build_manifest_rows's invalid_filename / orphan branches.
+#   - _write_manifest_file's "manifest already exists" unlink.
+#   - _seal_directory's exception path.
+#   - _orphan_log_merge_pass's race-orphan and missing-LOG_DIR branches.
+#   - _reconcile_dir_scoped_errors's stale-row deletion.
+#   - _lookup_event's read_events / skimmed_events return paths.
+# ---------------------------------------------------------------------------
+
+class _SealHelpersTestBase(unittest.TestCase):
+    """Common setUp: tmp date subdir + tmp DB + log_dir + paths patched."""
 
     def setUp(self):
-        self.conn = sqlite3.connect(':memory:')
-        snapshot_mover._ensure_mover_errors_table(self.conn)
-        # Pin threshold so tests don't depend on env var.
-        self._saved_threshold = snapshot_mover.MOVER_ERROR_THRESHOLD
-        snapshot_mover.MOVER_ERROR_THRESHOLD = 3
-
-    def tearDown(self):
-        snapshot_mover.MOVER_ERROR_THRESHOLD = self._saved_threshold
-        self.conn.close()
-
-    def _notified(self, key):
-        return self.conn.execute(
-            "SELECT notified FROM mover_errors WHERE key = ?", (key,)
-        ).fetchone()[0]
-
-    def test_persistent_below_threshold_does_not_notify(self):
-        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_not_called()
-        self.assertEqual(self._notified('move:/p'), 0)
-
-    def test_notification_body_includes_per_op_fix_hint(self):
-        # Persistent-class error → notification body should append the
-        # `_FIX_HINTS['move']` text so the user knows what to do.
-        for _ in range(3):
-            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_called_once()
-        body = mock_notify.call_args[0][1]
-        self.assertIn('Fix:', body)
-        self.assertIn(snapshot_mover._FIX_HINTS['move'], body)
-
-    def test_notification_body_for_top_level_includes_top_level_hint(self):
-        snapshot_mover._record_error(
-            self.conn, 'top_level', '', RuntimeError('crash'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        body = mock_notify.call_args[0][1]
-        self.assertIn(snapshot_mover._FIX_HINTS['top_level'], body)
-
-    def test_notification_body_for_rewrite_manifest_includes_hint(self):
-        # Single-shot op — escalates immediately on first occurrence, and
-        # the rewrite_manifest hint pointing at snapshot_sealer is what
-        # tells the user how to recover.
-        snapshot_mover._record_error(
-            self.conn, 'rewrite_manifest', '/d', OSError('boom'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        body = mock_notify.call_args[0][1]
-        self.assertIn(snapshot_mover._FIX_HINTS['rewrite_manifest'], body)
-
-    def test_persistent_at_threshold_notifies_and_marks(self):
-        for _ in range(3):
-            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_called_once()
-        title, body = mock_notify.call_args[0]
-        self.assertIn('mover error', title)
-        self.assertIn('move', body)
-        self.assertIn('/p', body)
-        self.assertEqual(self._notified('move:/p'), 1)
-
-    def test_immediate_notifies_on_first_occurrence(self):
-        snapshot_mover._record_error(
-            self.conn, 'move', '/p', OSError(errno.ENOSPC, 'disk full'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_called_once()
-        self.assertEqual(self._notified('move:/p'), 1)
-
-    def test_top_level_notifies_on_first_occurrence(self):
-        snapshot_mover._record_error(
-            self.conn, 'top_level', '', RuntimeError('crash'))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_called_once()
-        title, body = mock_notify.call_args[0]
-        self.assertIn('crashed', body)
-        self.assertEqual(self._notified('top_level:'), 1)
-
-    def test_already_notified_rows_are_skipped(self):
-        for _ in range(3):
-            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        # First escalation marks notified=1.
-        with patch.object(snapshot_mover, '_notify_user'):
-            snapshot_mover._escalate_errors(self.conn)
-        # Subsequent failures keep accruing attempts.
-        snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-        # Second escalation must not fire.
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover._escalate_errors(self.conn)
-        mock_notify.assert_not_called()
-
-    def test_escalate_db_query_failure_logs_and_returns(self):
-        bad_conn = sqlite3.connect(':memory:')   # no mover_errors table
-        with self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover._escalate_errors(bad_conn)
-        bad_conn.close()
-        self.assertTrue(any('Could not query mover_errors' in m for m in cm.output))
-
-    def test_escalate_update_failure_logs_but_continues(self):
-        for _ in range(3):
-            snapshot_mover._record_error(self.conn, 'move', '/p', OSError('boom'))
-
-        # Wrap the connection so the UPDATE for `notified=1` raises but
-        # everything else (including the SELECT) passes through.
-        # sqlite3.Connection.execute is a C method and can't be patched
-        # directly, so a thin proxy is the cleanest workaround.
-        real_conn = self.conn
-
-        class _FailingOnUpdateConn:
-            def execute(self, sql, *args, **kwargs):
-                if sql.lstrip().upper().startswith('UPDATE MOVER_ERRORS'):
-                    raise sqlite3.OperationalError('fake update failure')
-                return real_conn.execute(sql, *args, **kwargs)
-
-            def commit(self):
-                return real_conn.commit()
-
-        with patch.object(snapshot_mover, '_notify_user'), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover._escalate_errors(_FailingOnUpdateConn())
-        self.assertTrue(any('Could not mark' in m for m in cm.output))
-
-
-class TestNotifyUser(unittest.TestCase):
-    """_notify_user is a thin shell around osascript / a marker file."""
-
-    def setUp(self):
-        # Redirect the attention-file path to a temp location so we don't
-        # touch the real $HOME.
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self._saved = snapshot_mover._ATTENTION_FILE
-        snapshot_mover._ATTENTION_FILE = os.path.join(
-            self.tmp.name, 'mover-needs-attention')
+        self.icloud  = os.path.join(self.tmp.name, 'icloud')
+        self.log_dir = os.path.join(self.tmp.name, 'logs')
+        self.date    = '2024-01-15'
+        self.subdir  = os.path.join(self.icloud, self.date)
+        os.makedirs(self.subdir)
+        os.makedirs(self.log_dir)
+        self.db_path = os.path.join(self.tmp.name, 'visits.db')
+        self.conn = sqlite3.connect(self.db_path)
+        host.ensure_db(self.conn)
+        snapshot_mover._ensure_snapshots_table(self.conn)
+        snapshot_mover._ensure_mover_errors_table(self.conn)
+        # Patch the module-level constants the helpers read.
+        for module, attrs in (
+            (snapshot_mover, {'ICLOUD_SNAPSHOTS_DIR': self.icloud,
+                              'LOG_DIR':              self.log_dir}),
+            (host,           {'LOG_DIR':              self.log_dir}),
+        ):
+            for name, value in attrs.items():
+                p = patch.object(module, name, value)
+                p.start()
+                self.addCleanup(p.stop)
 
     def tearDown(self):
-        snapshot_mover._ATTENTION_FILE = self._saved
+        self.conn.close()
 
-    def test_macos_invokes_osascript(self):
-        with patch.object(snapshot_mover.sys, 'platform', 'darwin'), \
-             patch.object(snapshot_mover.subprocess, 'run') as mock_run:
-            snapshot_mover._notify_user('Title', 'Body')
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        self.assertEqual(args[0], 'osascript')
-        # AppleScript should embed both title and body.
-        joined = ' '.join(args)
-        self.assertIn('Title', joined)
-        self.assertIn('Body', joined)
-
-    def test_macos_subprocess_failure_falls_back_to_marker_file(self):
-        with patch.object(snapshot_mover.sys, 'platform', 'darwin'), \
-             patch.object(snapshot_mover.subprocess, 'run',
-                          side_effect=FileNotFoundError('osascript missing')), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover._notify_user('T', 'B')
-        self.assertTrue(any('osascript' in m for m in cm.output))
-        self.assertTrue(os.path.exists(snapshot_mover._ATTENTION_FILE))
-        contents = Path(snapshot_mover._ATTENTION_FILE).read_text()
-        self.assertIn('T', contents)
-        self.assertIn('B', contents)
-
-    def test_non_macos_writes_marker_file(self):
-        with patch.object(snapshot_mover.sys, 'platform', 'linux'):
-            snapshot_mover._notify_user('T', 'B')
-        self.assertTrue(os.path.exists(snapshot_mover._ATTENTION_FILE))
-
-    def test_non_macos_marker_file_failure_is_swallowed(self):
-        # Point the marker path at an unwritable location.
-        snapshot_mover._ATTENTION_FILE = os.path.join(
-            self.tmp.name, 'no', 'such', 'dir', 'marker')
-        with patch.object(snapshot_mover.sys, 'platform', 'linux'), \
-             self.assertLogs(snapshot_mover.logger, level='ERROR') as cm:
-            snapshot_mover._notify_user('T', 'B')   # must not raise
-        self.assertTrue(any('attention file' in m for m in cm.output))
-
-    def test_applescript_quote_escapes_quotes_and_backslashes(self):
-        self.assertEqual(
-            snapshot_mover._applescript_quote('hello "world"'),
-            '"hello \\"world\\""',
-        )
-        self.assertEqual(
-            snapshot_mover._applescript_quote(r'a\b'),
-            '"a\\\\b"',
-        )
+    def _seed_visit_and_event(self, tag, ts, basename):
+        """Insert a visits row + matching events row pointing at self.subdir."""
+        host.insert_visit(self.conn, ts, 'https://a.com', 'A')
+        table = 'read_events' if tag == 'read' else 'skimmed_events'
+        self.conn.execute(
+            f"INSERT INTO {table} (url, timestamp, filename, directory) "
+            f"VALUES (?, ?, ?, ?)",
+            ('https://a.com', ts, basename, self.subdir))
+        self.conn.commit()
 
 
-class TestErrorWiring(_MoverTestBase):
-    """End-to-end: per-op exceptions create rows; subsequent successes clear them."""
+class TestBuildManifestRows(_SealHelpersTestBase):
 
-    def test_move_failure_records_error_row(self):
-        # Inject an OSError into shutil.copy2 so the move pass fails.
-        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
-                         'a.mhtml', age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        with patch('shutil.copy2', side_effect=OSError(errno.EACCES, 'denied')):
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover._move_pass(conn)
-            finally:
-                conn.close()
-        conn = sqlite3.connect(self.db_file)
-        rows = conn.execute(
-            "SELECT operation, attempts, immediate FROM mover_errors"
-        ).fetchall()
-        conn.close()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], 'move')
-        self.assertEqual(rows[0][1], 1)
-        self.assertEqual(rows[0][2], 0)   # EACCES is not immediate
+    def test_returns_row_for_conforming_file_with_events_row(self):
+        # Happy path — the file is conforming and has a matching events
+        # row, so it appears in the manifest with full metadata.
+        basename = '2024-01-15T10-00-00Z-abc.mhtml'
+        Path(self.subdir, basename).write_bytes(b'data')
+        self._seed_visit_and_event('read', '2024-01-15T10:00:00Z', basename)
+        rows = snapshot_mover._build_manifest_rows(self.conn, self.subdir)
+        self.assertEqual(rows, [(basename, 'read', '2024-01-15T10:00:00Z',
+                                 'https://a.com', 'A')])
 
-    def test_repeated_move_failure_increments_attempts(self):
-        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
-                         'a.mhtml', age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        for _ in range(3):
-            with patch('shutil.copy2',
-                        side_effect=OSError(errno.EACCES, 'denied')):
-                conn = sqlite3.connect(self.db_file)
-                try:
-                    snapshot_mover._move_pass(conn)
-                finally:
-                    conn.close()
-        conn = sqlite3.connect(self.db_file)
-        attempts = conn.execute(
-            "SELECT attempts FROM mover_errors").fetchone()[0]
-        conn.close()
-        self.assertEqual(attempts, 3)
-
-    def test_disk_full_during_move_records_immediate_error(self):
-        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
-                         'a.mhtml', age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        with patch('shutil.copy2',
-                    side_effect=OSError(errno.ENOSPC, 'disk full')):
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover._move_pass(conn)
-            finally:
-                conn.close()
-        conn = sqlite3.connect(self.db_file)
-        immediate = conn.execute(
-            "SELECT immediate FROM mover_errors").fetchone()[0]
-        conn.close()
-        self.assertEqual(immediate, 1)
-
-    def test_successful_move_clears_prior_error_row(self):
-        # Pre-seed an error row, then run a successful move.
-        conn = sqlite3.connect(self.db_file)
-        prefixed = _snap('2024-01-15T10:00:00.000Z', 'a.mhtml')
-        source_path = os.path.join(self.source_dir, prefixed)
-        snapshot_mover._record_error(
-            conn, 'move', source_path, OSError('boom'))
-        conn.close()
-        # Now the same move succeeds.
-        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
-                         'a.mhtml', age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover._move_pass(conn)
-        finally:
-            conn.close()
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'move'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_seal_failure_records_error_row(self):
-        # Pre-seed an unsealed past-date row + dir, then inject a manifest
-        # write failure.  Because the seal pass calls main(), patch
-        # _today_utc so the row qualifies.
-        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
-        os.makedirs(date_subdir)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
-                     ('2024-01-15',))
-        conn.commit()
-        conn.close()
-        with patch.object(snapshot_mover, '_today_utc',
-                          return_value=datetime.date(2024, 1, 20)), \
-             patch.object(snapshot_mover, '_write_manifest_file',
-                          side_effect=OSError('disk full while sealing')):
-            snapshot_mover.main()
-        conn = sqlite3.connect(self.db_file)
-        rows = conn.execute(
+    def test_excludes_non_conforming_filename_and_records_invalid_filename(self):
+        Path(self.subdir, 'random.mhtml').write_bytes(b'x')
+        rows = snapshot_mover._build_manifest_rows(self.conn, self.subdir)
+        self.assertEqual(rows, [])
+        op_target = self.conn.execute(
             "SELECT operation, target FROM mover_errors").fetchall()
-        conn.close()
-        self.assertTrue(any(op == 'seal' and target == date_subdir
-                            for op, target in rows))
+        self.assertEqual(op_target,
+                         [('invalid_filename',
+                           os.path.join(self.subdir, 'random.mhtml'))])
 
-    def test_successful_seal_clears_prior_error_row(self):
-        date_subdir = os.path.join(self.dest_dir, '2024-01-15')
-        os.makedirs(date_subdir)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 0)",
-                     ('2024-01-15',))
-        snapshot_mover._record_error(
-            conn, 'seal', date_subdir, OSError('previous failure'))
-        conn.commit()
-        conn.close()
-        with patch.object(snapshot_mover, '_today_utc',
-                          return_value=datetime.date(2024, 1, 20)):
-            snapshot_mover.main()
-        conn = sqlite3.connect(self.db_file)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM mover_errors WHERE operation = 'seal'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(count, 0)
-
-    def test_straggler_rewrite_failure_records_error_row(self):
-        date_str = '2024-01-15'
-        date_subdir = os.path.join(self.dest_dir, date_str)
-        os.makedirs(date_subdir)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
-                     (date_str,))
-        conn.commit()
-        conn.close()
-        self._make_event('read_events', 'https://a.com', '2024-01-15T10:00:00.000Z',
-                         'a.mhtml', age_seconds=700)
-        os.makedirs(snapshot_mover.ICLOUD_SNAPSHOTS_DIR, exist_ok=True)
-        with patch.object(snapshot_mover, '_write_manifest_file',
-                          side_effect=OSError('disk full')):
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover._move_pass(conn)
-            finally:
-                conn.close()
-        conn = sqlite3.connect(self.db_file)
-        rows = conn.execute(
+    def test_excludes_orphan_file_and_records_orphan_file(self):
+        # Conforming filename but no events row in the DB.
+        basename = '2024-01-15T10-00-00Z-orphan.mhtml'
+        Path(self.subdir, basename).write_bytes(b'x')
+        rows = snapshot_mover._build_manifest_rows(self.conn, self.subdir)
+        self.assertEqual(rows, [])
+        op_target = self.conn.execute(
             "SELECT operation, target FROM mover_errors").fetchall()
-        conn.close()
-        self.assertTrue(any(op == 'rewrite_manifest' and target == date_subdir
-                            for op, target in rows))
+        self.assertEqual(op_target,
+                         [('orphan_file',
+                           os.path.join(self.subdir, basename))])
 
-    def test_invalid_filename_in_downloads_notifies_on_first_occurrence(self):
-        # Stray non-snapshot file in Downloads.  After one main() run, the
-        # row should be marked notified=1 (escalated immediately because
-        # 'invalid_filename' is now classified as immediate).
-        stray = os.path.join(self.source_dir, 'random.bin')
-        Path(stray).write_bytes(b'x')
-        mtime = time.time() - 700
-        os.utime(stray, (mtime, mtime))
-        with patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover.main()
-        mock_notify.assert_called_once()
-        body = mock_notify.call_args[0][1]
-        self.assertIn(snapshot_mover._FIX_HINTS['invalid_filename'], body)
-        conn = sqlite3.connect(self.db_file)
-        notified = conn.execute(
-            "SELECT notified FROM mover_errors WHERE operation = 'invalid_filename'"
-        ).fetchone()[0]
-        conn.close()
-        self.assertEqual(notified, 1)
+    def test_lookup_event_finds_skimmed_row(self):
+        # Covers _lookup_event's skimmed_events branch.
+        basename = '2024-01-15T10-00-00Z-skim.mhtml'
+        Path(self.subdir, basename).write_bytes(b'x')
+        self._seed_visit_and_event('skimmed', '2024-01-15T10:00:00Z', basename)
+        rows = snapshot_mover._build_manifest_rows(self.conn, self.subdir)
+        self.assertEqual(rows[0][1], 'skimmed')
 
-    def test_straggler_rewrite_failure_notifies_on_first_occurrence(self):
-        # A single straggler whose manifest rewrite fails should escalate
-        # without waiting for further stragglers (which may never arrive).
-        date_str = '2024-01-15'
-        date_subdir = os.path.join(self.dest_dir, date_str)
-        os.makedirs(date_subdir)
-        conn = sqlite3.connect(self.db_file)
-        conn.execute("INSERT INTO snapshots (date, sealed) VALUES (?, 1)",
-                     (date_str,))
-        conn.commit()
-        conn.close()
-        self._make_event('read_events', 'https://a.com',
-                         '2024-01-15T10:00:00.000Z', 'a.mhtml',
-                         age_seconds=700)
+
+class TestWriteManifestFile(_SealHelpersTestBase):
+
+    def test_overwrites_existing_read_only_manifest(self):
+        # Pre-create a 0o444 manifest so the unlink branch fires before
+        # the rewrite (open(path, 'w') would otherwise fail).
+        path = os.path.join(self.subdir, snapshot_mover.MANIFEST_FILENAME)
+        Path(path).write_text('STALE\n')
+        os.chmod(path, 0o444)
+        # Seed a real row so the rewrite produces non-empty content.
+        basename = '2024-01-15T10-00-00Z-abc.mhtml'
+        Path(self.subdir, basename).write_bytes(b'x')
+        self._seed_visit_and_event('read', '2024-01-15T10:00:00Z', basename)
+        count = snapshot_mover._write_manifest_file(self.conn, self.subdir)
+        self.assertEqual(count, 1)
+        body = open(path, encoding='utf-8').read().splitlines()
+        # Header + one data row.
+        self.assertEqual(len(body), 2)
+        self.assertNotIn('STALE', body[0])
+
+
+class TestSealDirectoryFailurePath(_SealHelpersTestBase):
+
+    def test_failure_recorded_to_mover_errors(self):
+        # Force _write_manifest_file to raise so we hit _seal_directory's
+        # except branch.  The 'seal' error row should appear.
         with patch.object(snapshot_mover, '_write_manifest_file',
-                          side_effect=OSError('disk full')), \
-             patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            snapshot_mover.main()
-        mock_notify.assert_called_once()
-        body = mock_notify.call_args[0][1]
-        self.assertIn('rewrite_manifest', body)
-        self.assertIn(snapshot_mover._FIX_HINTS['rewrite_manifest'], body)
-
-    def test_top_level_failure_records_and_notifies_then_reraises(self):
-        with patch.object(snapshot_mover, '_move_pass',
-                          side_effect=RuntimeError('unexpected explosion')), \
-             patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            with self.assertRaises(RuntimeError):
-                snapshot_mover.main()
-        mock_notify.assert_called_once()
-        conn = sqlite3.connect(self.db_file)
-        row = conn.execute(
-            "SELECT operation, target, immediate, notified "
-            "FROM mover_errors WHERE operation = 'top_level'"
-        ).fetchone()
-        conn.close()
-        self.assertIsNotNone(row)
-        self.assertEqual(row[0], 'top_level')
-        self.assertEqual(row[1], '')
-        self.assertEqual(row[2], 1)   # immediate
-        self.assertEqual(row[3], 1)   # notified
-
-    def test_top_level_db_fallback_uses_direct_notification(self):
-        # If the DB-recording path itself fails, _notify_user is still
-        # invoked directly with a generic crash message.
-        original_connect = sqlite3.connect
-
-        def _failing_connect(path, *args, **kwargs):
-            # Allow setUp's connection to succeed; fail any *new* one made
-            # inside main().
-            raise sqlite3.OperationalError('cannot open database')
-
-        # Allow os.makedirs to succeed.  Wrap `os.path.exists` so that the
-        # DB path appears to exist (forcing main() to reach the connect).
-        with patch.object(snapshot_mover, 'sqlite3') as mock_sqlite, \
-             patch.object(snapshot_mover.os.path, 'exists', return_value=True), \
-             patch.object(snapshot_mover, '_notify_user') as mock_notify:
-            mock_sqlite.connect.side_effect = sqlite3.OperationalError('boom')
-            mock_sqlite.Error = sqlite3.Error
-            mock_sqlite.OperationalError = sqlite3.OperationalError
-            mock_sqlite.DatabaseError = sqlite3.DatabaseError
-            with self.assertRaises(sqlite3.OperationalError):
-                snapshot_mover.main()
-        mock_notify.assert_called_once()
-        title, body = mock_notify.call_args[0]
-        self.assertIn('crashed', title.lower())
+                          side_effect=OSError('no space')):
+            snapshot_mover._seal_directory(
+                self.conn, self.subdir, dry_run=False, date_key=self.date)
+        ops = self.conn.execute(
+            "SELECT operation, target FROM mover_errors").fetchall()
+        self.assertEqual(ops, [('seal', self.subdir)])
 
 
-# ---------------------------------------------------------------------------
-# archive_for_tag — host.py's synchronous archive entry point.
-# ---------------------------------------------------------------------------
-class TestArchiveForTag(_MoverTestBase):
-    """Exercise the public archive_for_tag wrapper called by host.py."""
+class TestOrphanLogMergePass(_SealHelpersTestBase):
 
-    def _make_visit_row(self, url, ts):
-        """Insert a visit so _insert_event has something to attach events to."""
-        conn = sqlite3.connect(self.db_file)
-        try:
-            host.insert_visit(conn, ts, url, 'A title')
-        finally:
-            conn.close()
-
-    def _seed_pending_event(self, url, ts, basename):
-        """Insert a read_events row pointing at the Downloads dir, mirroring
-        what host.py's tag_visit does before calling archive_for_tag."""
-        self._make_visit_row(url, ts)
-        conn = sqlite3.connect(self.db_file)
-        try:
-            conn.execute(
-                "INSERT INTO read_events (url, timestamp, filename, directory) "
-                "VALUES (?, ?, ?, ?)",
-                (url, ts, basename, snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR))
-            conn.commit()
-        finally:
-            conn.close()
-
-    def test_archives_file_synchronously(self):
-        # Drop a real file in the Downloads source dir, seed an events
-        # row pointing at it, then archive_for_tag should move the file
-        # to the iCloud date subdir and update the events row.
-        basename = _snap(ISO_TS1, 'live.mhtml')
-        src = os.path.join(snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR, basename)
-        Path(src).write_bytes(b'snapshot bytes')
-        url = 'https://example.com'
-        self._seed_pending_event(url, ISO_TS1, basename)
-
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover.archive_for_tag(
-                conn, f'browser-visit-snapshots/{basename}')
-        finally:
-            conn.close()
-
-        date_subdir = os.path.join(snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
-                                   '2024-01-15')
-        self.assertFalse(os.path.exists(src), 'source should be unlinked')
-        self.assertTrue(
-            os.path.exists(os.path.join(date_subdir, basename)),
-            'destination should exist in iCloud date subdir')
-        # events row's directory column flipped.
-        self.assertEqual(
-            self._row('read_events', url),
-            (basename, date_subdir))
-
-    def test_empty_filename_is_a_noop(self):
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover.archive_for_tag(conn, '')          # no-op
-            snapshot_mover.archive_for_tag(conn, '/')         # basename ''
-        finally:
-            conn.close()
-        # No mover_errors row should have been written.
-        conn = sqlite3.connect(self.db_file)
-        n = conn.execute("SELECT COUNT(*) FROM mover_errors").fetchone()[0]
-        conn.close()
+    def test_log_dir_absent_is_a_silent_noop(self):
+        # Patch LOG_DIR to a path that doesn't exist; the function should
+        # return immediately without raising.
+        bogus = os.path.join(self.tmp.name, 'never-created')
+        with patch.object(snapshot_mover, 'LOG_DIR', bogus):
+            snapshot_mover._orphan_log_merge_pass(self.conn)
+        # No mover_errors row inserted.
+        n = self.conn.execute(
+            "SELECT COUNT(*) FROM mover_errors").fetchone()[0]
         self.assertEqual(n, 0)
 
-    def test_invalid_filename_records_error_row(self):
-        conn = sqlite3.connect(self.db_file)
-        try:
-            snapshot_mover.archive_for_tag(
-                conn, 'browser-visit-snapshots/not-a-snapshot-name.txt')
-        finally:
-            conn.close()
-        conn = sqlite3.connect(self.db_file)
-        rows = conn.execute(
-            "SELECT operation FROM mover_errors").fetchall()
-        conn.close()
-        self.assertEqual(rows, [('invalid_filename',)])
+    def test_race_orphan_appended_into_icloud_log_and_unlinked(self):
+        # Set up: an iCloud log file already exists for a past date,
+        # AND a fresh orphan with the same date sits in LOG_DIR.  The
+        # pass should append the orphan into the iCloud log and unlink
+        # the orphan.
+        fname = snapshot_mover._log_filename_for(self.date)
+        icloud_log = os.path.join(self.subdir, fname)
+        Path(icloud_log).write_text('original\n', encoding='utf-8')
+        os.chmod(icloud_log, 0o444)
+        log_orphan = os.path.join(self.log_dir, fname)
+        Path(log_orphan).write_text('appended\n', encoding='utf-8')
+        # Use a future today so self.date is past-day.
+        with patch.object(snapshot_mover, '_today_utc',
+                          return_value=datetime.date(2099, 1, 1)):
+            snapshot_mover._orphan_log_merge_pass(self.conn)
+        # Orphan unlinked, iCloud log now contains both.
+        self.assertFalse(os.path.exists(log_orphan))
+        body = open(icloud_log, encoding='utf-8').read()
+        self.assertIn('original',  body)
+        self.assertIn('appended',  body)
 
-    def test_missing_source_file_is_a_logged_noop(self):
-        # The basename matches the snapshot regex but no file exists at
-        # the expected source location.  archive_for_tag should log a
-        # warning and return without raising or recording an error.
-        basename = _snap(ISO_TS1, 'gone.mhtml')
-        conn = sqlite3.connect(self.db_file)
-        try:
-            with self.assertLogs(snapshot_mover.logger, level='WARNING') as cm:
-                snapshot_mover.archive_for_tag(
-                    conn, f'browser-visit-snapshots/{basename}')
-        finally:
-            conn.close()
-        self.assertTrue(
-            any('not present' in m for m in cm.output),
-            f'expected a warning about missing source; got {cm.output!r}')
-        conn = sqlite3.connect(self.db_file)
-        n = conn.execute("SELECT COUNT(*) FROM mover_errors").fetchone()[0]
-        conn.close()
+    def test_missing_icloud_log_inserts_snapshots_row(self):
+        # Past-day log in LOG_DIR with no iCloud counterpart → backfill
+        # a snapshots row at sealed=0 so the next seal pass picks it up.
+        fname = snapshot_mover._log_filename_for(self.date)
+        Path(self.log_dir, fname).write_text('x', encoding='utf-8')
+        with patch.object(snapshot_mover, '_today_utc',
+                          return_value=datetime.date(2099, 1, 1)):
+            snapshot_mover._orphan_log_merge_pass(self.conn)
+        rows = self.conn.execute(
+            "SELECT date, sealed FROM snapshots WHERE date = ?",
+            (self.date,)).fetchall()
+        self.assertEqual(rows, [(self.date, 0)])
+
+    def test_oserror_during_merge_is_logged_and_recorded(self):
+        # Trigger an OSError mid-merge and verify the except-block
+        # records a 'seal' error row.
+        fname = snapshot_mover._log_filename_for(self.date)
+        Path(self.subdir, fname).write_text('x', encoding='utf-8')
+        os.chmod(os.path.join(self.subdir, fname), 0o444)
+        Path(self.log_dir, fname).write_text('y', encoding='utf-8')
+        with patch.object(snapshot_mover, '_today_utc',
+                          return_value=datetime.date(2099, 1, 1)), \
+             patch('os.chmod', side_effect=OSError('denied')):
+            snapshot_mover._orphan_log_merge_pass(self.conn)
+        ops = self.conn.execute(
+            "SELECT operation, target FROM mover_errors").fetchall()
+        self.assertEqual(ops, [('seal', self.subdir)])
+
+
+class TestReconcileDirScopedErrors(_SealHelpersTestBase):
+
+    def test_clears_stale_row_under_dir_path(self):
+        # Pre-seed an invalid_filename row whose target is inside the
+        # date subdir, then run a reconcile with currentStrays=[] —
+        # the row should be deleted because it's "no longer present".
+        target = os.path.join(self.subdir, 'gone.mhtml')
+        snapshot_mover._record_error(
+            self.conn, 'invalid_filename', target, ValueError('synthetic'))
+        snapshot_mover._reconcile_dir_scoped_errors(
+            self.conn, 'invalid_filename', self.subdir, [])
+        n = self.conn.execute(
+            "SELECT COUNT(*) FROM mover_errors").fetchone()[0]
         self.assertEqual(n, 0)
-
-
-# ---------------------------------------------------------------------------
-# Public-alias smoke tests — sweep_pass / seal_pass / orphan_log_merge_pass /
-# escalate_errors / fetch_pending_errors are thin wrappers, but they are the
-# verifier's public surface, so a dedicated test pins their existence and
-# delegation behavior.
-# ---------------------------------------------------------------------------
-class TestPublicAliases(_MoverTestBase):
-
-    def test_sweep_pass_delegates_to_move_pass(self):
-        with patch.object(snapshot_mover, '_move_pass') as mock:
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover.sweep_pass(conn, dry_run=True)
-            finally:
-                conn.close()
-        mock.assert_called_once_with(conn, dry_run=True)
-
-    def test_seal_pass_delegates_to_underscored_seal_pass(self):
-        with patch.object(snapshot_mover, '_seal_pass') as mock:
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover.seal_pass(conn, dry_run=True)
-            finally:
-                conn.close()
-        mock.assert_called_once_with(conn, dry_run=True)
-
-    def test_orphan_log_merge_pass_delegates(self):
-        with patch.object(snapshot_mover, '_orphan_log_merge_pass') as mock:
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover.orphan_log_merge_pass(conn)
-            finally:
-                conn.close()
-        mock.assert_called_once_with(conn)
-
-    def test_escalate_errors_delegates(self):
-        with patch.object(snapshot_mover, '_escalate_errors') as mock:
-            conn = sqlite3.connect(self.db_file)
-            try:
-                snapshot_mover.escalate_errors(conn)
-            finally:
-                conn.close()
-        mock.assert_called_once_with(conn)
-
-    def test_fetch_pending_errors_returns_rows_in_first_seen_order(self):
-        conn = sqlite3.connect(self.db_file)
-        try:
-            with patch.object(snapshot_mover, '_now_iso',
-                              side_effect=['2024-01-15T10:00:00+00:00',
-                                           '2024-01-15T10:00:01+00:00']):
-                snapshot_mover._record_error(conn, 'move', '/a', OSError('a'))
-                snapshot_mover._record_error(conn, 'seal', '/b', OSError('b'))
-            rows = snapshot_mover.fetch_pending_errors(conn)
-        finally:
-            conn.close()
-        # first_seen ordering: a (10:00:00) before b (10:00:01).
-        self.assertEqual([r[1] for r in rows], ['move', 'seal'])
 
 
 if __name__ == '__main__':  # pragma: no cover

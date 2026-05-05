@@ -1,34 +1,13 @@
-#!/usr/bin/env python3
 """
-Native messaging host for Browser Visit Logger.
+Browser Visit Logger — Python DB helpers used by the rebuilder.
 
-Receives a single JSON visit record from Chrome via stdin (native messaging
-protocol: 4-byte LE length prefix + UTF-8 JSON), writes the record to a TSV
-log file and a SQLite database, then sends a JSON response to stdout.
-
-Chrome launches this script once per sendNativeMessage() call (MV3 one-shot
-semantics): read one message → write outputs → respond → exit.
-
-Message types
--------------
-Auto-log (from background.js):
-    { "timestamp": "...", "url": "...", "title": "..." }
-    → INSERT OR IGNORE new row (first visit wins); append 3-field TSV line.
-
-Tag action (from popup.js / background.js):
-    { "timestamp": "...", "url": "...", "title": "...", "tag": "of_interest"|"read"|"skimmed"
-      [, "filename": "browser-visit-snapshots/<hash>.<ext>"] }
-    → INSERT OR IGNORE the visit row first (so tagging always works even if the
-      auto-log hasn't fired yet), then update of_interest, read, or skimmed;
-      append 4-field TSV line.
-      For "read" and "skimmed": Chrome saves a snapshot and sends its filename
-      (Chrome's relative path under ~/Downloads). After inserting the events
-      row (initially with directory = ~/Downloads/browser-visit-snapshots/),
-      this host *synchronously* archives the file into the matching iCloud
-      date subdir via snapshot_mover.archive_for_tag, which updates the
-      events row's directory column in the same transaction.  If the archive
-      fails, the events row is left pointing at Downloads and the periodic
-      verifier sweep will retry on its next tick.
+This module used to be the Chrome native-messaging host
+(`read_message → write/log/DB → write_message`), but that role moved
+to the Swift `BVLHost` binary inside `BrowserVisitLoggerHost.app`.
+What remains here are the schema and insert helpers that
+`visits_rebuilder.py` imports to replay log files into a fresh
+database; nothing on the production tagging path runs through Python
+any more.
 
 Schema
 ------
@@ -61,36 +40,10 @@ Schema
         date   TEXT PRIMARY KEY,         -- 'YYYY-MM-DD' (UTC) of host activity
         sealed INTEGER NOT NULL DEFAULT 0
     )
-
-Log file layout
----------------
-The visit log is split per UTC day: <LOG_DIR>/browser-visits-<YYYY-MM-DD>.log.
-Each invocation pins its date at start (so action+result lines stay together
-even across midnight UTC).  The verifier later moves each day's log into
-the matching iCloud snapshot directory once the day is complete.
-
-TCC / app bundle
-----------------
-host.py runs inside a code-signed app bundle (BrowserVisitLoggerHost.app)
-so it has its own stable TCC identity.  The user grants the app
-Files & Folders → Downloads access (and ~/Documents access) once on
-first run; from then on the synchronous archive in archive_for_tag can
-read Downloads and write the iCloud-synced Documents subdir.  Without
-the bundle, Chrome-spawned native messaging hosts run with no TCC grant
-and every Downloads access fails with EPERM.
 """
 
-import datetime
-import json
-import logging
 import os
 import sqlite3
-import struct
-import sys
-import uuid
-from logging.handlers import RotatingFileHandler
-
-import snapshot_mover
 
 
 # ---------------------------------------------------------------------------
@@ -99,13 +52,13 @@ import snapshot_mover
 # ---------------------------------------------------------------------------
 HOME     = os.path.expanduser('~')
 # Per-day visit logs live under LOG_DIR as `browser-visits-<UTC-date>.log`.
-# The sealer collects each day's log into the matching iCloud snapshot dir.
 LOG_DIR  = os.environ.get('BVL_LOG_DIR',  HOME)
 DB_FILE  = os.environ.get('BVL_DB_FILE',  os.path.join(HOME, 'browser-visits.db'))
-HOST_LOG = os.environ.get('BVL_HOST_LOG', os.path.join(HOME, 'browser-visits-host.log'))
 
-# Snapshot storage locations.  Chrome writes snapshots to the Downloads dir;
-# the periodic mover later copies them to the iCloud-synced Documents dir.
+# Snapshot storage locations.  These are baked into the events tables'
+# column defaults at CREATE TABLE time (so ad-hoc INSERTs without a
+# directory get a sensible value); the production Swift code records
+# the actual on-disk locations explicitly per row.
 DOWNLOADS_SNAPSHOTS_DIR = os.environ.get(
     'BVL_DOWNLOADS_SNAPSHOTS_DIR',
     os.path.join(HOME, 'Downloads', 'browser-visit-snapshots'),
@@ -115,46 +68,9 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
     os.path.join(HOME, 'Documents', 'browser-visit-logger', 'snapshots'),
 )
 
-# ---------------------------------------------------------------------------
-# Host process logging (errors/debug — never written to stderr)
-# ---------------------------------------------------------------------------
-_handler = RotatingFileHandler(HOST_LOG, maxBytes=1_048_576, backupCount=3)
-_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-logger = logging.getLogger('bvl')
-logger.setLevel(logging.DEBUG)
-logger.addHandler(_handler)
-
-# Surface snapshot_mover's log lines (archive_for_tag warnings, _move_one
-# info/error) in the same host log.  Without this, Chrome discards
-# stderr from native messaging hosts and any archive failure would be
-# invisible.
-snapshot_mover.logger.addHandler(_handler)
 
 # ---------------------------------------------------------------------------
-# Native messaging I/O
-# ---------------------------------------------------------------------------
-
-def read_message() -> dict:
-    """Read one native message from stdin (binary mode)."""
-    raw_length = sys.stdin.buffer.read(4)
-    if len(raw_length) < 4:
-        raise EOFError('stdin closed before length header was complete')
-    msg_length = struct.unpack('<I', raw_length)[0]
-    raw_message = sys.stdin.buffer.read(msg_length)
-    if len(raw_message) < msg_length:
-        raise EOFError('stdin closed mid-message')
-    return json.loads(raw_message.decode('utf-8'))
-
-
-def write_message(payload: dict) -> None:
-    """Write one native message to stdout (binary mode)."""
-    encoded = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    sys.stdout.buffer.write(struct.pack('<I', len(encoded)))
-    sys.stdout.buffer.write(encoded)
-    sys.stdout.buffer.flush()
-
-# ---------------------------------------------------------------------------
-# SQLite helpers
+# Schema helpers
 # ---------------------------------------------------------------------------
 
 def ensure_db(conn: sqlite3.Connection) -> None:
@@ -180,12 +96,12 @@ def ensure_db(conn: sqlite3.Connection) -> None:
     _ensure_events_table(conn, 'read_events')
     _ensure_events_table(conn, 'skimmed_events')
 
-    # snapshots table: one row per UTC day with host activity.  host.py
-    # inserts (date, sealed=0) on every write invocation; the sealer flips
-    # to sealed=1 once it has moved the day's log + written MANIFEST.tsv.
-    # Owned here (rather than only by snapshot_mover) so a brand-new
-    # install with no mover run yet still has the table available for
-    # host's per-invocation INSERT OR IGNORE.
+    # snapshots table: one row per UTC day with host activity.  The
+    # production Swift host inserts (date, sealed=0) on every write;
+    # the verifier flips to sealed=1 once it has moved the day's log
+    # and written MANIFEST.tsv.  Owned here (rather than only by
+    # snapshot_mover) so a brand-new install with no Swift run yet
+    # still has the table present.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
             date   TEXT PRIMARY KEY,
@@ -218,6 +134,10 @@ def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
     """)
 
 
+# ---------------------------------------------------------------------------
+# Insert / update helpers — used by visits_rebuilder.py during log replay
+# ---------------------------------------------------------------------------
+
 def _insert_event(
     conn: sqlite3.Connection, table: str, url: str, timestamp: str,
     visits_col: str, filename: str = '',
@@ -225,10 +145,10 @@ def _insert_event(
     """Insert a timestamped event for url into table if the URL exists in visits,
     and increment the corresponding counter column in visits by 1.
 
-    The filename is normalized to its basename before being stored (background.js
-    sends Chrome's relative path under Downloads, e.g. 'browser-visit-snapshots/
-    <hash>.mhtml'; the parent directory is captured separately in the directory
-    column so the basename alone is sufficient).
+    The filename is normalized to its basename before being stored (the log
+    captures Chrome's relative path under Downloads, e.g. 'browser-visit-
+    snapshots/<hash>.mhtml'; the parent directory is captured separately in
+    the directory column so the basename alone is sufficient).
 
     Returns True if the URL exists (event inserted or duplicate ignored),
     False if no visits record exists for the URL.
@@ -252,22 +172,6 @@ def _insert_event(
     return exists is not None
 
 
-def _fetch_events(conn: sqlite3.Connection, table: str, url: str) -> list:
-    """Return all events for url from table as dicts {timestamp, filename, directory},
-    sorted ascending by timestamp.
-
-    table is a trusted internal constant, never user-supplied.
-    """
-    return [
-        {'timestamp': r[0], 'filename': r[1], 'directory': r[2]}
-        for r in conn.execute(
-            f"SELECT timestamp, filename, directory FROM {table} "
-            f"WHERE url = ? ORDER BY timestamp ASC",
-            (url,),
-        ).fetchall()
-    ]
-
-
 def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str) -> None:
     """Insert a new visit row; silently ignored if the URL already exists."""
     conn.execute(
@@ -277,30 +181,13 @@ def insert_visit(conn: sqlite3.Connection, timestamp: str, url: str, title: str)
     conn.commit()
 
 
-def query_visit(conn: sqlite3.Connection, url: str) -> 'dict | None':
-    """Return the visit record for url as a dict, or None if no record exists."""
-    row = conn.execute(
-        "SELECT timestamp, title, of_interest FROM visits WHERE url = ?",
-        (url,),
-    ).fetchone()
-    if row is None:
-        return None
-    return {
-        'timestamp':   row[0],
-        'title':       row[1],
-        'of_interest': True if row[2] else None,
-        'read':        _fetch_events(conn, 'read_events',    url),
-        'skimmed':     _fetch_events(conn, 'skimmed_events', url),
-    }
-
-
 def tag_visit(
     conn: sqlite3.Connection, url: str, tag: str, tag_timestamp: str, filename: str = '',
 ) -> bool:
     """Set the of_interest, read, or skimmed timestamp on the visit record for url.
 
-    For 'read' and 'skimmed' tags, filename is the snapshot filename as Chrome
-    reports it (relative path under ~/Downloads, e.g.
+    For 'read' and 'skimmed' tags, filename is the snapshot filename as the
+    log records it (relative path under ~/Downloads, e.g.
     'browser-visit-snapshots/<hash>.mhtml').  _insert_event normalizes it to
     its basename before storage.
 
@@ -318,167 +205,3 @@ def tag_visit(
         return False
     conn.commit()
     return cursor.rowcount > 0
-
-# ---------------------------------------------------------------------------
-# Log file helper
-# ---------------------------------------------------------------------------
-
-def _log_path_for(date_iso: str) -> str:
-    """Return the per-day log file path for a UTC date 'YYYY-MM-DD'."""
-    return os.path.join(LOG_DIR, f'browser-visits-{date_iso}.log')
-
-
-def append_log(
-    record_id: str, date_iso: str,
-    timestamp: str, url: str, title: str,
-    tag: str = '', filename: str = '',
-) -> None:
-    """Append one TSV action line, prefixed with record_id, to the per-day log.
-
-    The log file is `<LOG_DIR>/browser-visits-<date_iso>.log`.  date_iso is
-    pinned at host invocation start so this line and the matching result line
-    always land in the same file even if the wall clock crosses midnight UTC
-    mid-invocation.
-
-    Field layout:
-        <record_id>\\t<timestamp>\\t<url>\\t<title>                          # auto-log
-        <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>                   # of_interest
-        <record_id>\\t<timestamp>\\t<url>\\t<title>\\t<tag>\\t<filename>      # read / skimmed
-    """
-    def sanitise(s: str) -> str:
-        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
-
-    fields = [sanitise(record_id), sanitise(timestamp), sanitise(url), sanitise(title)]
-    if tag:
-        fields.append(sanitise(tag))
-        if tag in ('read', 'skimmed'):
-            fields.append(sanitise(filename))
-    line = '\t'.join(fields) + '\n'
-    with open(_log_path_for(date_iso), 'a', encoding='utf-8') as f:
-        f.write(line)
-
-
-def append_result_log(record_id: str, date_iso: str, result: str) -> None:
-    """Append a result line prefixed with record_id to the per-day log:
-    '<record_id>\\tsuccess' or '<record_id>\\terror: <message>'."""
-    def sanitise(s: str) -> str:
-        return s.replace('\t', ' ').replace('\n', ' ').replace('\r', '')
-
-    line = sanitise(record_id) + '\t' + sanitise(result) + '\n'
-    with open(_log_path_for(date_iso), 'a', encoding='utf-8') as f:
-        f.write(line)
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-VALID_TAGS = {'of_interest', 'read', 'skimmed'}
-
-
-def main() -> None:
-    try:
-        message = read_message()
-        logger.debug('Received: %s', message)
-    except Exception as exc:
-        logger.error('Failed to read message: %s', exc)
-        write_message({'status': 'error', 'message': str(exc)})
-        return
-
-    record_id = uuid.uuid4().hex
-    # Pin the per-day log file to the date the invocation started.  Used for
-    # both the action and the result line so they always land in the same
-    # file even if the wall clock crosses midnight UTC mid-invocation.
-    today_iso = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-
-    url    = (message.get('url') or '').strip()
-    action = (message.get('action') or '').strip()
-
-    # Query action: read-only lookup, no log writes.
-    if action == 'query':
-        if not url:
-            write_message({'status': 'error', 'message': 'url is required'})
-            return
-        try:
-            conn = sqlite3.connect(DB_FILE)
-            ensure_db(conn)
-            record = query_visit(conn, url)
-            conn.close()
-        except Exception as exc:
-            logger.error('SQLite query failed: %s', exc)
-            write_message({'status': 'error', 'message': str(exc)})
-            return
-        write_message({'status': 'ok', 'record': record})
-        return
-
-    timestamp = (message.get('timestamp') or '').strip()
-    title     = message.get('title') or ''
-    tag       = (message.get('tag')      or '').strip()
-    filename  = (message.get('filename') or '').strip()
-
-    if not url:
-        write_message({'status': 'error', 'message': 'url is required'})
-        return
-    if not timestamp:
-        write_message({'status': 'error', 'message': 'timestamp is required'})
-        return
-    if tag and tag not in VALID_TAGS:
-        write_message({'status': 'error', 'message': f'invalid tag: {tag}'})
-        return
-
-    errors = []
-
-    # First write: record the intended action
-    try:
-        append_log(record_id, today_iso, timestamp, url, title, tag, filename)
-    except Exception as exc:
-        logger.error('Log file write failed: %s', exc)
-        errors.append(f'log: {exc}')
-
-    # Write to SQLite.  Always insert the visit first (INSERT OR IGNORE, so the
-    # original first-visit timestamp wins if the row already exists); then apply
-    # the tag if one is present.  This means tagging always works even when the
-    # background auto-log hasn't finished writing yet.  Also INSERT OR IGNORE a
-    # snapshots row for today so the seal pass picks up activity-only days
-    # uniformly with snapshot-bearing days.
-    #
-    # For read/skimmed tags with a filename, the events row is inserted first
-    # (pointing at the Downloads dir), then snapshot_mover.archive_for_tag
-    # synchronously copies the file to the iCloud date subdir and UPDATEs
-    # the events row's directory column.  Doing the archive on the host
-    # process means we benefit from the bundle's TCC grant; doing it after
-    # the events insert means a mid-archive crash leaves a recoverable
-    # state (file in Downloads, events row points there, sweep retries).
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        ensure_db(conn)
-        snapshot_mover._ensure_mover_errors_table(conn)
-        conn.execute(
-            "INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)",
-            (today_iso,),
-        )
-        conn.commit()
-        insert_visit(conn, timestamp, url, title)
-        if tag:
-            tag_visit(conn, url, tag, timestamp, filename)
-            if tag in ('read', 'skimmed') and filename:
-                snapshot_mover.archive_for_tag(conn, filename)
-        conn.close()
-    except Exception as exc:
-        logger.error('SQLite write failed: %s', exc)
-        errors.append(f'db: {exc}')
-
-    # Second write: record the result
-    log_result = f'error: {"; ".join(errors)}' if errors else 'success'
-    try:
-        append_result_log(record_id, today_iso, log_result)
-    except Exception as exc:
-        logger.error('Log file result write failed: %s', exc)
-
-    if errors:
-        write_message({'status': 'error', 'errors': errors})
-    else:
-        write_message({'status': 'ok'})
-
-
-if __name__ == '__main__':  # pragma: no cover
-    main()

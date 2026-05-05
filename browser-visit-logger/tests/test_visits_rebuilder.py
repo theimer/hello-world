@@ -28,6 +28,8 @@ import host
 import snapshot_mover
 import visits_rebuilder as vr
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -1011,147 +1013,6 @@ class TestCLI(_CLIBase):
 # ---------------------------------------------------------------------------
 # End-to-end via host.py + snapshot_mover
 # ---------------------------------------------------------------------------
-
-class TestEndToEnd(unittest.TestCase):
-    """Full pipeline round-trip: drive host.main() for a few messages, run
-    the mover/sealer pass, snapshot the DB, wipe the DB, run rebuild, and
-    diff.  The rebuilt DB must match the original (modulo mover_errors)."""
-
-    def _drive_host(self, message, tmp):
-        """Call host.main() inline with patched paths and a JSON message
-        delivered via stdin in the native-messaging framing format."""
-        import json, struct
-        payload = json.dumps(message).encode('utf-8')
-        framed = struct.pack('<I', len(payload)) + payload
-
-        log_dir  = os.path.join(tmp, 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        db_path  = os.path.join(tmp, 'visits.db')
-        src      = os.path.join(tmp, 'dl')
-
-        stdin  = io.BytesIO(framed)
-        stdout = io.BytesIO()
-        stdin.buffer  = stdin   # host expects sys.stdin.buffer
-        stdout.buffer = stdout  # and sys.stdout.buffer
-
-        with patch.object(host, 'LOG_DIR', log_dir), \
-             patch.object(host, 'DB_FILE', db_path), \
-             patch.object(host, 'DOWNLOADS_SNAPSHOTS_DIR', src), \
-             patch.object(sys, 'stdin',  stdin), \
-             patch.object(sys, 'stdout', stdout):
-            host.main()
-
-    def _snapshot_tables(self, db_path):
-        """Return a dict {table: list[tuple]} for the rebuildable tables.
-        mover_errors is intentionally excluded — it's not log-recoverable
-        and the rebuild leaves it untouched."""
-        snap = {}
-        conn = sqlite3.connect(db_path)
-        try:
-            snap['visits'] = conn.execute(
-                'SELECT url, timestamp, title, of_interest, read, skimmed '
-                'FROM visits ORDER BY url'
-            ).fetchall()
-            snap['read_events'] = conn.execute(
-                'SELECT url, timestamp, filename, directory FROM read_events '
-                'ORDER BY url, timestamp'
-            ).fetchall()
-            snap['skimmed_events'] = conn.execute(
-                'SELECT url, timestamp, filename, directory FROM skimmed_events '
-                'ORDER BY url, timestamp'
-            ).fetchall()
-            snap['snapshots'] = conn.execute(
-                'SELECT date, sealed FROM snapshots ORDER BY date'
-            ).fetchall()
-        finally:
-            conn.close()
-        return snap
-
-    def test_round_trip_matches_original(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src     = os.path.join(tmp, 'dl');     os.makedirs(src)
-            dest    = os.path.join(tmp, 'icloud'); os.makedirs(dest)
-            log_dir = os.path.join(tmp, 'logs')    # _drive_host creates it
-            db      = os.path.join(tmp, 'visits.db')
-
-            # Seed a few host invocations: visit, of_interest, read, skimmed.
-            self._drive_host({'timestamp': '2026-04-29T10:00:00Z',
-                              'url': 'https://a.com', 'title': 'A'}, tmp)
-            self._drive_host({'timestamp': '2026-04-29T10:00:00Z',
-                              'url': 'https://a.com', 'title': 'A',
-                              'tag': 'of_interest'}, tmp)
-
-            # Place a snapshot file so the mover has work to do.
-            read_filename = '2026-04-29T11-00-00Z-aaa.mhtml'
-            Path(os.path.join(src, read_filename)).touch()
-            # Backdate so the mover's freshness gate (60s) lets it pass.
-            os.utime(os.path.join(src, read_filename), (1, 1))
-            self._drive_host({'timestamp': '2026-04-29T11:00:00Z',
-                              'url': 'https://a.com', 'title': 'A',
-                              'tag': 'read', 'filename': read_filename}, tmp)
-
-            skim_filename = '2026-04-29T12-00-00Z-bbb.mhtml'
-            Path(os.path.join(src, skim_filename)).touch()
-            os.utime(os.path.join(src, skim_filename), (1, 1))
-            self._drive_host({'timestamp': '2026-04-29T12:00:00Z',
-                              'url': 'https://b.com', 'title': 'B',
-                              'tag': 'skimmed', 'filename': skim_filename}, tmp)
-
-            # Run a mover + seal pass against these paths.
-            saved = (
-                snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
-                snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
-                snapshot_mover.LOG_DIR,
-                snapshot_mover.DB_FILE,
-            )
-            try:
-                snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR = src
-                snapshot_mover.ICLOUD_SNAPSHOTS_DIR    = dest
-                snapshot_mover.LOG_DIR                 = log_dir
-                snapshot_mover.DB_FILE                 = db
-                conn = sqlite3.connect(db)
-                snapshot_mover._ensure_snapshots_table(conn)
-                snapshot_mover._ensure_mover_errors_table(conn)
-                snapshot_mover._move_pass(conn)
-                snapshot_mover._seal_pass(conn)
-                snapshot_mover._orphan_log_merge_pass(conn)
-                conn.close()
-            finally:
-                (snapshot_mover.DOWNLOADS_SNAPSHOTS_DIR,
-                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
-                 snapshot_mover.LOG_DIR,
-                 snapshot_mover.DB_FILE) = saved
-
-            # Snapshot table contents, wipe the DB, run the rebuild.
-            before = self._snapshot_tables(db)
-            os.unlink(db)
-
-            saved2 = (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
-                      snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
-                      snapshot_mover.LOG_DIR)
-            try:
-                rc = vr.cli(['--log-dir', log_dir, '--db', db,
-                             '--source', src, '--dest', dest])
-            finally:
-                (host.DOWNLOADS_SNAPSHOTS_DIR, host.DB_FILE, host.LOG_DIR,
-                 snapshot_mover.ICLOUD_SNAPSHOTS_DIR,
-                 snapshot_mover.LOG_DIR) = saved2
-            self.assertEqual(rc, 0)
-
-            after = self._snapshot_tables(db)
-
-        # All four log/FS-recoverable tables must round-trip identically.
-        # mover_errors is intentionally not compared — it's allowed to
-        # diverge (rebuild leaves it untouched / starts empty).
-        self.assertEqual(before, after)
-
-
-# ---------------------------------------------------------------------------
-# Wrapper smoke (subprocess so we exercise the bash side too)
-# ---------------------------------------------------------------------------
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
 
 class TestWrapperSmoke(unittest.TestCase):
 
