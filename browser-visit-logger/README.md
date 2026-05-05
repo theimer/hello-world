@@ -165,27 +165,54 @@ bash install.sh
 
 After it finishes:
 
-1. Open `chrome://extensions` and enable **Developer mode**.
-2. **Load unpacked** → select the `extension/` directory.
-3. The extension ID Chrome displays should match the one printed by
+1. **Fully quit Chrome (⌘Q, not just close the window)** if it's
+   running.  Chrome reads the native-messaging manifest once at
+   startup, so a re-install's new `path` value only takes effect on
+   the next launch.
+2. Open `chrome://extensions` and enable **Developer mode**.
+3. **Load unpacked** → select the `extension/` directory.
+4. The extension ID Chrome displays should match the one printed by
    the installer.
-4. **Tag any page once** (★ / ✓ / ~) — macOS will prompt for
+5. **Tag any page once** (★ / ✓ / ~) — macOS will prompt for
    "BrowserVisitLoggerHost would like to access files in your
    Downloads folder.  Allow / Don't Allow."  Click Allow.  The same
    prompt may already have appeared for `BrowserVisitLoggerVerifier`
-   from step 6.
-5. Verify with:
+   from step 6 of the install.
+6. Confirm the pipeline is healthy:
    ```bash
-   tail ~/browser-visits-$(date -u +%Y-%m-%d).log
+   ./verify_snapshot_directory --show-errors        # → "No pending mover errors."
+   tail ~/browser-visits-host.log                   # → "Moved … (read-only)"
    sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY timestamp DESC LIMIT 10;"
    ```
 
-If you ever miss a TCC prompt and the host or verifier silently fails
-EPERM on `~/Downloads`, you can grant it manually in
-**System Settings → Privacy & Security → Files and Folders** (or
-**Full Disk Access** for a broader grant).  The bundles' identities
-are stable across `install.sh` re-runs as long as the wrapped script
-contents don't change.
+### Re-running `install.sh`
+
+Every `install.sh` run rebuilds the Swift binaries and re-codesigns
+the `.app` bundles ad-hoc.  Even when the binary contents are
+byte-identical, re-signing rewrites `Contents/_CodeSignature/` and
+the resulting cdhash often differs — which TCC treats as a different
+app, **invalidating any prior Files & Folders / Full Disk Access
+grants**.
+
+Symptom of this: tagging a page logs `ERROR Failed to move … [Errno 1]
+Operation not permitted` to `~/browser-visits-host.log`, or
+`./verify_snapshot_directory --show-errors` reports a fresh
+`top_level: Operation not permitted` row.
+
+Recovery, after every re-install:
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**
+   (or **Files and Folders → Downloads Folder + Documents Folder**).
+2. Find `BrowserVisitLoggerHost` and `BrowserVisitLoggerVerifier`.
+   If they're listed, remove them (click, then `−`).
+3. Re-add them: click `+` and navigate to (or drag from Finder)
+   ```
+   ~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerHost.app
+   ~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerVerifier.app
+   ```
+   Toggle each ON.
+4. Quit Chrome (⌘Q) and reopen.
+5. Verify with `./verify_snapshot_directory --show-errors`.
 
 ### Changing the verifier cadence (macOS)
 
@@ -600,14 +627,32 @@ shell or Finder.
 
 ### TCC denials
 
-If `host.py` or the verifier hit `[Errno 1] Operation not permitted`
-on `~/Downloads/browser-visit-snapshots/`, macOS' Privacy & Security
-framework hasn't granted the relevant `.app` bundle access yet.
-Either re-run `bash install.sh` (it kicks the verifier interactively
-to trigger a prompt) or grant the bundle manually in
-**System Settings → Privacy & Security → Files and Folders** under
-"Downloads Folder" / "Documents Folder", or **Full Disk Access** for
-a broader grant.
+If `BVLHost` or `BVLVerifier` hit `[Errno 1] Operation not permitted`
+on `~/Downloads/browser-visit-snapshots/` or
+`~/Documents/browser-visit-logger/`, macOS' Privacy & Security
+framework hasn't granted the relevant `.app` bundle access yet.  Two
+common triggers:
+
+- **Fresh install** — the user dismissed (or never saw) the initial
+  prompt.  Either tag a page (re-triggers the host's prompt) and
+  `launchctl kickstart -k gui/$(id -u)/com.browser.visit.logger.snapshot_verifier`
+  (re-triggers the verifier's), or grant manually.
+- **`install.sh` was re-run** — codesigning changed the bundle's
+  cdhash, invalidating any prior grant.  See the
+  [Re-running install.sh](#re-running-installsh) section above.
+
+Manual grant: **System Settings → Privacy & Security → Full Disk
+Access** (or **Files and Folders** under "Downloads Folder" /
+"Documents Folder"), drag in:
+
+```
+~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerHost.app
+~/Library/Application Support/browser-visit-logger/BrowserVisitLoggerVerifier.app
+```
+
+Then `./verify_snapshot_directory --show-errors` should report `No
+pending mover errors.` after the next host invocation or verifier
+tick.
 
 ---
 
