@@ -40,14 +40,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_DIR="$SCRIPT_DIR/extension"
 NATIVE_DIR="$SCRIPT_DIR/native-host"
+SWIFT_DIR="$SCRIPT_DIR/swift"
 MANIFEST_TEMPLATE="$EXTENSION_DIR/manifest.json.template"
 MANIFEST_JSON="$EXTENSION_DIR/manifest.json"
 HOST_MANIFEST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.json"
-HOST_PY="$NATIVE_DIR/host.py"
-VERIFIER_PY="$NATIVE_DIR/snapshot_verifier.py"
 VERIFIER_PLIST_TEMPLATE="$NATIVE_DIR/com.browser.visit.logger.snapshot_verifier.plist.template"
 VERIFIER_PLIST_LABEL="com.browser.visit.logger.snapshot_verifier"
-# Removed (cleaned up below if present from a previous-generation install):
+# Cleaned up below if present from a previous-generation install:
 MOVER_PLIST_LABEL="com.browser.visit.logger.snapshot_mover"
 KEY_PEM="$NATIVE_DIR/generated_key.pem"
 HOST_NAME="com.browser.visit.logger"
@@ -82,6 +81,7 @@ require_cmd openssl
 OS="$(uname -s)"
 if [[ "$OS" == "Darwin" ]]; then
   require_cmd codesign
+  require_cmd swift
 fi
 
 # ---------------------------------------------------------------------------
@@ -140,39 +140,44 @@ PYEOF
 info "Extension ID: $EXTENSION_ID"
 
 # ---------------------------------------------------------------------------
-# Step 4: Make scripts executable
-# ---------------------------------------------------------------------------
-chmod +x "$HOST_PY"     "$VERIFIER_PY"
-info "Made $HOST_PY and $VERIFIER_PY executable."
-
-# Resolve absolute real paths (no symlinks)
-HOST_PY_ABS="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$HOST_PY")"
-VERIFIER_PY_ABS="$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$VERIFIER_PY")"
-
-# ---------------------------------------------------------------------------
-# Step 5 (macOS only): Build code-signed .app bundles for host and verifier.
+# Step 4 (macOS): Build the Swift Mach-O binaries up front so the
+# bundles can be assembled with their final executables in one shot.
 #
-# An app bundle gives the wrapped Python script a stable TCC identity so
-# the user can grant it Files & Folders or Full Disk Access in
-# System Settings → Privacy & Security.  Without the bundle, both host.py
-# (Chrome-spawned, no inherited TCC) and the verifier (launchd-spawned,
-# no inherited TCC) hit EPERM on every ~/Downloads access.
-#
-# We re-create both bundles on every install.sh run so the signature
-# stays in sync with the current host.py / snapshot_verifier.py contents.
+# Why a Mach-O binary, not a shell-script entrypoint: TCC attributes
+# file accesses against the *running binary's* code signature.  When
+# the bundle's executable is a shell script, the chain is bash → env
+# → python3, and by the time the actual work runs the running binary
+# is /usr/bin/python3 — which has its own (Apple) signature, not the
+# bundle's, so the user's FDA grant for the bundle doesn't apply.  A
+# Mach-O binary signed as part of the bundle keeps the bundle's
+# identity all the way to syscall time.
+# ---------------------------------------------------------------------------
+if [[ "$OS" == "Darwin" ]]; then
+  info "Building Swift binaries (this may take ~20 s on first run)..."
+  ( cd "$SWIFT_DIR" && swift build -c release ) >/dev/null \
+    || error "swift build failed; cd $SWIFT_DIR && swift build to see the error."
+  SWIFT_HOST_BIN="$SWIFT_DIR/.build/release/BVLHost"
+  SWIFT_VERIFIER_BIN="$SWIFT_DIR/.build/release/BVLVerifier"
+  [[ -x "$SWIFT_HOST_BIN"     ]] || error "BVLHost binary missing at $SWIFT_HOST_BIN"
+  [[ -x "$SWIFT_VERIFIER_BIN" ]] || error "BVLVerifier binary missing at $SWIFT_VERIFIER_BIN"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 5 (macOS): Build code-signed .app bundles for host and verifier
+# with the freshly-built Mach-O binaries as their main executables.
 # ---------------------------------------------------------------------------
 build_app_bundle() {
-  local app_dir="$1"           # e.g. ~/Library/Application Support/.../BrowserVisitLoggerHost.app
+  local app_dir="$1"           # e.g. .../BrowserVisitLoggerHost.app
   local bundle_id="$2"         # e.g. com.browser.visit.logger.host
   local exec_name="$3"         # e.g. BrowserVisitLoggerHost
-  local target_script="$4"     # absolute path to host.py / snapshot_verifier.py
+  local source_bin="$4"        # path to a built Mach-O binary
 
   mkdir -p "$app_dir/Contents/MacOS"
   mkdir -p "$app_dir/Contents/Resources"
 
   # Info.plist — minimum required for TCC to recognize the bundle as a
-  # first-class app.  LSUIElement=true keeps the bundle out of the Dock
-  # and Cmd-Tab; it's a background helper, not a user-facing app.
+  # first-class app.  LSUIElement=true keeps it out of the Dock /
+  # Cmd-Tab; it's a background helper, not a user-facing app.
   cat > "$app_dir/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -196,23 +201,11 @@ build_app_bundle() {
 </plist>
 EOF
 
-  # The bundle's main executable: a tiny shell script that exec's into
-  # python3 + the real script outside the bundle.  TCC attribution stays
-  # with the bundle across the exec, so the user's grant follows.
-  #
-  # We use /usr/bin/env to find python3 instead of pinning it, because
-  # /usr/bin/python3 may not exist on systems where Python is supplied
-  # only via Xcode Command Line Tools or Homebrew.
-  cat > "$app_dir/Contents/MacOS/$exec_name" <<EOF
-#!/bin/bash
-exec /usr/bin/env python3 "$target_script" "\$@"
-EOF
+  cp "$source_bin" "$app_dir/Contents/MacOS/$exec_name"
   chmod +x "$app_dir/Contents/MacOS/$exec_name"
 
   # Ad-hoc sign the bundle.  --force overwrites any prior signature;
   # --deep covers any nested binaries (none here, but harmless).
-  # Without --sign -, TCC may treat each modification as a different
-  # app and revoke any existing grant.
   codesign --force --deep --sign - "$app_dir" 2>/dev/null
   info "Built and signed $app_dir"
 }
@@ -220,18 +213,20 @@ EOF
 if [[ "$OS" == "Darwin" ]]; then
   mkdir -p "$APP_PARENT"
   build_app_bundle \
-    "$HOST_APP" "$HOST_APP_BUNDLE_ID" "$HOST_APP_NAME" "$HOST_PY_ABS"
+    "$HOST_APP" "$HOST_APP_BUNDLE_ID" "$HOST_APP_NAME" "$SWIFT_HOST_BIN"
   build_app_bundle \
     "$VERIFIER_APP" "$VERIFIER_APP_BUNDLE_ID" "$VERIFIER_APP_NAME" \
-    "$VERIFIER_PY_ABS"
+    "$SWIFT_VERIFIER_BIN"
   HOST_BUNDLE_EXEC="$HOST_APP/Contents/MacOS/$HOST_APP_NAME"
   VERIFIER_BUNDLE_EXEC="$VERIFIER_APP/Contents/MacOS/$VERIFIER_APP_NAME"
 else
-  # On Linux there's no TCC; Chrome / launchd-equivalent (cron, systemd
-  # user units) can read ~/Downloads without a bundle.  Use the bare
-  # script paths.
-  HOST_BUNDLE_EXEC="$HOST_PY_ABS"
-  VERIFIER_BUNDLE_EXEC="$VERIFIER_PY_ABS"
+  # On Linux there's no TCC, but the Swift port is macOS-only.  Linux
+  # users would need to provide their own native-messaging host; for
+  # now the install just wires the manifest at the unbuilt Swift dir,
+  # which won't actually run anything.  Real Linux support is out of
+  # scope.
+  HOST_BUNDLE_EXEC="$SWIFT_DIR/.build/release/BVLHost"
+  VERIFIER_BUNDLE_EXEC="$SWIFT_DIR/.build/release/BVLVerifier"
 fi
 
 # ---------------------------------------------------------------------------
@@ -379,44 +374,57 @@ cat <<EOF
   Browser Visit Logger — Installation complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+Bundles installed (Swift Mach-O entrypoints, ad-hoc-signed):
+  $HOST_BUNDLE_EXEC
+  $VERIFIER_BUNDLE_EXEC
+
 Extension ID    : $EXTENSION_ID
 Extension dir   : $EXTENSION_DIR
-Native host     : $HOST_BUNDLE_EXEC
-Verifier        : $([[ "$OS" == "Darwin" ]] && echo "$VERIFIER_PLIST_LABEL (LaunchAgent, every 86400s = 1 day)" || echo "macOS-only, not installed")
+Verifier        : $VERIFIER_PLIST_LABEL (LaunchAgent, every 86400s = 1 day)
 
-Next steps:
-  1. Open Chrome and go to: chrome://extensions
-  2. Enable "Developer mode" (top-right toggle).
-  3. Click "Load unpacked" and select:
+If this is a fresh install:
+
+  1. Open Chrome → chrome://extensions, enable Developer mode, click
+     "Load unpacked" and select:
        $EXTENSION_DIR
-  4. Verify the extension ID shown in Chrome matches:
-       $EXTENSION_ID
-  5. Tag any page (★ / ✓ / ~) once.  The first tag will trigger a
-     macOS Files & Folders prompt for $HOST_APP_NAME — click "Allow".
-     This grants host.py access to ~/Downloads (where Chrome drops
-     snapshots) and ~/Documents (where the iCloud archive lives).
-  6. If you didn't see the verifier's TCC prompt during install, the
-     next daily verifier tick will surface it — or run the verifier
-     manually from a terminal:
-       ./verify_snapshot_directory --quiet
+     The extension ID shown should match: $EXTENSION_ID
 
-  7. Verify with:
-       tail ~/browser-visits-\$(date -u +%Y-%m-%d).log
-       sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY timestamp DESC LIMIT 10;"
+  2. Tag any page (★ / ✓ / ~).  macOS will pop a Files & Folders
+     prompt for "$HOST_APP_NAME" the first time — click "Allow".
+     The bundle's grant covers both ~/Downloads and ~/Documents.
 
-To change the verifier interval (default 86400s = 1 day):
-  • Edit the StartInterval value in:
-       ~/Library/LaunchAgents/$VERIFIER_PLIST_LABEL.plist
-  • Reload it:
-       launchctl bootout gui/\$(id -u)/$VERIFIER_PLIST_LABEL
-       launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$VERIFIER_PLIST_LABEL.plist
-  • Verifier output is logged to ~/browser-visits-verifier.log
+  3. The verifier's first scheduled tick will pop a similar prompt
+     for "$VERIFIER_APP_NAME"; click Allow when it appears.  To
+     trigger it now (interactively, while you're at the keyboard):
+       launchctl kickstart -k gui/\$(id -u)/$VERIFIER_PLIST_LABEL
 
-To run the verifier on demand:
+If you re-ran install.sh (e.g. after a code change), the bundles'
+codesign hashes changed — your existing FDA / Files-and-Folders
+grants are bound to the OLD hashes and need to be re-granted:
+
+  System Settings → Privacy & Security → Full Disk Access
+    → remove "$HOST_APP_NAME" and "$VERIFIER_APP_NAME"
+    → re-add the bundles (drag from Finder or click +):
+        $HOST_APP
+        $VERIFIER_APP
+    → toggle each ON
+  Then quit Chrome fully (Cmd-Q) and reopen so it picks up the new
+  native-messaging manifest path.
+
+Verify the install:
+  tail ~/browser-visits-host.log          # archive lines per tag
+  tail ~/browser-visits-verifier.log      # tick output
+  sqlite3 ~/browser-visits.db "SELECT * FROM visits ORDER BY timestamp DESC LIMIT 10;"
+
+Change the verifier cadence:
+  • Edit StartInterval in $VERIFIER_PLIST_LABEL.plist
+  • Reload:
+      launchctl bootout   gui/\$(id -u)/$VERIFIER_PLIST_LABEL
+      launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/$VERIFIER_PLIST_LABEL.plist
+
+Manual verifier ops (delegated to the Swift binary):
   ./verify_snapshot_directory                 # full tick
   ./verify_snapshot_directory --verify-all    # verify pass only
   ./verify_snapshot_directory --show-errors   # inspect mover_errors
-
-If Chrome shows a different extension ID, re-run this script to regenerate.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF

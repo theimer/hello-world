@@ -146,6 +146,12 @@ MANIFEST_FILENAME = 'MANIFEST.tsv'
 # Header columns of the manifest (must stay in sync with _build_manifest_rows).
 _MANIFEST_HEADER = ('filename', 'tag', 'timestamp', 'url', 'title')
 
+# Filenames the seal pass treats as "not part of the snapshot set" —
+# silently skipped, never flagged as invalid_filename, never included
+# in the manifest.  Currently just `.DS_Store`, which Finder writes
+# any time the user opens the iCloud-synced sealed dir in Finder.
+_IGNORED_NAMES = frozenset({'.DS_Store'})
+
 # Matches the daily snapshot subdir name (UTC date, ISO format).
 _DATE_DIR_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
@@ -807,6 +813,7 @@ def _build_manifest_rows(
         f for f in os.listdir(date_subdir)
         if f != MANIFEST_FILENAME
         and f != expected_log
+        and f not in _IGNORED_NAMES
         and os.path.isfile(os.path.join(date_subdir, f))
     )
     rows = []

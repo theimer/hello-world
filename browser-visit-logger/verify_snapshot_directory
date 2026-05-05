@@ -1,38 +1,48 @@
 #!/usr/bin/env bash
-# verify_snapshot_directory — convenience wrapper around
-# native-host/snapshot_verifier.py.
+# verify_snapshot_directory — convenience wrapper around the Swift
+# BVLVerifier binary built under swift/.build/release/.
 #
 # Audits one (--verify <date>) or every (--verify-all) sealed daily
 # snapshot directory's MANIFEST.tsv against the on-disk filesystem and
 # the database.  With no operation flag the verifier runs a full tick
 # (sweep + seal + orphan-merge + verify + escalate).  All arguments are
-# forwarded verbatim to the underlying Python script; --help is supported
-# and produces both a brief wrapper note and the script's full --help
-# output.
+# forwarded verbatim to the underlying binary; --help is supported and
+# produces both a brief wrapper note and the binary's full --help output.
+#
+# The wrapper points at the build-output binary rather than the bundled
+# binary inside ~/Library/Application Support/.../*.app/Contents/MacOS/
+# so that running from Terminal inherits the user's Terminal-granted
+# TCC (no need for the bundle's grant for ad-hoc CLI invocations).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET="$SCRIPT_DIR/native-host/snapshot_verifier.py"
+TARGET="$SCRIPT_DIR/swift/.build/release/BVLVerifier"
+
+if [[ ! -x "$TARGET" ]]; then
+  echo "verify_snapshot_directory: Swift binary not built." >&2
+  echo "Run 'bash install.sh' or '(cd swift && swift build -c release)'." >&2
+  exit 1
+fi
 
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
       cat <<'EOF'
-verify_snapshot_directory — wrapper around native-host/snapshot_verifier.py
+verify_snapshot_directory — wrapper around swift/.build/release/BVLVerifier
 
 Audits one (--verify <date>) or every (--verify-all) sealed daily
 snapshot directory's MANIFEST.tsv against the on-disk filesystem and
 the database.  With no operation flag the verifier runs a full tick
 (sweep + seal + orphan-merge + verify + escalate).  All arguments are
-forwarded verbatim to the Python script.
+forwarded verbatim to the binary.
 
-The remainder of this help is from the Python script:
+The remainder of this help is from the binary:
 
 EOF
-      exec python3 "$TARGET" --help
+      exec "$TARGET" --help
       ;;
   esac
 done
 
-exec python3 "$TARGET" "$@"
+exec "$TARGET" "$@"
