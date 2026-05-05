@@ -9,6 +9,17 @@ public let manifestHeader: [String] = [
     "filename", "tag", "timestamp", "url", "title",
 ]
 
+/// Filenames the seal and verify passes treat as "not part of the
+/// snapshot set" — silently skipped, never flagged as
+/// `invalid_filename`, never included in the manifest.  Currently
+/// just `.DS_Store`, which Finder writes any time the user opens an
+/// iCloud-synced sealed directory in Finder.
+///
+/// The manifest itself and the per-day log are also skipped, but
+/// each call site handles those by separate name checks (the per-day
+/// log filename is date-dependent).
+public let ignoredNames: Set<String> = [".DS_Store"]
+
 /// Matches the daily snapshot subdir name (UTC date, ISO format).
 private let dateDirRegex: NSRegularExpression = {
     // swiftlint:disable:next force_try
@@ -165,6 +176,7 @@ public enum Seal {
         for f in entries {
             if f == manifestFilename { continue }
             if let log = expectedLog, f == log { continue }
+            if ignoredNames.contains(f) { continue }
             let full = (dateSubdir as NSString).appendingPathComponent(f)
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: full, isDirectory: &isDir),

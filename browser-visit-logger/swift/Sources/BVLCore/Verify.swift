@@ -103,6 +103,7 @@ public enum Verify {
         for f in entries {
             if f == manifestFilename { continue }
             if let log = expectedLog, f == log { continue }
+            if ignoredNames.contains(f) { continue }
             let full = (dateSubdir as NSString).appendingPathComponent(f)
             var isDir: ObjCBool = false
             FileManager.default.fileExists(atPath: full, isDirectory: &isDir)
