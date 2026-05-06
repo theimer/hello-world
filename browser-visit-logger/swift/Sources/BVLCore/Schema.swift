@@ -1,8 +1,11 @@
 import Foundation
 
-/// SQL schema definitions.  Mirror the Python side's CREATE TABLE
-/// statements byte-for-byte — both implementations open the same
-/// `~/browser-visits.db` file and need to agree.
+/// SQL schema definitions.  The canonical DDL lives in the repo's
+/// top-level `schema.sql` (used by Python and the browser-visit-tools
+/// test suite); the statements below are compiled-in mirrors of
+/// those, kept in sync by `tests/test_schema_parity.py`.  Both
+/// implementations open the same `~/browser-visits.db` file and need
+/// to agree column-for-column.
 public enum Schema {
 
     /// Create / migrate the host-owned tables (visits, read_events,

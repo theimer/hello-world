@@ -5,10 +5,11 @@ the markdown rendering (link escaping, URL escaping, timestamp
 formatting, empty-table fallback), and the CLI entry point
 (missing DB, custom output path, parent-dir creation).
 
-The tool is a standalone consumer of the visits DB — no
-browser-visit-logger code is imported here.  The schema is created
-inline (matching what BVLHost / host.py emit) so this directory's
-tests are independent.
+The tool itself is a standalone consumer of the visits DB.  Tests
+share the canonical schema with browser-visit-logger by reading
+`../browser-visit-logger/schema.sql` — a soft filesystem dependency,
+not a Python import — so the two projects can't drift on column
+definitions or constraints.
 """
 import io
 import os
@@ -18,35 +19,29 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import reading_list
 
 
-# Schema mirror.  Matches what BVLHost (Swift) and host.py (Python)
-# create.  Kept inline so this test file doesn't import from the
-# logger project.
-_SCHEMA = """
-    CREATE TABLE visits (
-        url         TEXT PRIMARY KEY,
-        timestamp   TEXT NOT NULL,
-        title       TEXT NOT NULL DEFAULT '',
-        of_interest TEXT,
-        read        INTEGER NOT NULL DEFAULT 0,
-        skimmed     INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE skimmed_events (
-        url       TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        filename  TEXT NOT NULL DEFAULT '',
-        directory TEXT NOT NULL DEFAULT '',
-        PRIMARY KEY (url, timestamp)
-    );
-"""
+# Canonical schema lives in the sibling logger project.  At test time
+# we substitute the downloads-dir sentinel with an empty path — events
+# tables aren't exercised here, but the placeholder must be replaced
+# for the SQL to be syntactically valid.
+_SCHEMA_PATH = (Path(__file__).resolve().parent.parent.parent
+                / 'browser-visit-logger' / 'schema.sql')
+_DOWNLOADS_DIR_SENTINEL = '__BVL_DOWNLOADS_SNAPSHOTS_DIR__'
+
+
+def _load_schema_sql() -> str:
+    return _SCHEMA_PATH.read_text(encoding='utf-8').replace(
+        _DOWNLOADS_DIR_SENTINEL, '',
+    )
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(_SCHEMA)
+    conn.executescript(_load_schema_sql())
     conn.commit()
 
 

@@ -103,13 +103,13 @@ _LOG_FILENAME_RE = re.compile(r'^browser-visits-(\d{4}-\d{2}-\d{2})\.log$')
 # ---------------------------------------------------------------------------
 
 def _ensure_snapshots_table(conn: sqlite3.Connection) -> None:
-    """Create the snapshots table if it doesn't already exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            date   TEXT PRIMARY KEY,         -- 'YYYY-MM-DD' (UTC)
-            sealed INTEGER NOT NULL DEFAULT 0
-        )
-    """)
+    """Create the snapshots table if absent.
+
+    DDL lives in schema.sql; we just exec it via host._load_schema_sql.
+    Idempotent because every CREATE there uses IF NOT EXISTS.
+    """
+    import host
+    conn.executescript(host._load_schema_sql())
     conn.commit()
 
 
@@ -117,23 +117,12 @@ def _ensure_snapshots_table(conn: sqlite3.Connection) -> None:
 # Schema for the `mover_errors` table — tracks unresolved failures.
 # Reached transitively from `_build_manifest_rows` via `_try_record_error`,
 # so the sealer needs the table present before sealing a dir that has
-# any non-conforming filenames or orphan files.
+# any non-conforming filenames or orphan files.  DDL lives in schema.sql.
 # ---------------------------------------------------------------------------
 
 def _ensure_mover_errors_table(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS mover_errors (
-            key        TEXT PRIMARY KEY,           -- '<op>:<target>'
-            operation  TEXT NOT NULL,              -- 'move'|'seal'|'rewrite_manifest'|'top_level'
-            target     TEXT NOT NULL,              -- file path / date dir / '' for top-level
-            message    TEXT NOT NULL,              -- str(exc), sanitised
-            first_seen TEXT NOT NULL,              -- ISO timestamp (UTC)
-            last_seen  TEXT NOT NULL,
-            attempts   INTEGER NOT NULL DEFAULT 1,
-            notified   INTEGER NOT NULL DEFAULT 0,
-            immediate  INTEGER NOT NULL DEFAULT 0  -- 1 = notify on first sight, 0 = wait for threshold
-        )
-    """)
+    import host
+    conn.executescript(host._load_schema_sql())
     conn.commit()
 
 

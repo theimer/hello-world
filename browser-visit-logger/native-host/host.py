@@ -9,37 +9,9 @@ What remains here are the schema and insert helpers that
 database; nothing on the production tagging path runs through Python
 any more.
 
-Schema
-------
-    visits (
-        url         TEXT PRIMARY KEY,
-        timestamp   TEXT NOT NULL,           -- first-visit timestamp, never updated
-        title       TEXT NOT NULL DEFAULT '',
-        of_interest TEXT,                    -- non-NULL if ever tagged of_interest
-        read        INTEGER NOT NULL DEFAULT 0,  -- count of read clicks
-        skimmed     INTEGER NOT NULL DEFAULT 0   -- count of skimmed clicks
-    )
-
-    read_events (
-        url       TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
-        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
-        PRIMARY KEY (url, timestamp)
-    )
-
-    skimmed_events (
-        url       TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        filename  TEXT NOT NULL DEFAULT '',  -- snapshot basename, e.g. <hash>.mhtml
-        directory TEXT NOT NULL DEFAULT '<DOWNLOADS_SNAPSHOTS_DIR>',  -- absolute parent dir
-        PRIMARY KEY (url, timestamp)
-    )
-
-    snapshots (
-        date   TEXT PRIMARY KEY,         -- 'YYYY-MM-DD' (UTC) of host activity
-        sealed INTEGER NOT NULL DEFAULT 0
-    )
+The DDL itself lives in ../schema.sql (single source of truth).
+Swift's swift/Sources/BVLCore/Schema.swift duplicates it in compiled
+code; tests/test_schema_parity.py asserts they stay in sync.
 """
 
 import os
@@ -70,68 +42,36 @@ ICLOUD_SNAPSHOTS_DIR = os.environ.get(
 
 
 # ---------------------------------------------------------------------------
-# Schema helpers
+# Schema helpers — DDL is loaded from schema.sql (single source of truth).
+# The mover_errors table is also defined there but is created lazily by
+# snapshot_mover._ensure_mover_errors_table on first error record.
 # ---------------------------------------------------------------------------
 
-def ensure_db(conn: sqlite3.Connection) -> None:
-    cols = {r[1] for r in conn.execute('PRAGMA table_info(visits)').fetchall()}
-
-    if not cols:
-        conn.execute("""
-            CREATE TABLE visits (
-                url         TEXT PRIMARY KEY,
-                timestamp   TEXT NOT NULL,
-                title       TEXT NOT NULL DEFAULT '',
-                of_interest TEXT,
-                read        INTEGER NOT NULL DEFAULT 0,
-                skimmed     INTEGER NOT NULL DEFAULT 0
-            )
-        """)
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_visits_timestamp ON visits(timestamp)"
-    )
-
-    # One row per read/skimmed event (individual timestamps).
-    _ensure_events_table(conn, 'read_events')
-    _ensure_events_table(conn, 'skimmed_events')
-
-    # snapshots table: one row per UTC day with host activity.  The
-    # production Swift host inserts (date, sealed=0) on every write;
-    # the verifier flips to sealed=1 once it has moved the day's log
-    # and written MANIFEST.tsv.  Owned here (rather than only by
-    # snapshot_mover) so a brand-new install with no Swift run yet
-    # still has the table present.
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            date   TEXT PRIMARY KEY,
-            sealed INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-
-    conn.commit()
+# schema.sql lives at the repo root next to native-host/.
+_SCHEMA_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'schema.sql')
+_DOWNLOADS_DIR_SENTINEL = '__BVL_DOWNLOADS_SNAPSHOTS_DIR__'
 
 
-def _ensure_events_table(conn: sqlite3.Connection, table: str) -> None:
-    """Create an events table (url, timestamp PRIMARY KEY, filename, directory).
+def _load_schema_sql() -> str:
+    """Read schema.sql and substitute the downloads-dir sentinel.
 
-    table is a trusted internal constant, never user-supplied.
-
-    The DEFAULT for directory embeds DOWNLOADS_SNAPSHOTS_DIR at table-creation
-    time so that ad-hoc INSERTs (e.g. via sqlite3 CLI) get a sensible value;
-    _insert_event always specifies the directory explicitly.  Single-quotes in
-    the path are escaped to prevent SQL syntax errors on unusual home paths.
+    Single quotes in the path are escaped (SQL string literal escaping)
+    so unusual home paths don't break the DDL.
     """
-    default_dir_lit = "'" + DOWNLOADS_SNAPSHOTS_DIR.replace("'", "''") + "'"
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            url       TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            filename  TEXT NOT NULL DEFAULT '',
-            directory TEXT NOT NULL DEFAULT {default_dir_lit},
-            PRIMARY KEY (url, timestamp)
-        )
-    """)
+    with open(_SCHEMA_PATH, encoding='utf-8') as f:
+        sql = f.read()
+    escaped = DOWNLOADS_SNAPSHOTS_DIR.replace("'", "''")
+    return sql.replace(_DOWNLOADS_DIR_SENTINEL, escaped)
+
+
+def ensure_db(conn: sqlite3.Connection) -> None:
+    """Create / migrate every table the rebuilder may write to.
+
+    The schema file uses CREATE TABLE IF NOT EXISTS for everything, so
+    this is safe to run on fresh and existing databases alike.
+    """
+    conn.executescript(_load_schema_sql())
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
