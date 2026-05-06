@@ -36,6 +36,7 @@ public enum Sweep {
 
         var currentInvalid = Set<String>()
         for name in entries {
+            if ignoredNames.contains(name) { continue }
             let source = (dir as NSString).appendingPathComponent(name)
             var isDir: ObjCBool = false
             FileManager.default.fileExists(atPath: source, isDirectory: &isDir)

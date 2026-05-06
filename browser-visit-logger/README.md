@@ -248,6 +248,21 @@ each click creates a separate event row (its own timestamp + snapshot).
 The popup stays open while the snapshot saves; on success it closes
 itself, on failure it shows the error and re-enables the buttons.
 
+**Address-bar icon color** reflects the current tab's tag state at a
+glance — a white "B" on a colored disk:
+
+| State | Color |
+|-------|-------|
+| Untagged (or new tab) | Gray |
+| ★ Of Interest only | Orange |
+| ~ Skimmed (no Read) | Yellow |
+| ✓ Read (overrides Skimmed and Of Interest) | Green |
+
+The color refreshes on tab switch, on navigation completion, and
+immediately after a successful tag click.  The background queries
+`BVLHost` for the current URL's record — if the host is unavailable
+or the URL isn't `http(s)`, the icon falls back to gray.
+
 ---
 
 ## CLI scripts
@@ -688,7 +703,7 @@ npm install
 npm test -- --coverage
 ```
 
-The full suite is 165 Python + 94 JS tests, with 100% line/branch
+The full suite is 165 Python + 115 JS tests, with 100% line/branch
 coverage on every shipped module.
 
 ### Project layout

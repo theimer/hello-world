@@ -3,6 +3,81 @@
 const NATIVE_HOST = 'com.browser.visit.logger';
 const TITLE_FLUSH_TIMEOUT_MS = 5000;
 
+// Address-bar icon colors keyed off the visit record. Priority is
+// read > skimmed > of_interest > gray, so a page that has been both
+// of-interest and read shows green.
+const ICON_COLOR_GRAY   = '#9e9e9e';
+const ICON_COLOR_ORANGE = '#ff9800';
+const ICON_COLOR_YELLOW = '#ffeb3b';
+const ICON_COLOR_GREEN  = '#4caf50';
+const ICON_SIZES = [16, 32];
+const iconImageDataCache = new Map();
+
+function pickIconColor(record) {
+  if (!record) return ICON_COLOR_GRAY;
+  if (Array.isArray(record.read)    && record.read.length    > 0) return ICON_COLOR_GREEN;
+  if (Array.isArray(record.skimmed) && record.skimmed.length > 0) return ICON_COLOR_YELLOW;
+  if (record.of_interest)                                          return ICON_COLOR_ORANGE;
+  return ICON_COLOR_GRAY;
+}
+
+function iconImageDataForColor(color) {
+  const cached = iconImageDataCache.get(color);
+  if (cached) return cached;
+
+  const imageData = {};
+  for (const size of ICON_SIZES) {
+    const canvas = new OffscreenCanvas(size, size);
+    const ctx    = canvas.getContext('2d');
+
+    // Colored disk background.
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * Math.PI);
+    ctx.fill();
+
+    // White "B" centered on the disk — preserves the recognisable
+    // "Browser Visit Logger" cue from Chrome's auto-generated icon.
+    ctx.fillStyle    = '#ffffff';
+    ctx.font         = `bold ${Math.round(size * 0.7)}px sans-serif`;
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('B', size / 2, size / 2 + size * 0.04);
+
+    imageData[size] = ctx.getImageData(0, 0, size, size);
+  }
+  iconImageDataCache.set(color, imageData);
+  return imageData;
+}
+
+function setIconForTab(tabId, color) {
+  chrome.action.setIcon({ tabId, imageData: iconImageDataForColor(color) }, () => {
+    // Tab may have been closed between query and setIcon; ignore.
+    void chrome.runtime.lastError;
+  });
+}
+
+function refreshIconForTab(tabId, url) {
+  if (!url || !/^https?:/i.test(url)) {
+    setIconForTab(tabId, ICON_COLOR_GRAY);
+    return;
+  }
+  chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url }, (response) => {
+    if (chrome.runtime.lastError || !response || response.status !== 'ok') {
+      setIconForTab(tabId, ICON_COLOR_GRAY);
+      return;
+    }
+    setIconForTab(tabId, pickIconColor(response.record));
+  });
+}
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError || !tab) return;
+    refreshIconForTab(tabId, tab.url);
+  });
+});
+
 // tabId -> { url, title, timestamp, timerId }
 const pendingVisits = new Map();
 
@@ -39,6 +114,8 @@ function flushVisit(tabId) {
 chrome.webNavigation.onCompleted.addListener((details) => {
   // Only log main frame navigations, not iframes
   if (details.frameId !== 0) return;
+
+  refreshIconForTab(details.tabId, details.url);
 
   const timestamp = new Date().toISOString();
 
@@ -105,6 +182,10 @@ function snapshotDatetimePrefix(isoTimestamp) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'refresh-icon') {
+    refreshIconForTab(msg.tabId, msg.url);
+    return false;
+  }
   if (msg.type !== 'tag-and-snapshot') return false;
 
   const { tabId, timestamp, url, title, tag } = msg;

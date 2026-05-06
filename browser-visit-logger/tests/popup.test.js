@@ -458,6 +458,15 @@ describe('setupButtons', () => {
     expect(window.close).toHaveBeenCalled();
   });
 
+  test('on success, sends a refresh-icon message to the background', async () => {
+    nativeReturns({ status: 'ok', record: null });
+    mockSendMessage.mockClear();
+    await clickTag('of_interest');
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'refresh-icon', tabId: TAB.id, url: TAB.url }),
+    );
+  });
+
   test('on error response, shows the error message and re-enables buttons', async () => {
     await loadPopup();
     mockSendNativeMessage.mockImplementation((_host, _msg, cb) =>
