@@ -100,14 +100,21 @@ def _format_link(title: str, url: str) -> str:
 
 
 def _format_timestamp(iso: str) -> str:
-    """Render an ISO-8601 UTC timestamp as 'YYYY-MM-DD HH:MM UTC'."""
+    """Render an ISO-8601 UTC timestamp in local time as
+    'YYYY-MM-DD HH:MM <ZONE>' (e.g. '2026-04-30 07:35 PDT').
+
+    Stored timestamps are always UTC ('...Z'); the rebuilder and host
+    only ever write that format.  We parse, attach UTC, then convert
+    to the user's local zone via ``astimezone()`` (no argument =
+    system local zone).
+    """
     if not iso:
         return ''
     try:
         dt = datetime.datetime.fromisoformat(iso.replace('Z', '+00:00'))
     except ValueError:
         return iso
-    return dt.strftime('%Y-%m-%d %H:%M UTC')
+    return dt.astimezone().strftime('%Y-%m-%d %H:%M %Z')
 
 
 # ---------------------------------------------------------------------------
@@ -132,8 +139,7 @@ _QUERY = """
 def _fetch_rows(conn: sqlite3.Connection):
     """Return (skimmed, unskimmed) lists of dicts.
 
-    skimmed:   rows with skimmed > 0, ordered by last_skimmed DESC
-    unskimmed: rows with skimmed = 0, ordered by first-visit timestamp DESC
+    Both lists are sorted by first-visit timestamp, most recent first.
     """
     skimmed, unskimmed = [], []
     for url, title, ts, skim_count, last_skim in conn.execute(_QUERY):
@@ -143,8 +149,9 @@ def _fetch_rows(conn: sqlite3.Connection):
         }
         (skimmed if skim_count and skim_count > 0 else unskimmed).append(row)
 
-    skimmed.sort(key=lambda r: r['last_skimmed'] or '', reverse=True)
-    unskimmed.sort(key=lambda r: r['first_visited'] or '', reverse=True)
+    by_first_visit = lambda r: r['first_visited'] or ''
+    skimmed.sort(key=by_first_visit, reverse=True)
+    unskimmed.sort(key=by_first_visit, reverse=True)
     return skimmed, unskimmed
 
 

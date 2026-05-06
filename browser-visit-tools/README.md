@@ -31,10 +31,14 @@ Generates a Markdown reading list at
 tagged **★ Of Interest** that has not yet been **✓ Read**.  The list is
 split into two clickable tables:
 
-| Table | URLs included | Sort |
-|-------|---------------|------|
-| Unread URLs that have been skimmed | of_interest = set, read = 0, skimmed > 0 | most-recent skimmed first |
-| Unread URLs                         | of_interest = set, read = 0, skimmed = 0 | most-recent first-visit first |
+| Table | URLs included |
+|-------|---------------|
+| Unread URLs that have been skimmed | of_interest = set, read = 0, skimmed > 0 |
+| Unread URLs                         | of_interest = set, read = 0, skimmed = 0 |
+
+Both tables are sorted by **first-visited timestamp, most recent
+first**.  Date-time values are rendered in the user's **local time
+zone** (the database stores UTC; the tool converts at format time).
 
 URLs render as Markdown links — the visible label is the page title
 (falling back to the URL itself when title is empty).  Pipe / bracket

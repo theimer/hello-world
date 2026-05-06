@@ -152,12 +152,16 @@ class TestFilter(_ReadingListTestBase):
 
 class TestSorting(_ReadingListTestBase):
 
-    def test_skimmed_sorted_by_last_skim_desc(self):
+    def test_skimmed_sorted_by_first_visit_desc(self):
+        # Both tables now share the same sort key (first-visit DESC), so
+        # the older skim event with the more recent first-visit wins.
         _seed(self.conn, [
-            {'url': 'https://old/',  'of_interest': '1', 'read': 0, 'skimmed': 1,
-             'skim_events': ['2026-04-01T00:00:00Z']},
-            {'url': 'https://new/',  'of_interest': '1', 'read': 0, 'skimmed': 1,
-             'skim_events': ['2026-05-01T00:00:00Z']},
+            {'url': 'https://old/', 'timestamp': '2026-04-01T00:00:00Z',
+             'of_interest': '1', 'read': 0, 'skimmed': 1,
+             'skim_events': ['2026-05-15T00:00:00Z']},
+            {'url': 'https://new/', 'timestamp': '2026-05-01T00:00:00Z',
+             'of_interest': '1', 'read': 0, 'skimmed': 1,
+             'skim_events': ['2026-04-15T00:00:00Z']},
         ])
         self.run_cli()
         out = self.output()
@@ -277,6 +281,23 @@ class TestRendering(_ReadingListTestBase):
         # also for empty-string defensiveness.
         self.assertEqual(reading_list._format_timestamp(''), '')
         self.assertEqual(reading_list._format_timestamp(None), '')
+
+    def test_format_timestamp_converts_to_local_zone(self):
+        # Pin TZ to a fixed offset (Etc/GMT-5 == UTC+5, no DST surprises)
+        # to prove the formatter applies the user's local zone instead of
+        # always emitting UTC.  Restore the conftest UTC pin afterwards.
+        import os, time
+        os.environ['TZ'] = 'Etc/GMT-5'
+        time.tzset()
+        try:
+            # 14:35 UTC + 5h = 19:35 local, with the +05 zone label.
+            self.assertEqual(
+                reading_list._format_timestamp('2026-04-30T14:35:22Z'),
+                '2026-04-30 19:35 +05',
+            )
+        finally:
+            os.environ['TZ'] = 'UTC'
+            time.tzset()
 
 
 # ---------------------------------------------------------------------------
