@@ -26,10 +26,17 @@ one-line wrapper note before delegating.
 
 ### `generate_reading_list`
 
-Generates a Markdown reading list at
-`~/Documents/browser-visit-logger/reading_list.md` containing every URL
-tagged **★ Of Interest** that has not yet been **✓ Read**.  The list is
-split into two clickable tables:
+Generates a reading list of every URL tagged **★ Of Interest** that
+has not yet been **✓ Read**.  Output format defaults to **HTML**
+(a self-contained file with inline CSS, openable directly in a
+browser); pass `--format markdown` for Markdown.  Default output:
+
+| Format | Default path |
+|--------|--------------|
+| html (default) | `~/Documents/browser-visit-logger/reading_list.html` |
+| markdown       | `~/Documents/browser-visit-logger/reading_list.md` |
+
+The list is split into two clickable tables:
 
 | Table | URLs included |
 |-------|---------------|
@@ -40,19 +47,22 @@ Both tables are sorted by **first-visited timestamp, most recent
 first**.  Date-time values are rendered in the user's **local time
 zone** (the database stores UTC; the tool converts at format time).
 
-URLs render as Markdown links — the visible label is the page title
-(falling back to the URL itself when title is empty).  Pipe / bracket
-characters in titles are escaped, parens / spaces in URLs are
-percent-encoded, and tabs / newlines collapse to spaces so each row
-stays on a single line.
+URLs render as clickable links — the visible label is the page title
+(falling back to the URL itself when title is empty).  Special
+characters are escaped per format: HTML uses `html.escape` for both
+the link label and the `href` value; Markdown escapes `|`, `[`, `]`
+and percent-encodes parens / spaces in URLs.  Tabs / newlines in
+titles collapse to spaces so rows stay on one line.
 
 ```bash
-# Default — read ~/browser-visits.db, write to
-# ~/Documents/browser-visit-logger/reading_list.md
+# Default — HTML to ~/Documents/browser-visit-logger/reading_list.html
 ./generate_reading_list
 
+# Markdown instead (default path becomes reading_list.md)
+./generate_reading_list --format markdown
+
 # Override paths (useful for tests / experiments)
-./generate_reading_list --db /tmp/test.db --output /tmp/reading_list.md
+./generate_reading_list --db /tmp/test.db --output /tmp/reading_list.html
 
 # Skip the wrapper (equivalent)
 python3 reading_list.py
@@ -62,8 +72,9 @@ Flags:
 
 | Flag | Effect |
 |------|--------|
+| `--format {html,markdown}` | Output format (default `html`) |
 | `--db FILE` | Override `BVL_DB_FILE` (default `~/browser-visits.db`) |
-| `--output FILE` | Override the default output path |
+| `--output FILE` | Override the default output path; takes precedence over the format-derived default |
 | `-v`, `--verbose` | DEBUG log level |
 
 The output file is overwritten on every run.  Parent directory is
@@ -77,7 +88,7 @@ pip install -r requirements-test.txt
 python3 -m pytest tests/ --cov=reading_list --cov-report=term-missing
 ```
 
-23 tests, 100% line coverage.
+45 tests, 100% line coverage.
 
 ## Project layout
 

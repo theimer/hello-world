@@ -78,8 +78,15 @@ class _ReadingListTestBase(unittest.TestCase):
         self.conn.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    # Default format for the existing test classes is Markdown — most
+    # assertions match Markdown syntax (link text, escape sequences,
+    # cell separators).  Tests that exercise HTML pass --format html
+    # explicitly via run_cli.
+    default_format = 'markdown'
+
     def run_cli(self, *extra):
-        argv = ['--db', self.db, '--output', self.out, *extra]
+        argv = ['--db', self.db, '--output', self.out,
+                '--format', self.default_format, *extra]
         return reading_list.main(argv)
 
     def output(self) -> str:
@@ -347,6 +354,205 @@ class TestCli(_ReadingListTestBase):
                 run_path(reading_list.__file__, run_name='__main__')
         self.assertEqual(cm.exception.code, 0)
         self.assertTrue(os.path.exists(self.out))
+
+
+# ---------------------------------------------------------------------------
+# HTML format
+# ---------------------------------------------------------------------------
+
+class _HtmlTestBase(_ReadingListTestBase):
+    default_format = 'html'
+
+
+class TestHtmlStructure(_HtmlTestBase):
+
+    def test_doctype_and_root_tag(self):
+        _ensure_schema(self.conn)
+        self.run_cli()
+        out = self.output()
+        self.assertTrue(out.startswith('<!DOCTYPE html>'))
+        self.assertIn('<html lang="en">', out)
+        self.assertIn('</html>', out)
+
+    def test_charset_and_title_in_head(self):
+        _ensure_schema(self.conn)
+        self.run_cli()
+        out = self.output()
+        self.assertIn('<meta charset="utf-8">', out)
+        self.assertIn('<title>Reading list</title>', out)
+
+    def test_h1_and_section_h2s_present(self):
+        _ensure_schema(self.conn)
+        self.run_cli()
+        out = self.output()
+        self.assertIn('<h1>Reading list</h1>', out)
+        self.assertIn('<h2>Unread URLs that have been skimmed (0)</h2>', out)
+        self.assertIn('<h2>Unread URLs (0)</h2>', out)
+
+    def test_empty_tables_render_as_empty_paragraph_not_table(self):
+        _ensure_schema(self.conn)
+        self.run_cli()
+        out = self.output()
+        # Two empty sections, each yields a "(none)" empty-class paragraph
+        # and no <table> element.
+        self.assertEqual(out.count('<p class="empty">(none)</p>'), 2)
+        self.assertNotIn('<table>', out)
+
+    def test_tables_have_thead_and_tbody(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': 'Page A',
+            'of_interest': '1', 'read': 0, 'skimmed': 1,
+            'skim_events': ['2026-04-30T10:00:00Z'],
+        }, {
+            'url': 'https://b/', 'title': 'Page B',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        out = self.output()
+        self.assertEqual(out.count('<thead>'), 2)
+        self.assertEqual(out.count('<tbody>'), 2)
+        self.assertEqual(out.count('</table>'), 2)
+
+    def test_skimmed_table_has_three_columns(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': 'A', 'of_interest': '1',
+            'read': 0, 'skimmed': 1, 'skim_events': ['2026-04-30T10:00:00Z'],
+        }])
+        self.run_cli()
+        out = self.output()
+        self.assertIn('<th>Title</th><th>Last skimmed</th><th>First visited</th>', out)
+
+    def test_unskimmed_table_has_two_columns(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': 'A',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        out = self.output()
+        self.assertIn('<th>Title</th><th>First visited</th>', out)
+        # The skimmed-only header (3 cols) should NOT be present.
+        self.assertNotIn('<th>Last skimmed</th>', out)
+
+
+class TestHtmlEscaping(_HtmlTestBase):
+
+    def test_url_renders_as_anchor_with_href(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': 'Page A',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        self.assertIn('<a href="https://a/">Page A</a>', self.output())
+
+    def test_empty_title_falls_back_to_url_as_label(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': '',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        self.assertIn('<a href="https://a/">https://a/</a>', self.output())
+
+    def test_html_special_chars_in_title_are_escaped(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'title': '<b>Foo</b> & "bar"',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        out = self.run_cli() or self.output()
+        out = self.output()
+        # html.escape produces &lt; &gt; &amp; &quot; (with quote=True).
+        self.assertIn('&lt;b&gt;Foo&lt;/b&gt; &amp; &quot;bar&quot;', out)
+        # Raw <b> must not appear in the body content (would render as
+        # actual bold text and could break the document if unbalanced).
+        # The only `<b>` tokens permitted in the page are the CSS / HTML
+        # structural tags — none of which contain `<b>`.
+        self.assertNotIn('<b>Foo</b>', out)
+
+    def test_ampersand_in_url_is_escaped_in_href(self):
+        _seed(self.conn, [{
+            'url': 'https://a/?x=1&y=2', 'title': 'Page',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        # `&` inside an href attribute must be `&amp;` for valid HTML.
+        self.assertIn('href="https://a/?x=1&amp;y=2"', self.output())
+
+    def test_space_in_url_is_percent_encoded_in_href(self):
+        _seed(self.conn, [{
+            'url': 'https://a/with space', 'title': 'Page',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        self.assertIn('href="https://a/with%20space"', self.output())
+
+    def test_quote_in_url_is_escaped_in_href(self):
+        # If a URL contains a literal quote it'd otherwise close the href.
+        _seed(self.conn, [{
+            'url': 'https://a/?q="quoted"', 'title': 'Page',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        self.assertIn('&quot;quoted&quot;', self.output())
+
+
+class TestHtmlContent(_HtmlTestBase):
+
+    def test_skim_count_shown_in_skimmed_header(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'of_interest': '1', 'read': 0, 'skimmed': 1,
+            'skim_events': ['2026-04-30T10:00:00Z'],
+        }])
+        self.run_cli()
+        self.assertIn('<h2>Unread URLs that have been skimmed (1)</h2>', self.output())
+
+    def test_unskimmed_count_shown_in_unskimmed_header(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }, {
+            'url': 'https://b/', 'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        self.assertIn('<h2>Unread URLs (2)</h2>', self.output())
+
+    def test_local_zone_timestamp_rendered_in_cell(self):
+        _seed(self.conn, [{
+            'url': 'https://a/', 'timestamp': '2026-04-30T14:35:22Z',
+            'of_interest': '1', 'read': 0, 'skimmed': 0,
+        }])
+        self.run_cli()
+        # Timestamp wrapped in the .timestamp span; conftest pins TZ=UTC.
+        self.assertIn('<span class="timestamp">2026-04-30 14:35 UTC</span>',
+                      self.output())
+
+
+# ---------------------------------------------------------------------------
+# Format selection / default output path
+# ---------------------------------------------------------------------------
+
+class TestFormatDispatch(unittest.TestCase):
+    """No --output: the default path picks an extension matching --format."""
+
+    def test_default_format_is_html(self):
+        ns = reading_list._parse_args([])
+        self.assertEqual(ns.format, 'html')
+        self.assertTrue(ns.output.endswith('reading_list.html'))
+
+    def test_explicit_markdown_default_path_uses_md_extension(self):
+        ns = reading_list._parse_args(['--format', 'markdown'])
+        self.assertEqual(ns.format, 'markdown')
+        self.assertTrue(ns.output.endswith('reading_list.md'))
+
+    def test_explicit_html_default_path_uses_html_extension(self):
+        ns = reading_list._parse_args(['--format', 'html'])
+        self.assertTrue(ns.output.endswith('reading_list.html'))
+
+    def test_explicit_output_path_is_respected_regardless_of_format(self):
+        ns = reading_list._parse_args(
+            ['--format', 'markdown', '--output', '/tmp/anything.txt'])
+        self.assertEqual(ns.output, '/tmp/anything.txt')
+
+    def test_unknown_format_rejected_by_argparse(self):
+        with self.assertRaises(SystemExit):
+            reading_list._parse_args(['--format', 'pdf'])
 
 
 if __name__ == '__main__':

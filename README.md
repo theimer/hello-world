@@ -20,9 +20,11 @@ current tab's tag state (untagged / of-interest / skimmed / read).
 Standalone read-only consumers of the database the logger produces.
 Currently:
 
-- **`reading_list.py`** — generates a Markdown reading list of every
-  URL tagged of_interest but not yet read, split into "Unread URLs
-  that have been skimmed" and "Unread URLs" tables.
+- **`reading_list.py`** — generates a reading list of every URL
+  tagged of_interest but not yet read, split into "Unread URLs that
+  have been skimmed" and "Unread URLs" tables.  HTML by default
+  (self-contained, openable in a browser); pass `--format markdown`
+  for Markdown.
 
 These tools depend only on the DB schema, not on logger code, so the
 two directories can be developed and vendored independently.
