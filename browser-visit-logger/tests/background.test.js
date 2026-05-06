@@ -78,16 +78,26 @@ function buildChromeMock() {
   // it and reads back ImageData; tests only care that getImageData returns a
   // truthy value tagged with the chosen fill color.
   global.OffscreenCanvas = jest.fn((width, height) => {
+    // Track the disk fill (set before the arc) and any subsequent
+    // text fill (set before fillText) so tests can assert both.
+    let diskFill = null;
     let lastFill = null;
+    let drewText = null;
     return {
       width, height,
       getContext: () => ({
         set fillStyle(c) { lastFill = c; },
         get fillStyle()   { return lastFill; },
+        font: '',
+        textAlign: '',
+        textBaseline: '',
         beginPath: () => {},
-        arc:       () => {},
+        arc:       () => { diskFill = lastFill; },
         fill:      () => {},
-        getImageData: (_x, _y, w, h) => ({ width: w, height: h, color: lastFill }),
+        fillText:  (text) => { drewText = { text, fillStyle: lastFill }; },
+        getImageData: (_x, _y, w, h) => ({
+          width: w, height: h, color: diskFill, glyph: drewText,
+        }),
       }),
     };
   });
@@ -1010,6 +1020,20 @@ describe('address-bar icon coloring', () => {
       respondWith(null);
       const result = messageHandler({ type: 'refresh-icon', tabId: 1, url: URL }, {}, jest.fn());
       expect(result).toBe(false);
+    });
+  });
+
+  describe('icon glyph', () => {
+    test('draws a white "B" centered on the colored disk', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      respondWith({ read: [{ timestamp: 't' }], skimmed: [], of_interest: null });
+      tabActivatedHandler({ tabId: 1 });
+
+      const { imageData } = mockSetIcon.mock.calls[mockSetIcon.mock.calls.length - 1][0];
+      expect(imageData[16].glyph).toEqual({ text: 'B', fillStyle: '#ffffff' });
+      expect(imageData[32].glyph).toEqual({ text: 'B', fillStyle: '#ffffff' });
+      // Disk color is the priority pick (green) — separate from the glyph fill.
+      expect(imageData[16].color).toBe(GREEN);
     });
   });
 

@@ -29,10 +29,21 @@ function iconImageDataForColor(color) {
   for (const size of ICON_SIZES) {
     const canvas = new OffscreenCanvas(size, size);
     const ctx    = canvas.getContext('2d');
+
+    // Colored disk background.
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(size / 2, size / 2, size / 2 - 1, 0, 2 * Math.PI);
     ctx.fill();
+
+    // White "B" centered on the disk — preserves the recognisable
+    // "Browser Visit Logger" cue from Chrome's auto-generated icon.
+    ctx.fillStyle    = '#ffffff';
+    ctx.font         = `bold ${Math.round(size * 0.7)}px sans-serif`;
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('B', size / 2, size / 2 + size * 0.04);
+
     imageData[size] = ctx.getImageData(0, 0, size, size);
   }
   iconImageDataCache.set(color, imageData);
