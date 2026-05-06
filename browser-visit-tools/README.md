@@ -20,8 +20,8 @@ split into two clickable tables:
 
 | Table | URLs included | Sort |
 |-------|---------------|------|
-| Skimmed | of_interest = set, read = 0, skimmed > 0 | most-recent skimmed first |
-| To skim | of_interest = set, read = 0, skimmed = 0 | most-recent first-visit first |
+| Unread URLs that have been skimmed | of_interest = set, read = 0, skimmed > 0 | most-recent skimmed first |
+| Unread URLs                         | of_interest = set, read = 0, skimmed = 0 | most-recent first-visit first |
 
 URLs render as Markdown links — the visible label is the page title
 (falling back to the URL itself when title is empty).  Pipe / bracket

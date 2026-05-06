@@ -21,8 +21,8 @@ Standalone read-only consumers of the database the logger produces.
 Currently:
 
 - **`reading_list.py`** — generates a Markdown reading list of every
-  URL tagged of_interest but not yet read, split into "Skimmed" and
-  "To skim" tables.
+  URL tagged of_interest but not yet read, split into "Unread URLs
+  that have been skimmed" and "Unread URLs" tables.
 
 These tools depend only on the DB schema, not on logger code, so the
 two directories can be developed and vendored independently.

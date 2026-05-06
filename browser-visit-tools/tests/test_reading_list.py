@@ -113,10 +113,10 @@ class TestFilter(_ReadingListTestBase):
         self.run_cli()
         out = self.output()
         # Heading + counts: 0 skimmed, 1 unskimmed
-        self.assertIn('## Skimmed (0)', out)
-        self.assertIn('## To skim (1)', out)
+        self.assertIn('## Unread URLs that have been skimmed (0)', out)
+        self.assertIn('## Unread URLs (1)', out)
         # Skimmed section should be empty
-        skimmed_section, to_skim_section = out.split('## To skim')
+        skimmed_section, to_skim_section = out.split('\n## Unread URLs (')
         self.assertNotIn('https://a/', skimmed_section)
         self.assertIn('[Page A](https://a/)', to_skim_section)
 
@@ -128,9 +128,9 @@ class TestFilter(_ReadingListTestBase):
         }])
         self.run_cli()
         out = self.output()
-        self.assertIn('## Skimmed (1)', out)
-        self.assertIn('## To skim (0)', out)
-        skimmed_section, to_skim_section = out.split('## To skim')
+        self.assertIn('## Unread URLs that have been skimmed (1)', out)
+        self.assertIn('## Unread URLs (0)', out)
+        skimmed_section, to_skim_section = out.split('\n## Unread URLs (')
         self.assertIn('[Page B](https://b/)', skimmed_section)
         self.assertNotIn('https://b/', to_skim_section)
 
@@ -185,8 +185,8 @@ class TestRendering(_ReadingListTestBase):
         _ensure_schema(self.conn)
         self.run_cli()
         out = self.output()
-        self.assertIn('## Skimmed (0)', out)
-        self.assertIn('## To skim (0)', out)
+        self.assertIn('## Unread URLs that have been skimmed (0)', out)
+        self.assertIn('## Unread URLs (0)', out)
         # Both sections should have the empty marker, not a table header
         self.assertEqual(out.count('_(none)_'), 2)
         self.assertNotIn('| Title |', out)
