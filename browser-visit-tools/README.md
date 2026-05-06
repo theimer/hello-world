@@ -9,9 +9,22 @@ These tools depend only on the DB schema (`visits`, `read_events`,
 so this project can be vendored or copied without dragging the logger
 along.
 
-## Tools
+## CLI scripts
 
-### `reading_list.py`
+All scripts live at the project root.  They share the same `BVL_*`
+env-var conventions as `browser-visit-logger` (currently just
+`BVL_DB_FILE`) and accept overriding flags so they're safe to point
+at test data.
+
+Each shell wrapper delegates to a Python script.  The wrapper forwards
+all arguments verbatim and intercepts `--help` / `-h` to print a
+one-line wrapper note before delegating.
+
+| Wrapper | Underlying tool |
+|---------|------------------|
+| `./generate_reading_list` | `reading_list.py` (Python) |
+
+### `generate_reading_list`
 
 Generates a Markdown reading list at
 `~/Documents/browser-visit-logger/reading_list.md` containing every URL
@@ -36,7 +49,12 @@ stays on a single line.
 
 # Override paths (useful for tests / experiments)
 ./generate_reading_list --db /tmp/test.db --output /tmp/reading_list.md
+
+# Skip the wrapper (equivalent)
+python3 reading_list.py
 ```
+
+Flags:
 
 | Flag | Effect |
 |------|--------|
