@@ -33,22 +33,35 @@ A 30 s watchdog interrupts runaway queries.
 
 ## Install
 
+Requires Python 3.10+ (the `mcp` SDK refuses older Pythons; the
+project is developed against 3.13). No other runtime dependencies.
+
+The project assumes a venv at `browser-visit-mcp/.venv/` — that's where
+the `.mcp.json` at the repo root expects to find the interpreter. The
+venv is gitignored, so you create it once per checkout:
+
 ```bash
 cd browser-visit-mcp
-pip install -e .         # installs `mcp[cli]>=1.0`
+python3.13 -m venv .venv          # or python3.10 / 3.11 / 3.12
+source .venv/bin/activate         # activate so `pip` and `python` mean the venv's
+pip install -e .                  # installs `mcp[cli]>=1.0` + this package
 ```
 
-Python 3.10+. No other runtime dependencies.
+If you'd rather not activate, you can run `pip` directly with the
+venv's path: `.venv/bin/pip install -e .` — equivalent.
 
 ## Run
 
+With the venv activated (`source .venv/bin/activate`), or by invoking
+the venv's interpreter directly:
+
 ```bash
 # Default DB at ~/browser-visits.db (override via BVL_DB_FILE or --db).
-python3 server.py
+python server.py
 
 # Point at a test DB.
-python3 server.py --db /tmp/test.db
-BVL_DB_FILE=/tmp/test.db python3 server.py
+python server.py --db /tmp/test.db
+BVL_DB_FILE=/tmp/test.db python server.py
 ```
 
 The server speaks MCP over stdio — it is meant to be launched by an
@@ -57,7 +70,7 @@ MCP client, not used interactively.
 ### Inspector
 
 ```bash
-npx @modelcontextprotocol/inspector python3 server.py
+npx @modelcontextprotocol/inspector .venv/bin/python server.py
 ```
 
 ### Claude Code
@@ -87,10 +100,14 @@ To point at a different DB, add an `env` block to the entry in
 
 ## Tests
 
+With the venv activated:
+
 ```bash
-pip install pytest
-pytest tests/
+pip install pytest pytest-cov
+pytest tests/ --cov=server --cov-report=term-missing
 ```
+
+37 tests, 100% line coverage on `server.py`.
 
 The tests seed a temp DB from
 `../browser-visit-logger/schema.sql` and exercise the validation
