@@ -1,0 +1,18 @@
+[project]
+name = "browser-visit-mcp"
+version = "0.1.0"
+description = "MCP server exposing read-only SQL access to the browser-visits SQLite database."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0",
+]
+
+[project.scripts]
+browser-visit-mcp = "server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server"]

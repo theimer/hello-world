@@ -1,3 +1,6 @@
 .claude/
 .coverage
 .pytest_cache/
+__pycache__/
+browser-visit-mcp/.venv/
+browser-visit-mcp/*.egg-info/
