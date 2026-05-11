@@ -1,6 +1,6 @@
 # Browser Visit projects
 
-Two related projects that share a local SQLite database of browser
+Three related projects that share a local SQLite database of browser
 visit history.  Everything runs locally on your machine; nothing is
 sent anywhere.
 
@@ -27,4 +27,20 @@ Currently:
   for Markdown.
 
 These tools depend only on the DB schema, not on logger code, so the
-two directories can be developed and vendored independently.
+directories can be developed and vendored independently.
+
+## [`browser-visit-mcp/`](browser-visit-mcp/)
+
+A local [Model Context Protocol](https://modelcontextprotocol.io/)
+server that exposes the visits database to MCP clients (Claude Code,
+Claude Desktop, MCP Inspector) over stdio.  Provides two tools:
+`query` (run an arbitrary read-only SQL statement and get
+columns + rows back) and `schema` (return the DDL so the model can
+write well-formed queries).  Read-only is enforced both by opening
+SQLite with `mode=ro` and by validating each statement before
+execution.
+
+Like the tools project, this is a pure read-only consumer of the
+schema — no Python imports cross the directory boundary.  A
+`.mcp.json` at the repo root registers the server project-locally so
+Claude Code picks it up automatically when this repo is opened.
