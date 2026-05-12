@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "browser-visits": {
-      "command": "/Users/theimer/projects/hello-world/browser-visit-mcp/.venv/bin/python",
+      "command": "/Users/theimer/projects/browser-visit-logger/browser-visit-mcp/.venv/bin/python",
       "args": [
-        "/Users/theimer/projects/hello-world/browser-visit-mcp/server.py"
+        "/Users/theimer/projects/browser-visit-logger/browser-visit-mcp/server.py"
       ]
     }
   }
