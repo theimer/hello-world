@@ -1,4 +1,7 @@
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/query-browser-visits/
 .coverage
 .pytest_cache/
 __pycache__/
