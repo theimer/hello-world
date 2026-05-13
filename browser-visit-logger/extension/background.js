@@ -111,7 +111,7 @@ function flushVisit(tabId) {
   });
 }
 
-chrome.webNavigation.onCompleted.addListener((details) => {
+function handleNavigation(details) {
   // Only log main frame navigations, not iframes
   if (details.frameId !== 0) return;
 
@@ -142,7 +142,13 @@ chrome.webNavigation.onCompleted.addListener((details) => {
     const timerId = setTimeout(() => flushVisit(details.tabId), TITLE_FLUSH_TIMEOUT_MS);
     pendingVisits.set(details.tabId, { url: details.url, title, timestamp, timerId });
   });
-});
+}
+
+chrome.webNavigation.onCompleted.addListener(handleNavigation);
+// SPA navigations (pushState/replaceState) and hash-only changes don't fire
+// onCompleted; register here so the icon recolors and the visit is logged.
+chrome.webNavigation.onHistoryStateUpdated.addListener(handleNavigation);
+chrome.webNavigation.onReferenceFragmentUpdated.addListener(handleNavigation);
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.title) return;

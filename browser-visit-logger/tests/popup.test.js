@@ -124,11 +124,14 @@ beforeEach(() => {
 describe('formatTs', () => {
   const TAB = { id: 1, url: 'https://example.com/', title: 'Example' };
 
-  test('renders nothing when timestamp is null', async () => {
+  test('renders a First-visited row using the current time when record.timestamp is null', async () => {
     nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: []} });
     tabReturns(TAB);
     await loadPopup();
-    expect(document.querySelectorAll('.info-row').length).toBe(0);
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels).toEqual(['First visited']);
+    const valueEl = document.querySelector('.info-value');
+    expect(valueEl.textContent).toContain(String(new Date().getFullYear()));
   });
 
   test('renders a human-readable date string, not the raw ISO timestamp', async () => {
@@ -176,16 +179,20 @@ describe('showVisitInfo', () => {
     expect(document.getElementById('visit-info').style.display).toBe('block');
   });
 
-  test('leaves #visit-info hidden when record is null', async () => {
+  test('shows #visit-info with a First-visited row even when record is null', async () => {
     nativeReturns({ status: 'ok', record: null });
     await loadPopup();
-    expect(document.getElementById('visit-info').style.display).toBe('none');
+    expect(document.getElementById('visit-info').style.display).toBe('block');
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels).toEqual(['First visited']);
   });
 
-  test('leaves #visit-info hidden when all timestamps are null', async () => {
+  test('shows First-visited with the current time when all timestamps are null', async () => {
     nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: []} });
     await loadPopup();
-    expect(document.getElementById('visit-info').style.display).toBe('none');
+    expect(document.getElementById('visit-info').style.display).toBe('block');
+    const labels = [...document.querySelectorAll('.info-label')].map(el => el.textContent);
+    expect(labels).toEqual(['First visited']);
   });
 
   test('renders a row for each non-null timestamp', async () => {
