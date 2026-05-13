@@ -21,6 +21,8 @@ const mockSendNativeMessage = jest.fn();
 const mockQueryNativeMessage = jest.fn();
 const mockTabsGet           = jest.fn();
 const addNavListener        = jest.fn();
+const addHistoryStateListener = jest.fn();
+const addReferenceFragmentListener = jest.fn();
 const addTabUpdateListener  = jest.fn();
 const addTabActivatedListener = jest.fn();
 const addMessageListener    = jest.fn();
@@ -114,7 +116,9 @@ function buildChromeMock() {
       onMessage: { addListener: addMessageListener },
     },
     webNavigation: {
-      onCompleted: { addListener: addNavListener },
+      onCompleted:                { addListener: addNavListener },
+      onHistoryStateUpdated:      { addListener: addHistoryStateListener },
+      onReferenceFragmentUpdated: { addListener: addReferenceFragmentListener },
     },
     tabs: {
       get:         mockTabsGet,
@@ -138,7 +142,7 @@ function buildChromeMock() {
 // Load a fresh copy of background.js before every test
 // (jest.resetModules() clears the module cache so pendingVisits starts empty)
 // ---------------------------------------------------------------------------
-let navHandler, tabUpdateHandler, tabActivatedHandler, messageHandler;
+let navHandler, historyStateHandler, referenceFragmentHandler, tabUpdateHandler, tabActivatedHandler, messageHandler;
 
 beforeEach(() => {
   jest.useFakeTimers();
@@ -148,6 +152,8 @@ beforeEach(() => {
   mockQueryNativeMessage.mockClear();
   mockTabsGet.mockClear();
   addNavListener.mockClear();
+  addHistoryStateListener.mockClear();
+  addReferenceFragmentListener.mockClear();
   addTabUpdateListener.mockClear();
   addTabActivatedListener.mockClear();
   addMessageListener.mockClear();
@@ -166,7 +172,9 @@ beforeEach(() => {
   jest.resetModules();
   require('../extension/background');
 
-  navHandler          = addNavListener.mock.calls[0][0];
+  navHandler                = addNavListener.mock.calls[0][0];
+  historyStateHandler       = addHistoryStateListener.mock.calls[0][0];
+  referenceFragmentHandler  = addReferenceFragmentListener.mock.calls[0][0];
   tabUpdateHandler    = addTabUpdateListener.mock.calls[0][0];
   tabActivatedHandler = addTabActivatedListener.mock.calls[0][0];
   messageHandler      = addMessageListener.mock.calls[0][0];
@@ -198,6 +206,16 @@ describe('listener registration', () => {
   test('registers a webNavigation.onCompleted listener', () => {
     expect(addNavListener).toHaveBeenCalledTimes(1);
     expect(typeof navHandler).toBe('function');
+  });
+
+  test('registers a webNavigation.onHistoryStateUpdated listener', () => {
+    expect(addHistoryStateListener).toHaveBeenCalledTimes(1);
+    expect(typeof historyStateHandler).toBe('function');
+  });
+
+  test('registers a webNavigation.onReferenceFragmentUpdated listener', () => {
+    expect(addReferenceFragmentListener).toHaveBeenCalledTimes(1);
+    expect(typeof referenceFragmentHandler).toBe('function');
   });
 
   test('registers a tabs.onUpdated listener', () => {
@@ -254,6 +272,30 @@ describe('isTitleMeaningful (indirect)', () => {
 // ---------------------------------------------------------------------------
 // Navigation event — immediate flush path
 // ---------------------------------------------------------------------------
+describe('SPA navigations log visits too', () => {
+  test('onHistoryStateUpdated with a real title flushes a visit immediately', () => {
+    tabReturns('Example Domain');
+    historyStateHandler({ frameId: 0, tabId: 1, url: 'https://example.com/' });
+    expect(mockSendNativeMessage).toHaveBeenCalledTimes(1);
+    const msg = mockSendNativeMessage.mock.calls[0][1];
+    expect(msg.url).toBe('https://example.com/');
+    expect(msg.title).toBe('Example Domain');
+  });
+
+  test('onReferenceFragmentUpdated with a real title flushes a visit immediately', () => {
+    tabReturns('Example Domain');
+    referenceFragmentHandler({ frameId: 0, tabId: 1, url: 'https://example.com/#about' });
+    expect(mockSendNativeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSendNativeMessage.mock.calls[0][1].url).toBe('https://example.com/#about');
+  });
+
+  test('SPA iframe navigation is ignored', () => {
+    tabReturns('Example Domain');
+    historyStateHandler({ frameId: 1, tabId: 1, url: 'https://example.com/' });
+    expect(mockSendNativeMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('webNavigation.onCompleted — immediate flush', () => {
   test('ignores iframe navigations (frameId !== 0)', () => {
     navHandler({ frameId: 1, tabId: 1, url: 'https://example.com/' });
@@ -1004,6 +1046,31 @@ describe('address-bar icon coloring', () => {
       navHandler({ frameId: 1, tabId: 3, url: URL });
       expect(mockSetIcon).not.toHaveBeenCalled();
       expect(mockQueryNativeMessage).not.toHaveBeenCalled();
+    });
+
+    test('history-state SPA navigation refreshes the icon', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ title: 'Example Domain' }));
+      respondWith({ read: [], skimmed: [{ timestamp: 't' }], of_interest: null });
+
+      historyStateHandler({ frameId: 0, tabId: 4, url: URL });
+
+      expect(mockQueryNativeMessage).toHaveBeenCalledWith(
+        'com.browser.visit.logger',
+        { action: 'query', url: URL },
+        expect.any(Function),
+      );
+      expect(lastIconColor()).toBe(YELLOW);
+      expect(lastIconTabId()).toBe(4);
+    });
+
+    test('hash-only navigation refreshes the icon', () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ title: 'Example Domain' }));
+      respondWith({ read: [], skimmed: [], of_interest: '1' });
+
+      referenceFragmentHandler({ frameId: 0, tabId: 5, url: URL });
+
+      expect(lastIconColor()).toBe(ORANGE);
+      expect(lastIconTabId()).toBe(5);
     });
   });
 

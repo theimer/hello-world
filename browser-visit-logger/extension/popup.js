@@ -23,16 +23,17 @@ function formatTs(iso) {
  * Does nothing if record is null (URL not yet in the database).
  */
 function showVisitInfo(record) {
-  if (!record) return;
+  // First visited: prefer the recorded DB timestamp; fall back to now when the
+  // page hasn't been logged yet (e.g. the popup is opened immediately after
+  // navigating, before the host has written the visit row).
+  const firstVisited = (record && record.timestamp) || new Date().toISOString();
 
   const rows = [
-    { label: 'First visited', value: formatTs(record.timestamp) },
-    { label: '★ Of Interest', value: record.of_interest ? '' : null },
-    ...(record.read || []).map((r) => ({ label: '✓ Read', value: formatTs(r.timestamp) })),
-    ...(record.skimmed || []).map((r) => ({ label: '~ Skimmed', value: formatTs(r.timestamp) })),
+    { label: 'First visited', value: formatTs(firstVisited) },
+    { label: '★ Of Interest', value: record && record.of_interest ? '' : null },
+    ...((record && record.read)    || []).map((r) => ({ label: '✓ Read',    value: formatTs(r.timestamp) })),
+    ...((record && record.skimmed) || []).map((r) => ({ label: '~ Skimmed', value: formatTs(r.timestamp) })),
   ].filter((r) => r.value !== null);
-
-  if (rows.length === 0) return;
 
   document.getElementById('visit-rows').innerHTML = rows
     .map((r) =>
