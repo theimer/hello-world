@@ -60,16 +60,45 @@ function setIconForTab(tabId, color) {
   });
 }
 
+const NATIVE_QUERY_RETRY_DELAY_MS = 300;
+
+// Extract the failure reason from a sendNativeMessage callback, or null if
+// the response was successful. A status-ok response with `record: null` is a
+// valid "no record" (untagged page) — *not* an error.
+function nativeQueryError(response) {
+  if (chrome.runtime.lastError) return chrome.runtime.lastError.message;
+  if (!response)                return 'no response';
+  if (response.status !== 'ok') return response.message || 'non-ok status';
+  return null;
+}
+
 function refreshIconForTab(tabId, url) {
   if (!url || !/^https?:/i.test(url)) {
     return setIconForTab(tabId, ICON_COLOR_GRAY);
   }
   return new Promise((resolve) => {
     chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url }, (response) => {
-      const color = (chrome.runtime.lastError || !response || response.status !== 'ok')
-        ? ICON_COLOR_GRAY
-        : pickIconColor(response.record);
-      setIconForTab(tabId, color).then(resolve);
+      const err = nativeQueryError(response);
+      if (!err) {
+        setIconForTab(tabId, pickIconColor(response.record)).then(resolve);
+        return;
+      }
+      // First query failed — usually a cold-start race right after Chrome
+      // relaunch (host not spawned yet) or a transient sqlite lock. Retry
+      // once before giving up; do NOT fall back to gray on error (that would
+      // actively mislabel a tagged page as untagged).
+      setTimeout(() => {
+        chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url }, (retry) => {
+          const err2 = nativeQueryError(retry);
+          if (!err2) {
+            setIconForTab(tabId, pickIconColor(retry.record)).then(resolve);
+            return;
+          }
+          console.warn('[BVL] icon refresh failed for', url, '—', err2);
+          // Leave the icon at whatever it is rather than clobbering to gray.
+          resolve();
+        });
+      }, NATIVE_QUERY_RETRY_DELAY_MS);
     });
   });
 }
