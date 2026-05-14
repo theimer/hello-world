@@ -83,8 +83,15 @@ function setupButtons(tab) {
           showStatus('Error: ' + chrome.runtime.lastError.message);
           document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
         } else if (response && response.status === 'ok') {
-          chrome.runtime.sendMessage({ type: 'refresh-icon', tabId: tab.id, url: tab.url });
-          window.close();
+          // Wait for the background to finish recoloring before tearing the
+          // popup down — closing first can drop the message in MV3.
+          chrome.runtime.sendMessage(
+            { type: 'refresh-icon', tabId: tab.id, url: tab.url },
+            () => {
+              void chrome.runtime.lastError;
+              window.close();
+            }
+          );
         } else {
           showStatus(response && response.message ? response.message : 'Write failed — check host log.');
           document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = false; });
