@@ -51,23 +51,26 @@ function iconImageDataForColor(color) {
 }
 
 function setIconForTab(tabId, color) {
-  chrome.action.setIcon({ tabId, imageData: iconImageDataForColor(color) }, () => {
-    // Tab may have been closed between query and setIcon; ignore.
-    void chrome.runtime.lastError;
+  return new Promise((resolve) => {
+    chrome.action.setIcon({ tabId, imageData: iconImageDataForColor(color) }, () => {
+      // Tab may have been closed between query and setIcon; ignore.
+      void chrome.runtime.lastError;
+      resolve();
+    });
   });
 }
 
 function refreshIconForTab(tabId, url) {
   if (!url || !/^https?:/i.test(url)) {
-    setIconForTab(tabId, ICON_COLOR_GRAY);
-    return;
+    return setIconForTab(tabId, ICON_COLOR_GRAY);
   }
-  chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url }, (response) => {
-    if (chrome.runtime.lastError || !response || response.status !== 'ok') {
-      setIconForTab(tabId, ICON_COLOR_GRAY);
-      return;
-    }
-    setIconForTab(tabId, pickIconColor(response.record));
+  return new Promise((resolve) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url }, (response) => {
+      const color = (chrome.runtime.lastError || !response || response.status !== 'ok')
+        ? ICON_COLOR_GRAY
+        : pickIconColor(response.record);
+      setIconForTab(tabId, color).then(resolve);
+    });
   });
 }
 
@@ -189,8 +192,11 @@ function snapshotDatetimePrefix(isoTimestamp) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'refresh-icon') {
-    refreshIconForTab(msg.tabId, msg.url);
-    return false;
+    // Keep the SW alive until the native-host query completes and setIcon has
+    // been called — otherwise the in-flight callback can be dropped on
+    // suspension and the icon never recolors.
+    refreshIconForTab(msg.tabId, msg.url).then(() => sendResponse({ status: 'ok' }));
+    return true;
   }
   if (msg.type !== 'tag-and-snapshot') return false;
 

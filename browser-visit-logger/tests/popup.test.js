@@ -391,6 +391,9 @@ describe('setupButtons', () => {
     // Default: query succeeds with no record (so setupButtons is always called)
     tabReturns(TAB);
     nativeReturns({ status: 'ok', record: null });
+    // The popup now waits for the background's refresh-icon ack before
+    // closing — invoke the callback so window.close is reached.
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
   });
 
   /**
@@ -468,10 +471,24 @@ describe('setupButtons', () => {
   test('on success, sends a refresh-icon message to the background', async () => {
     nativeReturns({ status: 'ok', record: null });
     mockSendMessage.mockClear();
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
     await clickTag('of_interest');
     expect(mockSendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'refresh-icon', tabId: TAB.id, url: TAB.url }),
+      expect.any(Function),
     );
+  });
+
+  test('window.close is deferred until the background acks refresh-icon', async () => {
+    nativeReturns({ status: 'ok', record: null });
+    let ackCallback;
+    mockSendMessage.mockImplementation((_msg, cb) => { ackCallback = cb; });
+    await clickTag('of_interest');
+    // The native write has completed and refresh-icon has been sent, but the
+    // background hasn't responded yet — popup must still be alive.
+    expect(window.close).not.toHaveBeenCalled();
+    ackCallback();
+    expect(window.close).toHaveBeenCalled();
   });
 
   test('on error response, shows the error message and re-enables buttons', async () => {

@@ -1083,10 +1083,21 @@ describe('address-bar icon coloring', () => {
       expect(lastIconTabId()).toBe(12);
     });
 
-    test('returns false (synchronous handler, no async response)', () => {
-      respondWith(null);
-      const result = messageHandler({ type: 'refresh-icon', tabId: 1, url: URL }, {}, jest.fn());
-      expect(result).toBe(false);
+    test('returns true and acks via sendResponse once setIcon completes', async () => {
+      respondWith({ read: [], skimmed: [], of_interest: '1' });
+      const sendResponse = jest.fn();
+      const result = messageHandler({ type: 'refresh-icon', tabId: 9, url: URL }, {}, sendResponse);
+      // Channel must stay open until the async setIcon resolves; otherwise
+      // the service worker can suspend mid-flight and the icon never updates.
+      expect(result).toBe(true);
+      // sendResponse fires on the microtask queue after the setIcon callback.
+      // Flush microtasks so refreshIconForTab's promise chain resolves.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(sendResponse).toHaveBeenCalledWith({ status: 'ok' });
+      // And the icon was actually painted before the ack went out.
+      expect(lastIconColor()).toBe(ORANGE);
+      expect(lastIconTabId()).toBe(9);
     });
   });
 
