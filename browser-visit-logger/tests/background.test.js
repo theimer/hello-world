@@ -987,7 +987,32 @@ describe('address-bar icon coloring', () => {
       expect(lastIconColor()).toBe(GRAY);
     });
 
-    test('native query lastError → gray', () => {
+    test('transient native lastError → retries and applies the eventual color', async () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      let calls = 0;
+      mockQueryNativeMessage.mockImplementation((_host, _msg, cb) => {
+        calls += 1;
+        if (calls === 1) {
+          global.chrome.runtime.lastError = { message: 'host crashed' };
+          cb(undefined);
+          global.chrome.runtime.lastError = null;
+        } else {
+          cb({ status: 'ok', record: { read: [], skimmed: [], of_interest: '1' } });
+        }
+      });
+      tabActivatedHandler({ tabId: 9 });
+      // Drain the first query's microtasks, then fast-forward past the retry delay.
+      await Promise.resolve();
+      jest.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(2);
+      expect(lastIconColor()).toBe(ORANGE);
+      expect(lastIconTabId()).toBe(9);
+    });
+
+    test('persistent native lastError → leaves the icon untouched and warns', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
       mockQueryNativeMessage.mockImplementation((_host, _msg, cb) => {
         global.chrome.runtime.lastError = { message: 'host crashed' };
@@ -995,15 +1020,61 @@ describe('address-bar icon coloring', () => {
         global.chrome.runtime.lastError = null;
       });
       tabActivatedHandler({ tabId: 9 });
-      expect(lastIconColor()).toBe(GRAY);
+      await Promise.resolve();
+      jest.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(mockSetIcon).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('[BVL]'), URL, '—', 'host crashed');
+      warn.mockRestore();
     });
 
-    test('native response with non-ok status → gray', () => {
+    test('non-ok status, then non-ok again → leaves the icon untouched', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
       mockQueryNativeMessage.mockImplementation((_h, _m, cb) =>
         cb({ status: 'error', message: 'db locked' }),
       );
       tabActivatedHandler({ tabId: 9 });
+      await Promise.resolve();
+      jest.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(mockSetIcon).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('[BVL]'), URL, '—', 'db locked');
+      warn.mockRestore();
+    });
+
+    test('non-ok status without a message falls back to a generic error string', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      mockQueryNativeMessage.mockImplementation((_h, _m, cb) => cb({ status: 'error' }));
+      tabActivatedHandler({ tabId: 9 });
+      await Promise.resolve();
+      jest.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('[BVL]'), URL, '—', 'non-ok status');
+      warn.mockRestore();
+    });
+
+    test('missing response (no lastError) is treated as error and retried', async () => {
+      mockTabsGet.mockImplementation((_tabId, cb) => cb({ url: URL }));
+      let calls = 0;
+      mockQueryNativeMessage.mockImplementation((_host, _msg, cb) => {
+        calls += 1;
+        if (calls === 1) {
+          cb(undefined); // no lastError, no response
+        } else {
+          cb({ status: 'ok', record: null });
+        }
+      });
+      tabActivatedHandler({ tabId: 9 });
+      await Promise.resolve();
+      jest.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(calls).toBe(2);
       expect(lastIconColor()).toBe(GRAY);
     });
   });
