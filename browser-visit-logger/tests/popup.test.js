@@ -449,6 +449,58 @@ describe('setupButtons', () => {
     expect(mockSendNativeMessage).not.toHaveBeenCalled();
   });
 
+  test('clicking "read" on a not-yet-of-interest URL sets alsoOfInterest:true', async () => {
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: [] } });
+    await loadPopup();
+    mockSendMessage.mockClear();
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
+    document.querySelector('[data-tag="read"]').click();
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'read', alsoOfInterest: true }),
+      expect.any(Function),
+    );
+  });
+
+  test('clicking "skimmed" on a not-yet-of-interest URL sets alsoOfInterest:true', async () => {
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: null, read: [], skimmed: [] } });
+    await loadPopup();
+    mockSendMessage.mockClear();
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
+    document.querySelector('[data-tag="skimmed"]').click();
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'skimmed', alsoOfInterest: true }),
+      expect.any(Function),
+    );
+  });
+
+  test('clicking "read" on an already-of-interest URL sets alsoOfInterest:false', async () => {
+    nativeReturns({ status: 'ok', record: { timestamp: null, of_interest: true, read: [], skimmed: [] } });
+    await loadPopup();
+    mockSendMessage.mockClear();
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
+    document.querySelector('[data-tag="read"]').click();
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'read', alsoOfInterest: false }),
+      expect.any(Function),
+    );
+  });
+
+  test('when the query fails, read defaults to alsoOfInterest:true (treat as not-yet-of-interest)', async () => {
+    mockSendNativeMessage.mockImplementation((_host, _msg, cb) => {
+      global.chrome.runtime.lastError = { message: 'Host not found' };
+      cb(null);
+      global.chrome.runtime.lastError = null;
+    });
+    await loadPopup();
+    mockSendMessage.mockClear();
+    mockSendMessage.mockImplementation((_msg, cb) => { if (cb) cb(); });
+    document.querySelector('[data-tag="read"]').click();
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tag-and-snapshot', tag: 'read', alsoOfInterest: true }),
+      expect.any(Function),
+    );
+  });
+
   test('buttons are disabled while a request is in flight', async () => {
     // Load popup with the default (ok) query so setupButtons is called
     await loadPopup();

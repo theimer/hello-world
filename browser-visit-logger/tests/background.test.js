@@ -721,7 +721,22 @@ describe('tag-and-snapshot message handler', () => {
       {
         tag: 'read', url: 'https://example.com/', timestamp: baseMsg.timestamp, title: baseMsg.title,
         filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.mhtml`,
+        alsoOfInterest: false,
       },
+      expect.any(Function),
+    );
+  });
+
+  test('forwards alsoOfInterest:true to the native host when the popup sets it', async () => {
+    setupSuccessFlow({ downloadId: 42 });
+    messageHandler({ ...baseMsg, alsoOfInterest: true }, {}, jest.fn());
+    await flushPromises();
+
+    fireDownloadChanged({ id: 42, state: { current: 'complete' } });
+
+    expect(mockSendNativeMessage).toHaveBeenCalledWith(
+      'com.browser.visit.logger',
+      expect.objectContaining({ tag: 'read', alsoOfInterest: true }),
       expect.any(Function),
     );
   });
@@ -740,6 +755,7 @@ describe('tag-and-snapshot message handler', () => {
       {
         tag: 'skimmed', url: skimMsg.url, timestamp: skimMsg.timestamp, title: skimMsg.title,
         filename: `browser-visit-snapshots/2026-01-01T00-00-00Z-${MOCK_HEX_HASH}.mhtml`,
+        alsoOfInterest: false,
       },
       expect.any(Function),
     );
