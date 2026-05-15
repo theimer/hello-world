@@ -121,6 +121,10 @@ let timestamp = (message["timestamp"] as? String ?? "").trimmingCharacters(in: .
 let title = message["title"] as? String ?? ""
 let tag = (message["tag"] as? String ?? "").trimmingCharacters(in: .whitespaces)
 let filename = (message["filename"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+// When the popup marks a page "read" or "skimmed" on a URL that isn't
+// already of-interest, it asks the host to set of_interest in the same
+// transaction so both updates land atomically.
+let alsoOfInterest = (message["alsoOfInterest"] as? Bool) ?? false
 
 if url.isEmpty {
     writeError("url is required")
@@ -156,13 +160,29 @@ do {
     try db.run("""
         INSERT OR IGNORE INTO snapshots (date, sealed) VALUES (?, 0)
         """, [todayISO])
-    try Events.insertVisit(db, timestamp: timestamp, url: url, title: title)
-    if !tag.isEmpty {
-        try Events.tagVisit(db, url: url, tag: tag, timestamp: timestamp,
-                            filename: filename)
-        if (tag == "read" || tag == "skimmed") && !filename.isEmpty {
-            Archive.forTag(db, filename: filename, log: log)
+
+    // Wrap the visit + tag writes in a transaction so that the implicit
+    // of_interest update (when alsoOfInterest is set on a read/skimmed
+    // request) commits atomically with the read/skimmed event row.
+    try db.run("BEGIN")
+    do {
+        try Events.insertVisit(db, timestamp: timestamp, url: url, title: title)
+        if !tag.isEmpty {
+            try Events.tagVisit(db, url: url, tag: tag, timestamp: timestamp,
+                                filename: filename)
+            if alsoOfInterest && (tag == "read" || tag == "skimmed") {
+                try Events.tagVisit(db, url: url, tag: "of_interest",
+                                    timestamp: timestamp)
+            }
         }
+        try db.run("COMMIT")
+    } catch {
+        _ = try? db.run("ROLLBACK")
+        throw error
+    }
+
+    if !tag.isEmpty && (tag == "read" || tag == "skimmed") && !filename.isEmpty {
+        Archive.forTag(db, filename: filename, log: log)
     }
 } catch {
     log.error("SQLite write failed: \(error)")

@@ -57,20 +57,22 @@ document.addEventListener('DOMContentLoaded', () => {
     // Query the native host for any existing record for this URL.
     chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: 'query', url: tab.url },
       (response) => {
+        let alreadyOfInterest = false;
         // Ignore errors — the history section simply stays hidden.
         if (!chrome.runtime.lastError && response && response.status === 'ok') {
           showVisitInfo(response.record);
+          alreadyOfInterest = !!(response.record && response.record.of_interest);
         }
 
         // Set up tag buttons after the query returns (so the popup doesn't
         // flash in if the query is fast).
-        setupButtons(tab);
+        setupButtons(tab, alreadyOfInterest);
       }
     );
   });
 });
 
-function setupButtons(tab) {
+function setupButtons(tab, alreadyOfInterest) {
   document.querySelectorAll('[data-tag]').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('[data-tag]').forEach(b => { b.disabled = true; });
@@ -101,12 +103,16 @@ function setupButtons(tab) {
       if (tag === 'read' || tag === 'skimmed') {
         showStatus('Saving snapshot\u2026');
         chrome.runtime.sendMessage({
-          type:      'tag-and-snapshot',
+          type:           'tag-and-snapshot',
           tag,
-          tabId:     tab.id,
+          tabId:          tab.id,
           timestamp,
-          url:       tab.url,
-          title:     tab.title || tab.url,
+          url:            tab.url,
+          title:          tab.title || tab.url,
+          // Marking a page read or skimmed implies it's of-interest.
+          // Tell the host to set of_interest in the same DB transaction
+          // when it isn't already set.
+          alsoOfInterest: !alreadyOfInterest,
         }, handleResponse);
       } else {
         chrome.runtime.sendNativeMessage(NATIVE_HOST, {
